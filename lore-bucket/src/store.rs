@@ -49,8 +49,8 @@ pub struct BucketStore {
 }
 
 impl BucketStore {
-    /// `prefix` is already trimmed. `local_path` is the directory that holds
-    /// `index/` and `mutable/`.
+    /// `prefix` is already trimmed. `local_path` is the cache directory, the
+    /// parent of `immutable/` and `mutable/`. The server passes it in.
     pub fn new(
         client: Arc<dyn ObjectClient>,
         prefix: impl Into<String>,

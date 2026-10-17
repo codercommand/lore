@@ -43,7 +43,7 @@ pub enum BucketError {
 pub async fn prepare(config: &toml::Value) -> Result<(), BucketError> {
     let cfg = BucketConfig::parse(config)?;
     let Some(local) = cfg.local_path.as_ref() else {
-        tracing::info!("bucket prepare skipped: no local_path");
+        tracing::info!("bucket prepare skipped: no cache directory");
         return Ok(());
     };
     let local = PathBuf::from(local);

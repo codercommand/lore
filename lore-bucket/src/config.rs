@@ -10,30 +10,33 @@ fn default_snapshot_interval() -> u64 {
 }
 
 /// `[plugins.bucket]` table.
+///
+/// Dragon does not use Amazon Web Services. `endpoint` is an S3-compatible
+/// service. The access key and secret are required in this table.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BucketConfig {
     /// Bucket name.
     pub bucket: String,
-    /// Region string the SDK requires. Railway fixes this at bucket creation.
+    /// Region name that service expects. Railway fixes it when the bucket is
+    /// created. The local Silo uses `us-east-1`.
     pub region: String,
-    /// S3-compatible endpoint. Absent uses the default AWS endpoint.
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    /// Path-style addressing. Virtual-hosted style is the default.
+    /// Base URL of the S3-compatible service, including the scheme.
+    pub endpoint: String,
+    /// Path-style URLs. The local Silo needs this. Virtual-hosted style is the default.
     #[serde(default)]
     pub path_style: bool,
     /// Key prefix inside a shared bucket. Empty means the bucket root.
     #[serde(default)]
     pub prefix: String,
-    /// Static access key. Set together with `secret_access_key`, or leave both
-    /// unset and use the default credential chain.
-    #[serde(default)]
-    pub access_key_id: Option<String>,
-    /// Static secret for `access_key_id`.
-    #[serde(default)]
-    pub secret_access_key: Option<String>,
-    /// Directory that holds `index/` and `mutable/`. `loreserver` fills this
-    /// from the composite local store path.
+    /// Access key for `endpoint`.
+    pub access_key_id: String,
+    /// Secret for `access_key_id`.
+    pub secret_access_key: String,
+    /// Cache directory: the parent of `immutable/` and `mutable/`.
+    ///
+    /// `loreserver` sets this from the composite local `path` and replaces a
+    /// value written in the table. Absent only when the library is opened
+    /// without that server path, in which case no snapshot is taken.
     #[serde(default)]
     pub local_path: Option<String>,
     /// Seconds between index snapshots. Zero leaves snapshots to flush only.
@@ -63,12 +66,71 @@ impl BucketConfig {
         if self.region.is_empty() {
             return Err(BucketError::Config("region is empty".to_string()));
         }
-        match (&self.access_key_id, &self.secret_access_key) {
-            (Some(_), None) | (None, Some(_)) => Err(BucketError::Config(
-                "access_key_id and secret_access_key must both be set, or both left unset"
-                    .to_string(),
-            )),
-            _ => Ok(()),
+        if self.endpoint.is_empty() {
+            return Err(BucketError::Config("endpoint is empty".to_string()));
         }
+        if self.access_key_id.is_empty() || self.secret_access_key.is_empty() {
+            return Err(BucketError::Config(
+                "access_key_id and secret_access_key are required".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BucketConfig;
+
+    fn value(text: &str) -> toml::Value {
+        toml::from_str(text).expect("test toml")
+    }
+
+    #[test]
+    fn parse_accepts_the_local_bucket() {
+        let cfg = BucketConfig::parse(&value(
+            r#"
+            bucket = "dragon"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:9000"
+            path_style = true
+            access_key_id = "dragon"
+            secret_access_key = "dragonsecret"
+            "#,
+        ))
+        .expect("config");
+        assert_eq!(cfg.endpoint, "http://127.0.0.1:9000");
+        assert!(cfg.path_style);
+        assert!(cfg.local_path.is_none());
+        assert_eq!(cfg.snapshot_interval_seconds, 60);
+    }
+
+    #[test]
+    fn parse_rejects_a_missing_endpoint() {
+        let err = BucketConfig::parse(&value(
+            r#"
+            bucket = "dragon"
+            region = "us-east-1"
+            access_key_id = "dragon"
+            secret_access_key = "dragonsecret"
+            "#,
+        ))
+        .expect_err("missing endpoint");
+        assert!(err.to_string().contains("endpoint"), "{err}");
+    }
+
+    #[test]
+    fn parse_rejects_an_empty_secret() {
+        let err = BucketConfig::parse(&value(
+            r#"
+            bucket = "dragon"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:9000"
+            access_key_id = "dragon"
+            secret_access_key = ""
+            "#,
+        ))
+        .expect_err("empty secret");
+        assert!(err.to_string().contains("secret_access_key"), "{err}");
     }
 }

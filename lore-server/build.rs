@@ -46,6 +46,12 @@ const GENERATED_FILE_HEADER: &str = r#"// ======================================
 "#;
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // dragon: start — the Windows main thread reserves 1 MiB, and starting
+    // composite mode overflows it. This raises the reserve for loreserver.
+    #[cfg(windows)]
+    println!("cargo:rustc-link-arg-bins=/STACK:16777216");
+    // dragon: end
+
     // Generate mod.rs files for plugins and hooks
     generate_plugins_mod()?;
     generate_hooks_mod()?;

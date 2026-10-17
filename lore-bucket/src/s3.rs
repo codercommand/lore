@@ -37,24 +37,17 @@ pub async fn connect(config: &BucketConfig) -> Result<Arc<dyn ObjectClient>, Buc
                 .build()
         });
 
-    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+    let loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .http_client(http_client)
-        .region(aws_config::Region::new(config.region.clone()));
-
-    if let Some(endpoint) = &config.endpoint
-        && !endpoint.is_empty()
-    {
-        loader = loader.endpoint_url(endpoint);
-    }
-    if let (Some(key), Some(secret)) = (&config.access_key_id, &config.secret_access_key) {
-        loader = loader.credentials_provider(Credentials::new(
-            key.clone(),
-            secret.clone(),
+        .region(aws_config::Region::new(config.region.clone()))
+        .endpoint_url(&config.endpoint)
+        .credentials_provider(Credentials::new(
+            config.access_key_id.clone(),
+            config.secret_access_key.clone(),
             None,
             None,
             "lore-bucket",
         ));
-    }
 
     let sdk = loader.load().await;
     let s3_config = aws_sdk_s3::config::Builder::from(&sdk)
