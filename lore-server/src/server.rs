@@ -1493,22 +1493,52 @@ async fn configure_composite_store(
         )
         .with_record_copy_out_of_band(settings.record_copy_out_of_band);
 
+    let local_path = settings
+        .local
+        .local
+        .as_ref()
+        .map(|local| local_store_path(&local.path));
+
+    // Restore a missing index before the local store creates empty directories
+    // that would look like a live index.
+    if settings
+        .durable
+        .as_ref()
+        .is_some_and(|durable| durable.mode == "bucket")
+    {
+        if let Some(path) = &local_path {
+            let config = bucket_plugin_config(global_settings, path);
+            lore_bucket::prepare(&config)
+                .await
+                .map_err(|err| anyhow!("Failed to prepare bucket store: {err}"))?;
+        } else {
+            warn!("bucket durable store has no local directory; index restore is skipped");
+        }
+    }
+
     let store = Box::pin(configure_composite_substore(
         registry,
         &settings.local.mode,
         global_settings,
         &settings.local,
+        None,
     ))
     .await?;
     composite_store_builder =
         composite_store_builder.with_local(settings.local.mode.clone(), store)?;
 
     if let Some(durable_settings) = settings.durable.as_ref() {
+        let snapshot_root = if durable_settings.mode == "bucket" {
+            local_path.as_deref()
+        } else {
+            None
+        };
         let store = Box::pin(configure_composite_substore(
             registry,
             &durable_settings.mode,
             global_settings,
             durable_settings,
+            snapshot_root,
         ))
         .await?;
         composite_store_builder =
@@ -1526,6 +1556,7 @@ async fn configure_composite_store(
                 &store_settings.mode,
                 global_settings,
                 store_settings,
+                None,
             ))
             .await?;
 
@@ -1594,11 +1625,25 @@ async fn configure_composite_store(
     Ok(store)
 }
 
+fn bucket_plugin_config(global_settings: &Settings, local_path: &std::path::Path) -> toml::Value {
+    let mut config =
+        resolve_plugin_config_with_fallback(&global_settings.plugins, "bucket", "immutable_store")
+            .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    if let toml::Value::Table(table) = &mut config {
+        table.insert(
+            "local_path".to_string(),
+            toml::Value::String(local_path.display().to_string()),
+        );
+    }
+    config
+}
+
 async fn configure_composite_substore(
     registry: &PluginRegistry,
     mode: &str,
     global_settings: &Settings,
     settings: &CompositeSubStoreSettings,
+    snapshot_root: Option<&std::path::Path>,
 ) -> Result<Arc<dyn ImmutableStore>> {
     match mode {
         store_mode::LOCAL => {
@@ -1630,12 +1675,21 @@ async fn configure_composite_substore(
         }
         _ => {
             // All other modes use the plugin system
-            let plugin_config = resolve_plugin_config_with_fallback(
+            let mut plugin_config = resolve_plugin_config_with_fallback(
                 &global_settings.plugins,
                 mode,
                 "immutable_store",
             )
             .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+            if mode == "bucket"
+                && let Some(path) = snapshot_root
+                && let toml::Value::Table(table) = &mut plugin_config
+            {
+                table.insert(
+                    "local_path".to_string(),
+                    toml::Value::String(path.display().to_string()),
+                );
+            }
 
             info!(mode, "Creating composite substore via plugin system");
 

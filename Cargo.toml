@@ -4,6 +4,7 @@ members = [
     "lore",
     "lore-aws",
     "lore-base",
+    "lore-bucket",
     "lore-capi",
     "lore-chaos-client",
     "lore-client",
@@ -101,6 +102,7 @@ zero_sized_map_values = "warn"
 lore = { path = "lore" }
 lore-aws = { path = "lore-aws" }
 lore-base = { path = "lore-base" }
+lore-bucket = { path = "lore-bucket" }
 lore-credential = { path = "lore-credential" }
 lore-error-set = { path = "lore-error-set" }
 lore-error-set-macro = { path = "lore-error-set-macro" }

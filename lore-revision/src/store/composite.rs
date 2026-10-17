@@ -1503,7 +1503,13 @@ impl ImmutableStore for CompositeStore {
     }
 
     async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.local.store().flush(sync_data).await
+        self.local.store().flush(sync_data).await?;
+        // The local tier writes the index the durable tier snapshots. When the
+        // local tier is itself the durable store, that one flush is enough.
+        if !self.local_durable {
+            self.durable.store().flush(sync_data).await?;
+        }
+        Ok(())
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {

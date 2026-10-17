@@ -2605,6 +2605,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "lore-bucket"
+version = "0.10.2-nightly"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-s3",
+ "aws-smithy-http-client",
+ "bytes",
+ "dashmap",
+ "futures",
+ "hex",
+ "lore-base",
+ "lore-storage",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.9.12+spec-1.1.0",
+ "tracing",
+ "zerocopy",
+]
+
+[[package]]
 name = "lore-capi"
 version = "0.10.2-nightly"
 dependencies = [
@@ -2897,6 +2921,7 @@ dependencies = [
  "jsonwebtoken",
  "lore-aws",
  "lore-base",
+ "lore-bucket",
  "lore-error-set",
  "lore-hashicorp",
  "lore-macro",
