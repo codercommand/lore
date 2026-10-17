@@ -39,8 +39,16 @@ impl From<ObjectError> for SnapshotError {
     }
 }
 
+/// Files the snapshot never copies and a restore never counts: the store's
+/// process `lock`, the local store's `*.tmp` files (written and then renamed
+/// over the real file, so one seen mid-flush is half written), and a restore's
+/// own `*.restore-tmp`.
+fn is_skipped_file(name: &str) -> bool {
+    name == "lock" || name.ends_with(".tmp") || name.ends_with(".restore-tmp")
+}
+
 /// True when `dir` contains a file that is not inside a `pack` directory and
-/// is not the store's `lock` file.
+/// is not the store's `lock` file or a temporary file.
 pub fn has_kept_file(dir: &Path) -> std::io::Result<bool> {
     if !dir.exists() {
         return Ok(false);
@@ -55,7 +63,7 @@ pub fn has_kept_file(dir: &Path) -> std::io::Result<bool> {
                     continue;
                 }
                 stack.push(path);
-            } else if path.is_file() && entry.file_name() != "lock" {
+            } else if path.is_file() && !entry.file_name().to_str().is_some_and(is_skipped_file) {
                 return Ok(true);
             }
         }
@@ -70,17 +78,50 @@ pub fn has_kept_file(dir: &Path) -> std::io::Result<bool> {
 /// store directory is held for the life of the process; on Windows that lock
 /// is mandatory, so reading it fails with a lock violation. Neither belongs
 /// in the snapshot. Older generations are removed after the manifest is in place.
+#[cfg(test)]
 pub async fn upload(
     client: &dyn ObjectClient,
     prefix: &str,
     local: &Path,
 ) -> Result<(), SnapshotError> {
-    let generation = new_generation();
-    let root = format!("snapshot/g/{generation}");
+    upload_if_changed(client, prefix, local, &mut None)
+        .await
+        .map(|_| ())
+}
+
+/// Names, sizes and modification times of the files one snapshot copied.
+pub type Fingerprint = Vec<(String, u64, Option<SystemTime>)>;
+
+/// [`upload`], skipped when the files match `last`, the fingerprint of the
+/// previous successful upload from this process. Returns whether it uploaded.
+///
+/// Every snapshot copies the whole index, which is on the order of 3 GiB for
+/// a 2 TiB history. An idle guild on the default 60 second timer would send
+/// that every minute. A guild with no writes since the last snapshot now
+/// sends nothing. `last` is only replaced after the manifest is written.
+pub async fn upload_if_changed(
+    client: &dyn ObjectClient,
+    prefix: &str,
+    local: &Path,
+    last: &mut Option<Fingerprint>,
+) -> Result<bool, SnapshotError> {
     let mut files = collect_tree(&local.join("immutable"), "immutable")?;
     files.extend(collect_tree(&local.join("mutable"), "mutable")?);
+    let fingerprint = fingerprint(&files);
+    if last.as_ref() == Some(&fingerprint) {
+        return Ok(false);
+    }
+    let generation = new_generation();
+    let root = format!("snapshot/g/{generation}");
     for (relative, path) in files {
-        let bytes = read_file(&path)?;
+        // A file listed a moment ago can be gone: the local store removes
+        // index files when its fan-out changes. It is not part of the index
+        // any more, so the snapshot leaves it out.
+        let bytes = match read_file(&path) {
+            Ok(bytes) => bytes,
+            Err(SnapshotError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
         client
             .put(&join_key(prefix, &format!("{root}/{relative}")), bytes)
             .await?;
@@ -94,7 +135,22 @@ pub async fn upload(
     if let Err(err) = delete_other_generations(client, prefix, &generation).await {
         tracing::warn!("bucket snapshot left an older generation in place: {err}");
     }
-    Ok(())
+    *last = Some(fingerprint);
+    Ok(true)
+}
+
+fn fingerprint(files: &[(String, PathBuf)]) -> Fingerprint {
+    files
+        .iter()
+        .map(|(relative, path)| {
+            let meta = std::fs::metadata(path).ok();
+            (
+                relative.clone(),
+                meta.as_ref().map_or(0, std::fs::Metadata::len),
+                meta.and_then(|meta| meta.modified().ok()),
+            )
+        })
+        .collect()
 }
 
 /// Fill the trees named in `which` from the manifest's generation.
@@ -171,7 +227,7 @@ fn collect_tree(dir: &Path, key_prefix: &str) -> std::io::Result<Vec<(String, Pa
                     continue;
                 }
                 stack.push((path, format!("{prefix}/{name}")));
-            } else if path.is_file() && name != "lock" {
+            } else if path.is_file() && !is_skipped_file(name) {
                 out.push((format!("{prefix}/{name}"), path));
             }
         }
@@ -360,5 +416,51 @@ mod tests {
         );
         assert!(keys.iter().any(|key| key.ends_with("/mutable/branches")));
         assert!(keys.iter().all(|key| !key.ends_with("/lock")));
+    }
+
+    #[tokio::test]
+    async fn snapshot_skips_temporary_files_and_unchanged_trees() {
+        let client = MemoryClient::new();
+        let root = tempfile::tempdir().unwrap();
+        let index = root.path().join("immutable").join("index").join("aa");
+        std::fs::create_dir_all(&index).unwrap();
+        std::fs::write(index.join("index_00"), b"index-bytes").unwrap();
+        std::fs::write(index.join("index_01.tmp"), b"half").unwrap();
+
+        let mut last = None;
+        assert!(
+            upload_if_changed(client.as_ref(), "", root.path(), &mut last)
+                .await
+                .unwrap()
+        );
+        let keys = client.list("snapshot/g/").await.unwrap();
+        assert!(keys.iter().any(|key| key.ends_with("/index_00")));
+        assert!(keys.iter().all(|key| !key.ends_with(".tmp")));
+
+        // Nothing changed: no new generation.
+        assert!(
+            !upload_if_changed(client.as_ref(), "", root.path(), &mut last)
+                .await
+                .unwrap()
+        );
+        assert_eq!(client.list("snapshot/g/").await.unwrap(), keys);
+
+        // A changed file uploads again.
+        std::fs::write(index.join("index_00"), b"index-bytes-2").unwrap();
+        assert!(
+            upload_if_changed(client.as_ref(), "", root.path(), &mut last)
+                .await
+                .unwrap()
+        );
+        assert_ne!(client.list("snapshot/g/").await.unwrap(), keys);
+    }
+
+    #[test]
+    fn a_lone_temporary_file_is_not_an_index() {
+        let root = tempfile::tempdir().unwrap();
+        let index = root.path().join("index").join("aa");
+        std::fs::create_dir_all(&index).unwrap();
+        std::fs::write(index.join("index_00.tmp"), b"half").unwrap();
+        assert!(!has_kept_file(&root.path().join("index")).unwrap());
     }
 }

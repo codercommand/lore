@@ -45,7 +45,9 @@ pub struct BucketStore {
     prefix: String,
     local_path: Option<PathBuf>,
     stripes: Vec<tokio::sync::Mutex<()>>,
-    snapshot_gate: tokio::sync::Mutex<()>,
+    /// Held for one snapshot at a time. Holds the fingerprint of the last
+    /// upload, so an unchanged cache directory is not sent again.
+    snapshot_gate: tokio::sync::Mutex<Option<snapshot::Fingerprint>>,
 }
 
 impl BucketStore {
@@ -65,7 +67,7 @@ impl BucketStore {
             prefix: prefix.into(),
             local_path,
             stripes,
-            snapshot_gate: tokio::sync::Mutex::new(()),
+            snapshot_gate: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -92,8 +94,10 @@ impl BucketStore {
         let Some(local) = &self.local_path else {
             return Ok(());
         };
-        let _guard = self.snapshot_gate.lock().await;
-        snapshot::upload(self.client.as_ref(), &self.prefix, local).await
+        let mut last = self.snapshot_gate.lock().await;
+        snapshot::upload_if_changed(self.client.as_ref(), &self.prefix, local, &mut last)
+            .await
+            .map(|_| ())
     }
 
     fn stripe(&self, hash: &Hash) -> &tokio::sync::Mutex<()> {
