@@ -463,6 +463,7 @@ fn check_fragment(fragment: &Fragment, payload: Option<&Bytes>) -> Result<(), St
 /// and served until something verifies it. A compressed payload is expanded
 /// to hash its content, the same way the local store's `verify` does. A codec
 /// this build cannot expand (Oodle) is passed through unchecked, as before.
+/// An unknown or reserved compression bit is refused, never passed through.
 fn verify_payload(
     address: &Address,
     fragment: &Fragment,
@@ -471,7 +472,14 @@ fn verify_payload(
     let content_hash = if fragment.flags & FragmentFlags::PayloadCompressed.bits() != 0 {
         match lore_storage::compress::decompress(*fragment, payload) {
             Ok((_fragment, content)) => lore_storage::hash::hash_slice(&content),
-            Err(lore_storage::FragmentError::NotSupported(_)) => {
+            // Only a payload marked exactly Oodle2 passes unchecked. Any other
+            // codec this build cannot expand (a reserved compression bit) is
+            // refused: the header comes from the bucket, so a header with an
+            // unknown bit set would otherwise skip the hash check entirely.
+            Err(lore_storage::FragmentError::NotSupported(_))
+                if fragment.flags & FragmentFlags::PayloadCompressed.bits()
+                    == FragmentFlags::PayloadCompressedOodle2.bits() =>
+            {
                 tracing::debug!(hash = %address.hash, "bucket payload codec not supported; hash not checked");
                 return Ok(());
             }
@@ -726,6 +734,23 @@ mod tests {
         let key = format!("guilds/one/payloads/{}", hex::encode(address.hash.data()));
         client
             .put(&key, Bytes::from(vec![8, 8, 9, 8]))
+            .await
+            .unwrap();
+        let err = store.get(part(1), address).await.unwrap_err();
+        assert!(err.to_string().contains("hash check"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn get_refuses_a_header_with_an_unknown_codec_bit() {
+        let client = MemoryClient::new();
+        let store = store(Arc::clone(&client));
+        let address = addr(9, 1);
+        // A reserved compression bit (0b1_0000): no codec in Lore uses it.
+        let mut header = fragment(4);
+        header.flags |= 0b1_0000;
+        store
+            .clone()
+            .put(part(1), address, header, Some(Bytes::from(vec![1, 2, 3, 4])), false)
             .await
             .unwrap();
         let err = store.get(part(1), address).await.unwrap_err();
