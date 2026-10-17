@@ -113,13 +113,21 @@ pub async fn upload_if_changed(
     }
     let generation = new_generation();
     let root = format!("snapshot/g/{generation}");
+    // A listed file can vanish before it is read. Leave it out of this
+    // generation, and do not remember the fingerprint: the next snapshot
+    // has to upload again, or a skip would keep a generation that is missing
+    // that file.
+    let mut omitted = false;
     for (relative, path) in files {
         // A file listed a moment ago can be gone: the local store removes
         // index files when its fan-out changes. It is not part of the index
         // any more, so the snapshot leaves it out.
         let bytes = match read_file(&path) {
             Ok(bytes) => bytes,
-            Err(SnapshotError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(SnapshotError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                omitted = true;
+                continue;
+            }
             Err(err) => return Err(err),
         };
         client
@@ -135,7 +143,7 @@ pub async fn upload_if_changed(
     if let Err(err) = delete_other_generations(client, prefix, &generation).await {
         tracing::warn!("bucket snapshot left an older generation in place: {err}");
     }
-    *last = Some(fingerprint);
+    *last = if omitted { None } else { Some(fingerprint) };
     Ok(true)
 }
 

@@ -39,7 +39,8 @@ pub struct BucketConfig {
     /// without that server path, in which case no snapshot is taken.
     #[serde(default)]
     pub local_path: Option<String>,
-    /// Seconds between index snapshots. Zero leaves snapshots to flush only.
+    /// Seconds between index snapshots. Zero snapshots only when the store is
+    /// flushed. `loreserver` does that at a clean stop, not while it is running.
     #[serde(default = "default_snapshot_interval")]
     pub snapshot_interval_seconds: u64,
 }
