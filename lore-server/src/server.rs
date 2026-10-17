@@ -2565,8 +2565,12 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // flush the bucket keeps branch tips up to one flush delay old, and a
     // guild started from that bucket on another machine loses those pushes.
     // The local tier has nothing dirty by now, so this is only the snapshot.
-    if let Some(store) = immutable_store_for_snapshot {
-        let _ = store.flush(true).await;
+    if let Some(store) = immutable_store_for_snapshot
+        && let Err(err) = store.flush(true).await
+    {
+        // A failed final snapshot leaves the bucket with older branch tips.
+        // Say so: a guild moved or restored from this bucket would lose them.
+        error!("final bucket snapshot at shutdown failed: {err}");
     }
     // dragon: end
 

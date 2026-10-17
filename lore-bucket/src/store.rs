@@ -469,30 +469,28 @@ fn verify_payload(
     fragment: &Fragment,
     payload: &Bytes,
 ) -> Result<(), StoreError> {
-    let content_hash = if fragment.flags & FragmentFlags::PayloadCompressed.bits() != 0 {
-        match lore_storage::compress::decompress(*fragment, payload) {
-            Ok((_fragment, content)) => lore_storage::hash::hash_slice(&content),
-            // Only a payload marked exactly Oodle2 passes unchecked. Any other
-            // codec this build cannot expand (a reserved compression bit) is
-            // refused: the header comes from the bucket, so a header with an
-            // unknown bit set would otherwise skip the hash check entirely.
-            Err(lore_storage::FragmentError::NotSupported(_))
-                if fragment.flags & FragmentFlags::PayloadCompressed.bits()
-                    == FragmentFlags::PayloadCompressedOodle2.bits() =>
-            {
-                tracing::debug!(hash = %address.hash, "bucket payload codec not supported; hash not checked");
-                return Ok(());
-            }
-            Err(err) => {
-                tracing::warn!(hash = %address.hash, "bucket payload does not decompress: {err}");
-                return Err(StoreError::internal(format!(
-                    "bucket payload for {} failed its hash check: does not decompress: {err}",
-                    address.hash
-                )));
-            }
+    // Lore's own hash_fragment: expands a compressed payload and also checks
+    // size_content against the expanded length, as the local store does.
+    let content_hash = match lore_storage::hash::hash_fragment(*fragment, payload) {
+        Ok(hash) => hash,
+        // Only a payload marked exactly Oodle2 passes unchecked. Any other
+        // codec this build cannot expand (a reserved compression bit) is
+        // refused: the header comes from the bucket, so a header with an
+        // unknown bit set would otherwise skip the hash check entirely.
+        Err(lore_storage::FragmentError::NotSupported(_))
+            if fragment.flags & FragmentFlags::PayloadCompressed.bits()
+                == FragmentFlags::PayloadCompressedOodle2.bits() =>
+        {
+            tracing::debug!(hash = %address.hash, "bucket payload codec not supported; hash not checked");
+            return Ok(());
         }
-    } else {
-        lore_storage::hash::hash_slice(payload)
+        Err(err) => {
+            tracing::warn!(hash = %address.hash, "bucket payload does not expand: {err}");
+            return Err(StoreError::internal(format!(
+                "bucket payload for {} failed its hash check: does not expand: {err}",
+                address.hash
+            )));
+        }
     };
     if content_hash != address.hash {
         tracing::warn!(hash = %address.hash, got = %content_hash, "bucket payload failed its hash check");
