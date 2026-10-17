@@ -13,7 +13,7 @@ fn default_snapshot_interval() -> u64 {
 ///
 /// Dragon does not use Amazon Web Services. `endpoint` is an S3-compatible
 /// service. The access key and secret are required in this table.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct BucketConfig {
     /// Bucket name.
     pub bucket: String,
@@ -42,6 +42,24 @@ pub struct BucketConfig {
     /// Seconds between index snapshots. Zero leaves snapshots to flush only.
     #[serde(default = "default_snapshot_interval")]
     pub snapshot_interval_seconds: u64,
+}
+
+/// Prints every field except the secret, so a `{:?}` in a log line or an
+/// error message cannot leak it.
+impl std::fmt::Debug for BucketConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BucketConfig")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("path_style", &self.path_style)
+            .field("prefix", &self.prefix)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("local_path", &self.local_path)
+            .field("snapshot_interval_seconds", &self.snapshot_interval_seconds)
+            .finish()
+    }
 }
 
 impl BucketConfig {
@@ -132,5 +150,22 @@ mod tests {
         ))
         .expect_err("empty secret");
         assert!(err.to_string().contains("secret_access_key"), "{err}");
+    }
+
+    #[test]
+    fn debug_hides_the_secret() {
+        let cfg = BucketConfig::parse(&value(
+            r#"
+            bucket = "dragon"
+            region = "us-east-1"
+            endpoint = "http://127.0.0.1:9000"
+            access_key_id = "dragon"
+            secret_access_key = "dragonsecret"
+            "#,
+        ))
+        .expect("config");
+        let printed = format!("{cfg:?}");
+        assert!(!printed.contains("dragonsecret"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
     }
 }
