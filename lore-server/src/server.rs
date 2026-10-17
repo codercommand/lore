@@ -1964,6 +1964,16 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // Initialize metrics and tracing telemetry, returns a guard that will cleanup when it falls out
     // of scope
     let (mut settings, settings_hash) = settings;
+    // dragon: start — remember whether the durable tier is the bucket plugin,
+    // for the second flush at shutdown.
+    let settings_uses_bucket = settings.immutable_store.mode == "composite"
+        && settings
+            .immutable_store
+            .composite
+            .as_ref()
+            .and_then(|composite| composite.durable.as_ref())
+            .is_some_and(|durable| durable.mode == "bucket");
+    // dragon: end
     let runtime = runtime();
     let telemetry = settings.telemetry.clone().unwrap_or_default();
     let metrics_config = telemetry.metrics.clone().unwrap_or_default();
@@ -2544,8 +2554,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     up_gauge.record(0, &up_attributes);
 
     info!("Flushing stores");
+    // dragon: start — keep a handle for the second flush below.
+    let immutable_store_for_snapshot = settings_uses_bucket.then(|| Arc::clone(&immutable_store));
+    // dragon: end
     let _ = immutable_store.flush(true).await;
     let _ = mutable_store.flush(true).await;
+    // dragon: start — snapshot again after the mutable flush.
+    // The immutable flush above runs the bucket snapshot, and it runs before
+    // the mutable store writes its last branch tips. Without this second
+    // flush the bucket keeps branch tips up to one flush delay old, and a
+    // guild started from that bucket on another machine loses those pushes.
+    // The local tier has nothing dirty by now, so this is only the snapshot.
+    if let Some(store) = immutable_store_for_snapshot {
+        let _ = store.flush(true).await;
+    }
+    // dragon: end
 
     Ok(())
 }
