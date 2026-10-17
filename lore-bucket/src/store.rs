@@ -219,6 +219,8 @@ impl ImmutableStore for BucketStore {
                 fragment.size_payload
             )));
         }
+        // dragon review L2: check the content hash before composite caches it.
+        verify_payload(&address, &fragment, &payload)?;
         Ok(StoreGetData {
             fragment,
             match_made: StoreMatch::MatchFull,
@@ -450,6 +452,46 @@ fn check_fragment(fragment: &Fragment, payload: Option<&Bytes>) -> Result<(), St
     Ok(())
 }
 
+/// Check that the bucket bytes hash to the address.
+///
+/// Composite caches whatever the durable tier returns, and Lore's local `get`
+/// checks only lengths, so a damaged bucket object would otherwise be cached
+/// and served until something verifies it. A compressed payload is expanded
+/// to hash its content, the same way the local store's `verify` does. A codec
+/// this build cannot expand (Oodle) is passed through unchecked, as before.
+fn verify_payload(
+    address: &Address,
+    fragment: &Fragment,
+    payload: &Bytes,
+) -> Result<(), StoreError> {
+    let content_hash = if fragment.flags & FragmentFlags::PayloadCompressed.bits() != 0 {
+        match lore_storage::compress::decompress(*fragment, payload) {
+            Ok((_fragment, content)) => lore_storage::hash::hash_slice(&content),
+            Err(lore_storage::FragmentError::NotSupported(_)) => {
+                tracing::debug!(hash = %address.hash, "bucket payload codec not supported; hash not checked");
+                return Ok(());
+            }
+            Err(err) => {
+                tracing::warn!(hash = %address.hash, "bucket payload does not decompress: {err}");
+                return Err(StoreError::internal(format!(
+                    "bucket payload for {} failed its hash check: does not decompress: {err}",
+                    address.hash
+                )));
+            }
+        }
+    } else {
+        lore_storage::hash::hash_slice(payload)
+    };
+    if content_hash != address.hash {
+        tracing::warn!(hash = %address.hash, got = %content_hash, "bucket payload failed its hash check");
+        return Err(StoreError::internal(format!(
+            "bucket payload for {} failed its hash check, got {content_hash}",
+            address.hash
+        )));
+    }
+    Ok(())
+}
+
 fn header_bytes(mut fragment: Fragment) -> Bytes {
     let clear =
         FragmentFlags::PayloadStoredLocal.bits() | FragmentFlags::PayloadStoredDurable.bits();
@@ -478,9 +520,13 @@ mod tests {
         partition
     }
 
+    /// Four bytes of `hash_byte`: the content whose hash `addr(hash_byte, _)` names.
+    fn content(hash_byte: u8) -> Bytes {
+        Bytes::from(vec![hash_byte; 4])
+    }
+
     fn addr(hash_byte: u8, context_byte: u8) -> Address {
-        let mut hash = Hash::default();
-        hash.data_mut()[0] = hash_byte;
+        let hash = lore_storage::hash::hash_slice(&content(hash_byte));
         let mut context = Context::default();
         context.data_mut()[0] = context_byte;
         Address { hash, context }
@@ -494,10 +540,6 @@ mod tests {
         }
     }
 
-    fn payload(len: usize) -> Bytes {
-        Bytes::from(vec![7u8; len])
-    }
-
     fn store(client: Arc<MemoryClient>) -> Arc<BucketStore> {
         Arc::new(BucketStore::new(client, "guilds/one", None))
     }
@@ -509,13 +551,13 @@ mod tests {
         let address = addr(1, 2);
         store
             .clone()
-            .put(part(3), address, fragment(4), Some(payload(4)), false)
+            .put(part(3), address, fragment(4), Some(content(1)), false)
             .await
             .unwrap();
 
         let got = store.clone().get(part(3), address).await.unwrap();
         assert_eq!(got.match_made, StoreMatch::MatchFull);
-        assert_eq!(got.payload.unwrap(), payload(4));
+        assert_eq!(got.payload.unwrap(), content(1));
         assert_ne!(
             got.fragment.flags & FragmentFlags::PayloadStoredDurable.bits(),
             0
@@ -551,7 +593,7 @@ mod tests {
         let second = addr(4, 2);
         store
             .clone()
-            .put(part(1), first, fragment(4), Some(payload(4)), false)
+            .put(part(1), first, fragment(4), Some(content(4)), false)
             .await
             .unwrap();
         store
@@ -575,7 +617,7 @@ mod tests {
                 .unwrap()
                 .payload
                 .unwrap(),
-            payload(4)
+            content(4)
         );
 
         store
@@ -610,7 +652,7 @@ mod tests {
         let address = addr(6, 1);
         store
             .clone()
-            .put(part(1), address, fragment(4), Some(payload(4)), false)
+            .put(part(1), address, fragment(4), Some(content(6)), false)
             .await
             .unwrap();
         assert_eq!(store.clone().evict(0, true, None).await.unwrap(), 0);
@@ -623,7 +665,7 @@ mod tests {
         let store = store(Arc::clone(&client));
         store
             .clone()
-            .put(part(1), addr(7, 1), fragment(4), Some(payload(4)), false)
+            .put(part(1), addr(7, 1), fragment(4), Some(content(7)), false)
             .await
             .unwrap();
         store
@@ -664,5 +706,25 @@ mod tests {
                 .any(|key| key.ends_with("immutable/index/aa/index_00"))
         );
         assert!(keys.iter().all(|key| !key.contains("/pack/")));
+    }
+
+    #[tokio::test]
+    async fn get_rejects_a_damaged_bucket_payload() {
+        let client = MemoryClient::new();
+        let store = store(Arc::clone(&client));
+        let address = addr(8, 1);
+        store
+            .clone()
+            .put(part(1), address, fragment(4), Some(content(8)), false)
+            .await
+            .unwrap();
+        // Same length, one byte flipped: what bit rot in the bucket looks like.
+        let key = format!("guilds/one/payloads/{}", hex::encode(address.hash.data()));
+        client
+            .put(&key, Bytes::from(vec![8, 8, 9, 8]))
+            .await
+            .unwrap();
+        let err = store.get(part(1), address).await.unwrap_err();
+        assert!(err.to_string().contains("hash check"), "{err}");
     }
 }
