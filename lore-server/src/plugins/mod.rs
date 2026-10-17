@@ -88,7 +88,10 @@ pub mod traits;
 
 // Auto-discovered plugin modules
 pub mod aws;
+// dragon: start — Dragon bucket plugin (lore-bucket), compiled in from plugins/bucket.rs.
+// This file is generated. Edit lore-server/build.rs to keep this marker.
 pub mod bucket;
+// dragon: end
 pub mod hashicorp;
 
 // Re-export commonly used items at the module level
@@ -126,6 +129,9 @@ pub use traits::TopologyPluginFactory;
 /// ```
 pub fn register_all_plugins(registry: &mut PluginRegistry) {
     aws::register(registry);
+    // dragon: start — Dragon bucket plugin (lore-bucket), compiled in from plugins/bucket.rs.
+    // This file is generated. Edit lore-server/build.rs to keep this marker.
     bucket::register(registry);
+    // dragon: end
     hashicorp::register(registry);
 }

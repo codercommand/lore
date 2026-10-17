@@ -16,7 +16,7 @@ use crate::client::join_key;
 
 /// Which missing trees a restore may fill.
 pub struct RestoreSet {
-    /// `index/` has no index files.
+    /// `immutable/index/` has no index files.
     pub index: bool,
     /// `mutable/` has no files.
     pub mutable: bool,
@@ -39,7 +39,8 @@ impl From<ObjectError> for SnapshotError {
     }
 }
 
-/// True when `dir` contains a file that is not inside a `pack` directory.
+/// True when `dir` contains a file that is not inside a `pack` directory and
+/// is not the store's `lock` file.
 pub fn has_kept_file(dir: &Path) -> std::io::Result<bool> {
     if !dir.exists() {
         return Ok(false);
@@ -54,7 +55,7 @@ pub fn has_kept_file(dir: &Path) -> std::io::Result<bool> {
                     continue;
                 }
                 stack.push(path);
-            } else if path.is_file() {
+            } else if path.is_file() && entry.file_name() != "lock" {
                 return Ok(true);
             }
         }
@@ -62,8 +63,13 @@ pub fn has_kept_file(dir: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
-/// Upload `index/` and `mutable/`, skipping every `pack` directory, then write
-/// the manifest. Older generations are removed after the manifest is in place.
+/// Upload `immutable/` and `mutable/`, then write the manifest.
+///
+/// The local store keeps its index at `immutable/index/` and its branch files
+/// under `mutable/`. Pack directories are the cache. The `lock` file in each
+/// store directory is held for the life of the process; on Windows that lock
+/// is mandatory, so reading it fails with a lock violation. Neither belongs
+/// in the snapshot. Older generations are removed after the manifest is in place.
 pub async fn upload(
     client: &dyn ObjectClient,
     prefix: &str,
@@ -71,10 +77,10 @@ pub async fn upload(
 ) -> Result<(), SnapshotError> {
     let generation = new_generation();
     let root = format!("snapshot/g/{generation}");
-    let mut files = collect_tree(&local.join("index"), "index")?;
+    let mut files = collect_tree(&local.join("immutable"), "immutable")?;
     files.extend(collect_tree(&local.join("mutable"), "mutable")?);
     for (relative, path) in files {
-        let bytes = Bytes::from(std::fs::read(path)?);
+        let bytes = read_file(&path)?;
         client
             .put(&join_key(prefix, &format!("{root}/{relative}")), bytes)
             .await?;
@@ -120,7 +126,7 @@ pub async fn restore(
         let Some(relative) = key.strip_prefix(&list_prefix) else {
             continue;
         };
-        let keep = (which.index && relative.starts_with("index/"))
+        let keep = (which.index && relative.starts_with("immutable/"))
             || (which.mutable && relative.starts_with("mutable/"));
         if !keep {
             continue;
@@ -165,7 +171,7 @@ fn collect_tree(dir: &Path, key_prefix: &str) -> std::io::Result<Vec<(String, Pa
                     continue;
                 }
                 stack.push((path, format!("{prefix}/{name}")));
-            } else if path.is_file() {
+            } else if path.is_file() && name != "lock" {
                 out.push((format!("{prefix}/{name}"), path));
             }
         }
@@ -198,12 +204,21 @@ async fn delete_other_generations(
 fn local_file(root: &Path, relative: &str) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
     for part in relative.split('/') {
-        if part.is_empty() || part == "." || part == ".." || part == "pack" {
+        if part.is_empty() || part == "." || part == ".." || part == "pack" || part == "lock" {
             return None;
         }
         path.push(part);
     }
     Some(path)
+}
+
+fn read_file(path: &Path) -> Result<Bytes, SnapshotError> {
+    std::fs::read(path).map(Bytes::from).map_err(|err| {
+        SnapshotError::Io(std::io::Error::new(
+            err.kind(),
+            format!("reading {}: {err}", path.display()),
+        ))
+    })
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -228,24 +243,30 @@ mod tests {
     async fn snapshot_skips_packs_and_restores_a_missing_index() {
         let client = MemoryClient::new();
         let root = tempfile::tempdir().unwrap();
-        let index = root.path().join("index").join("aa");
+        let index = root.path().join("immutable").join("index").join("aa");
         std::fs::create_dir_all(index.join("pack")).unwrap();
         std::fs::write(index.join("index_00"), b"index-bytes").unwrap();
         std::fs::write(index.join("pack").join("data"), b"pack-bytes").unwrap();
+        std::fs::write(root.path().join("immutable").join("lock"), b"held").unwrap();
         let mutable = root.path().join("mutable");
         std::fs::create_dir_all(&mutable).unwrap();
         std::fs::write(mutable.join("branches"), b"branch-bytes").unwrap();
+        std::fs::write(mutable.join("lock"), b"held").unwrap();
 
         upload(client.as_ref(), "guilds/one", root.path())
             .await
             .unwrap();
 
         let keys = client.list("guilds/one/snapshot/").await.unwrap();
-        assert!(keys.iter().any(|key| key.ends_with("/index/aa/index_00")));
+        assert!(
+            keys.iter()
+                .any(|key| key.ends_with("/immutable/index/aa/index_00"))
+        );
         assert!(keys.iter().any(|key| key.ends_with("/mutable/branches")));
         assert!(keys.iter().all(|key| !key.contains("/pack/")));
+        assert!(keys.iter().all(|key| !key.ends_with("/lock")));
 
-        std::fs::remove_dir_all(root.path().join("index")).unwrap();
+        std::fs::remove_dir_all(root.path().join("immutable").join("index")).unwrap();
         std::fs::remove_file(mutable.join("branches")).unwrap();
         restore(
             client.as_ref(),
@@ -260,7 +281,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            std::fs::read(root.path().join("index/aa/index_00")).unwrap(),
+            std::fs::read(root.path().join("immutable/index/aa/index_00")).unwrap(),
             b"index-bytes"
         );
         assert_eq!(
@@ -273,7 +294,7 @@ mod tests {
     async fn restore_leaves_a_present_index_in_place() {
         let client = MemoryClient::new();
         let root = tempfile::tempdir().unwrap();
-        let index = root.path().join("index").join("aa");
+        let index = root.path().join("immutable").join("index").join("aa");
         std::fs::create_dir_all(&index).unwrap();
         std::fs::write(index.join("index_00"), b"first").unwrap();
         upload(client.as_ref(), "", root.path()).await.unwrap();
@@ -292,7 +313,7 @@ mod tests {
         .unwrap();
         assert_eq!(std::fs::read(index.join("index_00")).unwrap(), b"live");
 
-        std::fs::remove_dir_all(root.path().join("index")).unwrap();
+        std::fs::remove_dir_all(root.path().join("immutable").join("index")).unwrap();
         std::fs::create_dir_all(&index).unwrap();
         std::fs::write(index.join("index_00"), b"still-live").unwrap();
         restore(
@@ -310,5 +331,34 @@ mod tests {
             std::fs::read(index.join("index_00")).unwrap(),
             b"still-live"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_reads_while_the_store_holds_its_lock() {
+        let client = MemoryClient::new();
+        let root = tempfile::tempdir().unwrap();
+        let immutable = root.path().join("immutable");
+        let index = immutable.join("index").join("aa");
+        std::fs::create_dir_all(&index).unwrap();
+        std::fs::write(index.join("index_00"), b"index-bytes").unwrap();
+        let mutable = root.path().join("mutable");
+        std::fs::create_dir_all(&mutable).unwrap();
+        std::fs::write(mutable.join("branches"), b"branch-bytes").unwrap();
+        let _immutable_lock = lore_base::fs::lock::FSLock::acquire_directory_lock(&immutable)
+            .await
+            .unwrap();
+        let _mutable_lock = lore_base::fs::lock::FSLock::acquire_directory_lock(&mutable)
+            .await
+            .unwrap();
+
+        upload(client.as_ref(), "", root.path()).await.unwrap();
+
+        let keys = client.list("snapshot/").await.unwrap();
+        assert!(
+            keys.iter()
+                .any(|key| key.ends_with("/immutable/index/aa/index_00"))
+        );
+        assert!(keys.iter().any(|key| key.ends_with("/mutable/branches")));
+        assert!(keys.iter().all(|key| !key.ends_with("/lock")));
     }
 }

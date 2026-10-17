@@ -648,7 +648,7 @@ mod tests {
     async fn flush_snapshots_the_index_and_skips_packs() {
         let client = MemoryClient::new();
         let root = tempfile::tempdir().unwrap();
-        let index = root.path().join("index").join("aa");
+        let index = root.path().join("immutable").join("index").join("aa");
         std::fs::create_dir_all(index.join("pack")).unwrap();
         std::fs::write(index.join("index_00"), b"idx").unwrap();
         std::fs::write(index.join("pack").join("data"), b"pack").unwrap();
@@ -659,7 +659,10 @@ mod tests {
         ));
         store.flush(true).await.unwrap();
         let keys = client.list("snapshot/").await.unwrap();
-        assert!(keys.iter().any(|key| key.ends_with("index/aa/index_00")));
+        assert!(
+            keys.iter()
+                .any(|key| key.ends_with("immutable/index/aa/index_00"))
+        );
         assert!(keys.iter().all(|key| !key.contains("/pack/")));
     }
 }

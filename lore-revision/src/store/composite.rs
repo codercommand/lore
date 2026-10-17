@@ -1503,13 +1503,17 @@ impl ImmutableStore for CompositeStore {
     }
 
     async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+        // dragon: start — flush the durable tier after the local tier.
+        // Upstream returns after the local flush. The bucket plugin snapshots
+        // the index during its own flush, so that snapshot has to run after
+        // the local tier has written the index. When the local tier is itself
+        // the durable store, the second flush would snapshot nothing new.
         self.local.store().flush(sync_data).await?;
-        // The local tier writes the index the durable tier snapshots. When the
-        // local tier is itself the durable store, that one flush is enough.
         if !self.local_durable {
             self.durable.store().flush(sync_data).await?;
         }
         Ok(())
+        // dragon: end
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {

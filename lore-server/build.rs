@@ -226,6 +226,34 @@ fn write_if_changed(path: &Path, content: &str) -> Result<bool, Box<dyn Error>> 
     Ok(true)
 }
 
+// dragon: start — wrap Dragon's bucket plugin in the generated plugins/mod.rs.
+// plugins/mod.rs is rewritten by this script. A hand comment there is deleted
+// on the next lore-server build, so the marker has to be emitted here.
+fn write_bucket_marker(
+    content: &mut String,
+    name: &str,
+    start: bool,
+    indent: &str,
+) -> Result<(), Box<dyn Error>> {
+    if name != "bucket" {
+        return Ok(());
+    }
+    if start {
+        writeln!(
+            content,
+            "{indent}// dragon: start — Dragon bucket plugin (lore-bucket), compiled in from plugins/bucket.rs."
+        )?;
+        writeln!(
+            content,
+            "{indent}// This file is generated. Edit lore-server/build.rs to keep this marker."
+        )?;
+    } else {
+        writeln!(content, "{indent}// dragon: end")?;
+    }
+    Ok(())
+}
+// dragon: end
+
 /// Generates the mod.rs file for the plugins directory.
 fn generate_plugins_mod() -> Result<(), Box<dyn Error>> {
     let plugins_dir = Path::new("src/plugins");
@@ -248,10 +276,17 @@ fn generate_plugins_mod() -> Result<(), Box<dyn Error>> {
     if !modules.is_empty() {
         writeln!(content, "// Auto-discovered plugin modules")?;
         for module in &modules {
+            // dragon: start — plugins/mod.rs is regenerated. Emit the marker
+            // around `pub mod bucket` so a later Lore merge can find our module.
+            write_bucket_marker(&mut content, &module.name, true, "")?;
+            // dragon: end
             if let Some(feature) = &module.feature {
                 writeln!(content, "#[cfg(feature = \"{feature}\")]")?;
             }
             writeln!(content, "pub mod {};", module.name)?;
+            // dragon: start — close the marker emitted around `pub mod bucket`.
+            write_bucket_marker(&mut content, &module.name, false, "")?;
+            // dragon: end
         }
         writeln!(content)?;
     }
@@ -287,10 +322,17 @@ fn generate_plugins_mod() -> Result<(), Box<dyn Error>> {
         )?;
     } else {
         for module in &modules {
+            // dragon: start — plugins/mod.rs is regenerated. Emit the marker
+            // around bucket::register so a later Lore merge can find our line.
+            write_bucket_marker(&mut content, &module.name, true, "    ")?;
+            // dragon: end
             if let Some(feature) = &module.feature {
                 writeln!(content, "    #[cfg(feature = \"{feature}\")]")?;
             }
             writeln!(content, "    {}::register(registry);", module.name)?;
+            // dragon: start — close the marker emitted around bucket::register.
+            write_bucket_marker(&mut content, &module.name, false, "    ")?;
+            // dragon: end
         }
     }
     writeln!(content, "}}")?;

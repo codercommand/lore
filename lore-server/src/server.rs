@@ -1493,14 +1493,16 @@ async fn configure_composite_store(
         )
         .with_record_copy_out_of_band(settings.record_copy_out_of_band);
 
+    // dragon: start — restore a missing bucket index before the local store opens.
+    // Opening the local store creates empty index directories. Prepare would
+    // treat those as a live index and skip the restore. local_path is the
+    // composite local directory, the parent of immutable/ and mutable/.
     let local_path = settings
         .local
         .local
         .as_ref()
         .map(|local| local_store_path(&local.path));
 
-    // Restore a missing index before the local store creates empty directories
-    // that would look like a live index.
     if settings
         .durable
         .as_ref()
@@ -1515,30 +1517,39 @@ async fn configure_composite_store(
             warn!("bucket durable store has no local directory; index restore is skipped");
         }
     }
+    // dragon: end
 
     let store = Box::pin(configure_composite_substore(
         registry,
         &settings.local.mode,
         global_settings,
         &settings.local,
+        // dragon: start — snapshot_root argument. The local tier is not the bucket.
         None,
+        // dragon: end
     ))
     .await?;
     composite_store_builder =
         composite_store_builder.with_local(settings.local.mode.clone(), store)?;
 
     if let Some(durable_settings) = settings.durable.as_ref() {
+        // dragon: start — give the bucket plugin the cache directory as local_path.
+        // A path written in the toml is replaced, so the snapshot and the cache
+        // cannot point at different directories.
         let snapshot_root = if durable_settings.mode == "bucket" {
             local_path.as_deref()
         } else {
             None
         };
+        // dragon: end
         let store = Box::pin(configure_composite_substore(
             registry,
             &durable_settings.mode,
             global_settings,
             durable_settings,
+            // dragon: start — pass the cache directory into the bucket plugin.
             snapshot_root,
+            // dragon: end
         ))
         .await?;
         composite_store_builder =
@@ -1556,7 +1567,9 @@ async fn configure_composite_store(
                 &store_settings.mode,
                 global_settings,
                 store_settings,
+                // dragon: start — snapshot_root argument. Replicas are not the bucket.
                 None,
+                // dragon: end
             ))
             .await?;
 
@@ -1625,6 +1638,10 @@ async fn configure_composite_store(
     Ok(store)
 }
 
+// dragon: start — config for lore_bucket::prepare.
+// Copies the composite local directory into local_path. open() does this
+// again when the plugin starts. Prepare has to see the same path first,
+// or it restores into a directory the server will not use.
 fn bucket_plugin_config(global_settings: &Settings, local_path: &std::path::Path) -> toml::Value {
     let mut config =
         resolve_plugin_config_with_fallback(&global_settings.plugins, "bucket", "immutable_store")
@@ -1637,13 +1654,18 @@ fn bucket_plugin_config(global_settings: &Settings, local_path: &std::path::Path
     }
     config
 }
+// dragon: end
 
 async fn configure_composite_substore(
     registry: &PluginRegistry,
     mode: &str,
     global_settings: &Settings,
     settings: &CompositeSubStoreSettings,
+    // dragon: start — snapshot directory for durable mode "bucket".
+    // Other tiers pass None. lore_bucket snapshots immutable/ and mutable/
+    // under this path. Drop the argument if the bucket plugin goes away.
     snapshot_root: Option<&std::path::Path>,
+    // dragon: end
 ) -> Result<Arc<dyn ImmutableStore>> {
     match mode {
         store_mode::LOCAL => {
@@ -1675,6 +1697,9 @@ async fn configure_composite_substore(
         }
         _ => {
             // All other modes use the plugin system
+            // dragon: start — same local_path copy as prepare, for plugin open().
+            // plugin_config is mut so this can overwrite local_path. Server-owned
+            // so the toml cannot point the snapshot somewhere else.
             let mut plugin_config = resolve_plugin_config_with_fallback(
                 &global_settings.plugins,
                 mode,
@@ -1690,6 +1715,7 @@ async fn configure_composite_substore(
                     toml::Value::String(path.display().to_string()),
                 );
             }
+            // dragon: end
 
             info!(mode, "Creating composite substore via plugin system");
 

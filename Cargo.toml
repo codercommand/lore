@@ -4,7 +4,9 @@ members = [
     "lore",
     "lore-aws",
     "lore-base",
+    # dragon: start — workspace member for the Dragon bucket plugin.
     "lore-bucket",
+    # dragon: end
     "lore-capi",
     "lore-chaos-client",
     "lore-client",
@@ -102,7 +104,9 @@ zero_sized_map_values = "warn"
 lore = { path = "lore" }
 lore-aws = { path = "lore-aws" }
 lore-base = { path = "lore-base" }
+# dragon: start — Dragon bucket plugin. Durable mode "bucket" loads this crate.
 lore-bucket = { path = "lore-bucket" }
+# dragon: end
 lore-credential = { path = "lore-credential" }
 lore-error-set = { path = "lore-error-set" }
 lore-error-set-macro = { path = "lore-error-set-macro" }

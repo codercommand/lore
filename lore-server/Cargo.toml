@@ -61,7 +61,9 @@ opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 lore-base = { workspace = true }
 lore-aws = { workspace = true }
+# dragon: start — Dragon bucket plugin. plugins/bucket.rs registers it.
 lore-bucket = { workspace = true }
+# dragon: end
 lore-hashicorp = { workspace = true }
 lore-storage = { workspace = true }
 lore-revision = { workspace = true }

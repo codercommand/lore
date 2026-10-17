@@ -3,8 +3,9 @@
 //! Durable Lore tier for an S3-compatible bucket.
 //!
 //! Payloads and association markers live in the bucket. The local Lore index
-//! answers lookups. A snapshot of `index/` (without pack files) and `mutable/`
-//! is uploaded after flush so a missing local index can be restored.
+//! answers lookups. A snapshot of `immutable/` (without pack files or the
+//! process lock) and `mutable/` is uploaded after flush so a missing local
+//! index can be restored.
 
 mod client;
 mod config;
@@ -46,7 +47,8 @@ pub async fn prepare(config: &toml::Value) -> Result<(), BucketError> {
         return Ok(());
     };
     let local = PathBuf::from(local);
-    let index_absent = !snapshot::has_kept_file(&local.join("index")).map_err(BucketError::io)?;
+    let index_absent = !snapshot::has_kept_file(&local.join("immutable").join("index"))
+        .map_err(BucketError::io)?;
     let mutable_absent =
         !snapshot::has_kept_file(&local.join("mutable")).map_err(BucketError::io)?;
     if !index_absent && !mutable_absent {
