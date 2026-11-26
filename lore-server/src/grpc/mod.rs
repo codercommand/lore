@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use futures::FutureExt;
+use crate::authnz::repository_authorizer::Action;
 pub mod admin_service;
 pub mod environment;
 pub mod environment_service;
+pub mod forwarded_lock_service;
 pub mod forwarded_repository;
 pub mod forwarded_requests;
 pub mod forwarded_revision;
@@ -19,7 +20,10 @@ pub mod storage;
 pub mod storage_service;
 pub mod thinclient;
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context as TaskContext;
+use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -29,10 +33,13 @@ mod replication_service;
 pub mod tower;
 
 pub use admin_service::LoreAdminService;
+use futures::Stream;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
+use lore_base::error::Cancelled;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::branch::BranchError;
+use lore_revision::commit::CommitError;
 use lore_revision::diff::DiffError;
 use lore_revision::find::FindError;
 use lore_revision::immutable::ImmutableError;
@@ -41,14 +48,18 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
 use lore_revision::metadata::branch::BranchMetadataError;
 use lore_revision::metadata::repository::RepositoryMetadataError;
+use lore_revision::notification::NotificationSender;
 use lore_revision::repository::RepositoryError;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::ServerContext;
+use lore_revision::runtime::Cancellation;
 use lore_revision::state::StateError;
 use lore_storage::StoreError;
+use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::PARTITION_ID_KEY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
+use pin_project::pin_project;
 pub use repository::LoreRepositoryV1Service;
 pub use revision::LoreRevisionV1Service;
 pub use revision_service::LoreRevisionService;
@@ -58,7 +69,9 @@ pub use server::GrpcTimeouts;
 pub use storage_service::LoreStorageService;
 pub use thinclient::LoreThinClientV1Service;
 use tokio::sync::mpsc::Sender;
-use tokio::time::timeout;
+use tokio::time::Sleep;
+use tokio::time::sleep;
+use tokio_util::sync::WaitForCancellationFutureOwned;
 use tonic::Code;
 use tonic::Extensions;
 use tonic::Status;
@@ -68,17 +81,24 @@ use tracing::info;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::ResourceMatcher;
+use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+use crate::authnz::repository_authorizer::is_denial;
+use crate::authnz::repository_authorizer::permits_with;
+use crate::hooks::HookContext;
+use crate::hooks::HookDispatcher;
+use crate::hooks::HookPoint;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::MessageHandleError;
+use crate::util::core_hop::poll_with_request_cancellation;
+use crate::util::core_hop::request_cancellation;
+use crate::util::core_hop::request_is_cancelled;
 use crate::util::get_user_id_from_token_ref;
-use crate::util::resources_from_token;
 
 /// Matches the Infrastructure alerting rule regex
 /// for what counts as an internal status code error
@@ -211,6 +231,19 @@ pub fn get_repository(metadata: &MetadataMap) -> Result<RepositoryId, Status> {
     Ok(context.into())
 }
 
+/// Decodes a repository id carried in a request body.
+///
+/// The all-zero id is refused because it identifies the namespace-root
+/// partition, which holds the deployment's repository name table rather than
+/// a repository.
+pub fn requested_repository_id(id: &[u8]) -> Result<RepositoryId, Status> {
+    let id = Context::from(id);
+    if id.is_zero() {
+        return Err(Status::invalid_argument("Repository id must not be zero"));
+    }
+    Ok(id.into())
+}
+
 pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, Status> {
     match extensions.get::<AuthorizationToken>() {
         Some(auth) => Ok(auth.clone()),
@@ -247,7 +280,7 @@ pub fn link_read_authorizer(
     Arc::new(move |repository_id| {
         let token = token.as_ref().map(VerifiedTokenOwned::as_token);
         authorizer
-            .check_repository_access_sync(token.as_ref(), repository_id, None)
+            .check_repository_access_sync(token.as_ref(), repository_id, Action::Read)
             .is_some_and(|verdict| verdict.is_ok())
     })
 }
@@ -255,6 +288,15 @@ pub fn link_read_authorizer(
 pub fn get_user_id(extensions: &Extensions) -> String {
     let auth = extensions.get::<AuthorizationToken>();
     get_user_id_from_token_ref(auth)
+}
+
+/// Whether the caller's verified token marks it as a service account. False
+/// without a token.
+pub fn get_is_service_account(extensions: &Extensions) -> bool {
+    extensions
+        .get::<AuthorizationToken>()
+        .and_then(|token| token.is_service_account)
+        .unwrap_or(false)
 }
 
 /// Marker that opts the gRPC server crate into [`RepositoryWriteToken::server`].
@@ -271,6 +313,116 @@ const LORE_SERVER: LoreServer = LoreServer;
 /// without consulting the `RepositoryContext`.
 pub fn get_write_token() -> RepositoryWriteToken {
     RepositoryWriteToken::server(&LORE_SERVER)
+}
+
+/// The notification sender, the post hooks' dispatcher and context, and the instrument provider a
+/// branch create or delete uses once its write succeeds.
+pub(crate) struct BranchWriteFollowUp<P> {
+    pub(crate) notification_sender: Arc<dyn NotificationSender>,
+    pub(crate) hook_dispatcher: Arc<HookDispatcher>,
+    pub(crate) hook_context: HookContext,
+    pub(crate) instrument_provider: P,
+}
+
+/// Creates `branch` in `repository`, as `lore_revision::branch::create` does without a dry run or
+/// linked repositories, in a task that runs to its end ([`run_detached`]). Once the create
+/// succeeds, the task sends its notification, spawns its post hooks and counts it, with what
+/// `follow_up` holds. A request dropped part way stops neither the create between its writes nor
+/// what follows it.
+///
+/// Not an `async fn`, which would hold its arguments until its first poll, and spawn only then.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_branch_detached(
+    repository: Arc<lore_revision::repository::RepositoryContext>,
+    branch: lore_revision::lore::BranchId,
+    name: String,
+    category: String,
+    creator: String,
+    created: u64,
+    stack: Vec<lore_base::types::BranchPoint>,
+    follow_up: BranchWriteFollowUp<impl InstrumentProvider + Send + 'static>,
+) -> impl Future<Output = Result<Result<Context, BranchError>, Status>> {
+    run_detached("branch create", async move {
+        let repository_id = repository.id;
+        let branch = lore_revision::branch::create(
+            repository,
+            &get_write_token(),
+            branch,
+            name.as_str(),
+            category.as_str(),
+            creator.as_str(),
+            created,
+            stack,
+            false,
+            false,
+        )
+        .await?;
+        follow_up
+            .notification_sender
+            .branch_created(repository_id, branch)
+            .await;
+        follow_up
+            .hook_dispatcher
+            .spawn_post(HookPoint::BranchCreate, follow_up.hook_context);
+        follow_up
+            .instrument_provider
+            .counter("num_branches_created")
+            .add(1, &[]);
+        Ok::<_, BranchError>(branch)
+    })
+}
+
+/// Archives `branch` in `repository`, as `lore_revision::branch::delete` does, in a task that runs
+/// to its end ([`run_detached`]). Once the archive succeeds, the task sends its notification,
+/// spawns its post hooks and counts it, with what `follow_up` holds. A request dropped part way
+/// stops neither a settle nor an archive between its writes, nor what follows them.
+///
+/// Not an `async fn`, which would hold its arguments until its first poll, and spawn only then.
+pub(crate) fn delete_branch_detached(
+    repository: Arc<lore_revision::repository::RepositoryContext>,
+    branch: lore_revision::lore::BranchId,
+    follow_up: BranchWriteFollowUp<impl InstrumentProvider + Send + 'static>,
+) -> impl Future<Output = Result<Result<(), BranchError>, Status>> {
+    run_detached("branch delete", async move {
+        let repository_id = repository.id;
+        lore_revision::branch::delete(repository, branch).await?;
+        follow_up
+            .notification_sender
+            .branch_deleted(repository_id, branch)
+            .await;
+        follow_up
+            .hook_dispatcher
+            .spawn_post(HookPoint::BranchDelete, follow_up.hook_context);
+        follow_up
+            .instrument_provider
+            .counter("num_branches_deleted")
+            .add(1, &[]);
+        Ok::<_, BranchError>(())
+    })
+}
+
+/// Spawns `task`, named `what` in errors, in the current span, and answers its output. A request
+/// dropped part way, at its deadline or by its client, drops only the task's `JoinHandle`, which
+/// detaches the task, so the task isn't stopped between its writes. A task that panics fails as
+/// internal, with a warning.
+///
+/// Not an `async fn`, which would hold `task` in its future as well as spawn it: the task starts
+/// at the call, and the answer holds only its handle.
+#[lore_macro::test_pub]
+fn run_detached<T: Send + 'static>(
+    what: &'static str,
+    task: impl Future<Output = T> + Send + 'static,
+) -> impl Future<Output = Result<T, Status>> {
+    let handle = lore_base::lore_spawn!(tracing::Instrument::in_current_span(
+        crate::util::core_hop::outliving_request(task)
+    ));
+    async move {
+        handle.await.map_err(|err| {
+            warn_error_to_status(&err, |err| {
+                Status::internal(format!("The {what}'s task failed: {err}"))
+            })
+        })
+    }
 }
 
 pub(crate) fn metadata_to_attribute(
@@ -328,23 +480,163 @@ pub(crate) fn log_server_error(status: &Status) {
     }
 }
 
-pub fn is_owner_or_admin(extensions: &Extensions, repository: RepositoryId) -> bool {
-    let user_permissions = user_permissions(extensions, repository);
-    user_permissions.contains(&"owner".to_string())
-        || user_permissions.contains(&"admin".to_string())
+/// What the caller's grants allow for administering a repository, before
+/// the recorded creator is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositoryAdministration {
+    /// `owner` or `admin`; also `write` without a verified token, where there
+    /// is no identity to compare with the creator: every caller is
+    /// `<unknown>` while the recorded creator is whatever identity the client
+    /// sent at create.
+    Permitted,
+    /// `write`: permitted only to the recorded creator.
+    CreatorOnly,
+    Denied,
+    /// The caller's enumerated grants do not reach the repository at all. A
+    /// handler whose refusal would tell an existing repository from a missing
+    /// one answers this as the missing one.
+    Unreachable,
 }
 
-pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool {
-    user_permissions(extensions, repository).contains(&"obliterate".to_string())
+impl RepositoryAdministration {
+    pub fn permits(self, creator: &str, user_id: &str) -> bool {
+        match self {
+            Self::Permitted => true,
+            Self::CreatorOnly => creator == user_id,
+            Self::Denied | Self::Unreachable => false,
+        }
+    }
 }
 
-pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
-    user_permissions(extensions, repository).contains(&"migrate".to_string())
+/// Answered from the grants the partition-access layer enumerated for
+/// `repository` when the request carries them, else from one enumeration,
+/// else per action. `Err` when a check failed rather than denied.
+pub async fn repository_administration(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
+    repository: RepositoryId,
+) -> Result<RepositoryAdministration, Status> {
+    let token = get_verified_token(extensions);
+    let enumerated;
+    let grants = if let Some(grants) = extensions
+        .get::<PartitionGrants>()
+        .filter(|grants| grants.repository_id == repository)
+    {
+        Some(&grants.grants)
+    } else {
+        match authorizer.granted_actions(token.as_ref(), repository).await {
+            Ok(grants) => enumerated = grants,
+            Err(status) if is_denial(&status) => return Ok(RepositoryAdministration::Denied),
+            Err(status) => return Err(status),
+        }
+        enumerated.as_ref()
+    };
+    if grants.is_some_and(|grants| !grants.reachable()) {
+        return Ok(RepositoryAdministration::Unreachable);
+    }
+    let permits = async |action| {
+        permits_with(&**authorizer, grants, token.as_ref(), repository, action).await
+    };
+    Ok(
+        if permits(Action::Owner).await? || permits(Action::Admin).await? {
+            RepositoryAdministration::Permitted
+        } else if !permits(Action::Write).await? {
+            RepositoryAdministration::Denied
+        } else if token.is_none() {
+            RepositoryAdministration::Permitted
+        } else {
+            RepositoryAdministration::CreatorOnly
+        },
+    )
 }
 
-pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Vec<String> {
-    let user_resources = resources_from_token(get_authorization(extensions).ok());
-    ResourceMatcher::default().merged_permissions(&user_resources, repository)
+/// Whether `user_id` may administer `repository`, recorded as created by
+/// `creator`, per [`RepositoryAdministration`]. `Err` when a check failed
+/// rather than denied.
+pub async fn may_administer_repository(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
+    repository: RepositoryId,
+    creator: &str,
+    user_id: &str,
+) -> Result<bool, Status> {
+    Ok(
+        repository_administration(authorizer, extensions, repository)
+            .await?
+            .permits(creator, user_id),
+    )
+}
+
+/// The creator recorded in `repository`'s metadata. Reads only, so it does
+/// not repair the name mapping and may run before the caller is authorized.
+pub async fn repository_creator(
+    repository: Arc<lore_revision::repository::RepositoryContext>,
+) -> Result<String, Status> {
+    let to_status = |err: &lore_revision::repository::RepositoryError| {
+        if err.is_not_found() || err.is_repository_not_found() || err.is_address_not_found() {
+            Status::not_found("Repository does not exist")
+        } else {
+            Status::internal(format!("Failed to read repository metadata: {err}"))
+        }
+    };
+    let metadata_hash = lore_revision::repository::metadata_hash(repository.clone())
+        .await
+        .filter_slow_down()?
+        .warn_map_err(to_status)?;
+    let metadata = lore_revision::repository::metadata(repository, metadata_hash)
+        .await
+        .filter_slow_down()?
+        .warn_map_err(to_status)?;
+    Ok(metadata.creator)
+}
+
+/// Refuses with `permission_denied` unless the caller may administer
+/// `repository` or holds [`Action::SetProtected`]. The recorded creator is
+/// read only when the decision rests on it.
+pub async fn require_branch_protection_administration(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
+    repository: Arc<lore_revision::repository::RepositoryContext>,
+    user_id: &str,
+) -> Result<(), Status> {
+    if authorizer
+        .permits(extensions, repository.id, Action::SetProtected)
+        .await?
+    {
+        return Ok(());
+    }
+    let permitted = match repository_administration(authorizer, extensions, repository.id).await? {
+        RepositoryAdministration::Permitted => true,
+        RepositoryAdministration::CreatorOnly => repository_creator(repository).await? == user_id,
+        RepositoryAdministration::Denied | RepositoryAdministration::Unreachable => false,
+    };
+    if permitted {
+        Ok(())
+    } else {
+        info!(user_id, "Repository administration refused");
+        Err(Status::permission_denied(
+            "Not permitted to change branch protection",
+        ))
+    }
+}
+
+/// Whether the caller may perform `action` on the partition the request's
+/// metadata names, answered from the partition-access layer's grants when
+/// present. Denial is the uniform [`no_repository_access_status`].
+pub async fn require_action<T>(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    request: &tonic::Request<T>,
+    action: Action,
+) -> Result<(), Status> {
+    let repository = get_repository(request.metadata())?;
+    if authorizer
+        .permits(request.extensions(), repository, action)
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(no_repository_access_status())
+    }
 }
 
 pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> {
@@ -431,8 +723,9 @@ where
 
 /// Converts a [`HookError`] into a [`tonic::Status`].
 ///
-/// Maps [`StatusCode`] variants to their corresponding gRPC status codes.
-/// Non-rejection errors (timeout, panic, execution failure) map to `INTERNAL`.
+/// Maps [`StatusCode`] variants to their corresponding gRPC status codes. A
+/// timeout maps to `UNAVAILABLE`, so the client may retry. Other non-rejection
+/// errors (panic, execution failure) map to `INTERNAL`.
 pub fn hook_error_to_status(error: HookError) -> Status {
     match &error {
         HookError::Rejected {
@@ -444,7 +737,9 @@ pub fn hook_error_to_status(error: HookError) -> Status {
             StatusCode::InvalidArgument => Status::invalid_argument(message),
             StatusCode::Aborted => Status::aborted(message),
             StatusCode::Internal => Status::internal(message),
+            StatusCode::Unavailable => Status::unavailable(message),
         },
+        HookError::Timeout { .. } => Status::unavailable(error.to_string()),
         _ => Status::internal(error.to_string()),
     }
 }
@@ -461,13 +756,76 @@ pub fn authorization_timeout_status() -> Status {
     Status::cancelled("Authorization timeout exceeded")
 }
 
-pub fn timeout_grpc<T>(
+/// Runs a request handler with a deadline.
+///
+/// At the deadline the handler is cancelled, not dropped: it runs on to its next cancellation
+/// check, so a write it has started is never cut off part way. A handler that still fails as
+/// cancelled reports the timeout, and one that completes regardless keeps its result.
+pub fn timeout_grpc<T, F>(duration: Duration, fut: F) -> TimeoutGrpc<F>
+where
+    F: Future<Output = Result<T, Status>>,
+{
+    TimeoutGrpc {
+        handler: fut,
+        sleep: sleep(duration),
+        duration,
+        deadline: None,
+        elapsed: false,
+    }
+}
+
+/// The future [`timeout_grpc`] returns. It holds the handler future once, in place.
+#[pin_project]
+pub struct TimeoutGrpc<F> {
+    #[pin]
+    handler: F,
+    #[pin]
+    sleep: Sleep,
     duration: Duration,
-    fut: impl Future<Output = Result<T, Status>>,
-) -> impl Future<Output = Result<T, Status>> {
-    timeout(duration, fut).map(|result| {
-        result.unwrap_or_else(|_| Err(Status::cancelled("Request handler timeout exceeded")))
-    })
+    /// The handler's cancellation: a child of the request's, made on first poll.
+    deadline: Option<Cancellation>,
+    elapsed: bool,
+}
+
+impl<T, F> Future for TimeoutGrpc<F>
+where
+    F: Future<Output = Result<T, Status>>,
+{
+    type Output = Result<T, Status>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let deadline = this.deadline.get_or_insert_with(|| {
+            request_cancellation().map_or_else(Cancellation::new, |request| request.child())
+        });
+        let handler = this.handler;
+        if let Poll::Ready(result) =
+            poll_with_request_cancellation(deadline.clone(), || handler.poll(cx))
+        {
+            return Poll::Ready(match result {
+                // A client that left after the deadline keeps its own status. Any other
+                // CANCELLED returned after the deadline is reported as the timeout.
+                Err(status)
+                    if *this.elapsed
+                        && status.code() == Code::Cancelled
+                        && !deadline.is_parent_cancelled() =>
+                {
+                    Err(Status::cancelled("Request handler timeout exceeded"))
+                }
+                result => result,
+            });
+        }
+        if !*this.elapsed && this.sleep.poll(cx).is_ready() {
+            warn!(
+                timeout_ms = this.duration.as_millis(),
+                "Request handler timeout exceeded, cancelling"
+            );
+            *this.elapsed = true;
+            // Wakes the handler if it waits for cancellation, so it is polled again to see it.
+            deadline.cancel();
+        }
+        Poll::Pending
+    }
 }
 
 pub trait FilterSlowDownExt<T, E> {
@@ -497,6 +855,7 @@ macro_rules! impl_filter_slow_down {
 impl_filter_slow_down!(
     BranchError,
     BranchMetadataError,
+    CommitError,
     DiffError,
     FindError,
     ImmutableError,
@@ -506,6 +865,109 @@ impl_filter_slow_down!(
     RepositoryMetadataError,
     StateError,
     StoreError,
+);
+
+/// Fails with `CANCELLED` once the request being served has been cancelled, whether or not the
+/// caller has entered the request's execution context yet.
+///
+/// Call it only where returning leaves no partial write behind, as with
+/// [`lore_revision::runtime::check_cancelled`].
+pub fn check_request_cancelled() -> Result<(), Status> {
+    if request_is_cancelled() {
+        return Err(Status::cancelled(Cancelled.to_string()));
+    }
+    Ok(())
+}
+
+/// `stream`, ending once the request being served is cancelled rather than at its next message.
+pub fn until_request_cancelled<S: Stream>(stream: S) -> UntilCancelled<S> {
+    UntilCancelled {
+        stream,
+        cancellation: request_cancellation(),
+        waiting: None,
+        ended: false,
+    }
+}
+
+/// The stream [`until_request_cancelled`] returns. Each poll reads the cancellation's flags
+/// before polling the inner stream, and only an inner stream that is waiting also waits on the
+/// cancellation, so a message costs no lock.
+#[pin_project]
+pub struct UntilCancelled<S> {
+    #[pin]
+    stream: S,
+    cancellation: Option<Cancellation>,
+    #[pin]
+    waiting: Option<WaitForCancellationFutureOwned>,
+    ended: bool,
+}
+
+impl<S: Stream> Stream for UntilCancelled<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<S::Item>> {
+        let mut this = self.project();
+        if *this.ended {
+            return Poll::Ready(None);
+        }
+        if this
+            .cancellation
+            .as_ref()
+            .is_some_and(Cancellation::is_cancelled)
+        {
+            *this.ended = true;
+            return Poll::Ready(None);
+        }
+        if let Poll::Ready(item) = this.stream.poll_next(cx) {
+            *this.ended = item.is_none();
+            return Poll::Ready(item);
+        }
+        let Some(cancellation) = this.cancellation.as_ref() else {
+            return Poll::Pending;
+        };
+        if this.waiting.is_none() {
+            this.waiting.set(Some(cancellation.cancelled()));
+        }
+        if let Some(waiting) = this.waiting.as_pin_mut()
+            && waiting.poll(cx).is_ready()
+        {
+            *this.ended = true;
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    }
+}
+
+pub trait FilterCancelledExt<T, E> {
+    fn filter_cancelled(self) -> Result<Result<T, E>, Status>;
+}
+
+/// Implements [`FilterCancelledExt`] for error sets that declare a `Cancelled` variant: an
+/// operation that stopped because nobody waits for it any more becomes `CANCELLED`, and every
+/// other outcome passes through for the caller to match on.
+macro_rules! impl_filter_cancelled {
+    ($($error:ty),+ $(,)?) => {
+        $(
+            impl<T> FilterCancelledExt<T, $error> for Result<T, $error> {
+                fn filter_cancelled(self) -> Result<Result<T, $error>, Status> {
+                    if let Err(err) = &self
+                        && err.is_cancelled()
+                    {
+                        return Err(Status::cancelled(err.to_string()));
+                    }
+                    Ok(self)
+                }
+            }
+        )+
+    };
+}
+
+impl_filter_cancelled!(
+    BranchError,
+    DiffError,
+    LinkError,
+    RepositoryError,
+    StateError
 );
 
 /// Converts a failed result into `Ok(None)` when `discard` accepts the error,

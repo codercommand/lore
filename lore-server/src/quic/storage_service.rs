@@ -29,12 +29,14 @@ use tracing::debug;
 use tracing::info_span;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::UserAgentValue;
+use crate::protocol::storage::connect::connection_permits;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -55,7 +57,6 @@ use crate::telemetry::Transport;
 /// between v0 (`LoreStorageService`) and v4 (`StorageServiceV4`); the caller
 /// passes its `StorageProtocol` so v0 and v4 are distinguishable in traces via
 /// the `protocol` attribute.
-#[lore_macro::test_pub]
 pub(crate) fn build_storage_protocol_request_span(
     cmd: QuicOpCode,
     protocol: StorageProtocol,
@@ -298,6 +299,31 @@ pub enum ParsedStorageRequest {
     MutableCas(requests::MutableCas),
 }
 
+impl ParsedStorageRequest {
+    /// The action this command needs on the connection's partition beyond
+    /// reaching it, which connect already checked. `None` for reads, which
+    /// reaching the partition permits, and for the commands that set up the
+    /// connection. Exhaustive, so a new command cannot skip the decision.
+    pub fn required_action(&self) -> Option<Action> {
+        match self {
+            Self::Connect(_)
+            | Self::Correlate(_)
+            | Self::Get(_)
+            | Self::GetMetadata(_)
+            | Self::GetResolved(_)
+            | Self::Query(_)
+            | Self::MutableLoad(_) => None,
+            // Healing drops the server's index entries for a corrupt fragment.
+            Self::Verify(verify) => (verify.heal != 0).then_some(Action::Write),
+            Self::Put(_)
+            | Self::PutResolved(_)
+            | Self::Copy(_)
+            | Self::MutableStoreOp(_)
+            | Self::MutableCas(_) => Some(Action::Write),
+        }
+    }
+}
+
 fn quic_error(message_error: &MessageHandleError) -> QuicServiceError {
     match message_error {
         MessageHandleError::AuthorizationFailure(_) | MessageHandleError::MissingToken => {
@@ -442,7 +468,7 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
 }
 
 pub struct StorageService {
-    jwt_verifier: Arc<Option<JwtVerifier>>,
+    token_verification: Arc<TokenVerification>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -451,14 +477,14 @@ pub struct StorageService {
 
 impl StorageService {
     pub fn new(
-        jwt_verifier: Arc<Option<JwtVerifier>>,
+        token_verification: Arc<TokenVerification>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
         Self {
-            jwt_verifier,
+            token_verification,
             repository_authorizer,
             immutable_store,
             local_store,
@@ -490,12 +516,22 @@ impl QuicService for StorageService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
+        if let Some(action) = request.required_action()
+            && connection_permits(&context, self.repository_authorizer.as_ref(), action)
+                .await
+                .map_err(MessageHandleError::from_authorization)?
+                == Some(false)
+        {
+            return Err(MessageHandleError::AuthorizationFailure(
+                "Action not permitted".to_string(),
+            ));
+        }
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request
                     .handle_auth(
                         context,
-                        self.jwt_verifier.clone(),
+                        self.token_verification.clone(),
                         self.repository_authorizer.clone(),
                     )
                     .await
@@ -509,10 +545,10 @@ impl QuicService for StorageService {
             }
             ParsedStorageRequest::Verify(verify) => {
                 verify
-                    .handle(
+                    .handle_with(
                         context,
                         self.local_store.clone(),
-                        self.repository_authorizer.clone(),
+                        self.immutable_store.clone(),
                     )
                     .await
             }

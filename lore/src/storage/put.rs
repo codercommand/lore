@@ -39,7 +39,9 @@ use crate::storage::store::StoreInternal;
 
 /// One put item — a buffer to hash and store at `(partition, context)`.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy, Clone, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 pub struct LoreStoragePutItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -53,10 +55,30 @@ pub struct LoreStoragePutItem {
     pub remote_write: u8,
     /// Tag the fragment with `PayloadLocalCachePriority` so future remote reads always cache it locally
     pub local_cache: u8,
+    /// Ask the remote whether it already holds each fragment at its exact address before
+    /// compressing and uploading it, and upload none it holds. With `local_cache`, a fragment the
+    /// remote holds is still compressed for the local copy, and only its upload is spared. Costs a
+    /// round trip per fragment the local store does not know as stored remotely. A fragment it
+    /// knows under another context the remote holds is copied from there first, and asked about
+    /// only if the remote refuses the copy. Takes effect only where `remote_write` does. The field
+    /// sits in what was padding, so zero the whole item with `memset`, or give it static storage,
+    /// before setting its fields: a non-zero padding byte from a caller built against an older
+    /// header turns the query on
+    pub remote_query: u8,
     /// Leaf fragment size cap for large buffers; `0` lets `write_content` choose. Ignored
     /// for buffers under `FRAGMENT_SIZE_THRESHOLD`
     pub fixed_size_chunk: u64,
 }
+
+// Lock the C ABI layout of `LoreStoragePutItem` on a 64-bit target. `remote_query` sits in the
+// padding after `local_cache`, so a caller built against a header without it passes an item of the
+// same size, with `fixed_size_chunk` at the same offset.
+const _: () = assert!(std::mem::size_of::<LoreStoragePutItem>() == 72);
+const _: () = assert!(std::mem::offset_of!(LoreStoragePutItem, fixed_size_chunk) == 64);
+const _: () = assert!(
+    std::mem::offset_of!(LoreStoragePutItem, remote_query)
+        == std::mem::offset_of!(LoreStoragePutItem, local_cache) + 1
+);
 
 impl core::fmt::Debug for LoreStoragePutItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -64,6 +86,7 @@ impl core::fmt::Debug for LoreStoragePutItem {
             .field("id", &self.id)
             .field("data_len", &self.data.len)
             .field("remote_write", &self.remote_write)
+            .field("remote_query", &self.remote_query)
             .field("fixed_size_chunk", &self.fixed_size_chunk)
             .finish()
     }
@@ -71,7 +94,16 @@ impl core::fmt::Debug for LoreStoragePutItem {
 
 /// Arguments for `lore_storage_put`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(put_local)]
 pub struct LoreStoragePutArgs {
     /// Open storage handle
@@ -81,12 +113,12 @@ pub struct LoreStoragePutArgs {
 }
 
 /// Store one or more content-addressed buffers.
-pub async fn put(
+pub fn put(
     globals: LoreGlobalArgs,
     args: LoreStoragePutArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, put_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, put_local)
 }
 
 async fn put_local(
@@ -96,6 +128,7 @@ async fn put_local(
 ) -> i32 {
     let handle = args.handle;
     let per_call = crate::storage::store::PerCallFlags::from_globals(&globals);
+    let stats = globals.stats();
     storage_call(
         globals,
         callback,
@@ -112,7 +145,7 @@ async fn put_local(
             let effective = store.effective_flags(per_call)?;
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            crate::storage::fan_out_items!(items, "put", |item| {
+            crate::storage::fan_out_items!(items, "put", stats = stats, |item| {
                 let session = reuse.session_for(
                     &store,
                     item.partition,
@@ -181,6 +214,9 @@ async fn resolve_put_item(
     }
     if item.local_cache != 0 {
         write_options = write_options.with_local_cache_priority();
+    }
+    if item.remote_query != 0 {
+        write_options = write_options.with_remote_query();
     }
 
     write_content(

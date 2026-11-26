@@ -1,11 +1,32 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::time::Duration;
+
+use lore_revision::util::time::RetryPolicy;
+use lore_revision::util::time::RetrySettings;
 use lore_server::plugins::ImmutableStorePluginFactory;
 use lore_server::plugins::LockStorePluginFactory;
 use lore_server::plugins::MutableStorePluginFactory;
 use lore_server::plugins::PluginRegistry;
 use lore_server::plugins::aws::*;
 use tokio::runtime::Handle;
+
+const UNPROCESSED_KEYS_RETRY: &str = r#"
+    [dynamodb_unprocessed_keys_retry]
+    initial_backoff_ms = 20
+    max_backoff_ms = 30
+    max_attempts = 3
+    jitter = 0.0
+"#;
+
+/// The wait durations yielded by a retry built from `settings` until its limit is reached.
+fn waits(settings: &RetrySettings) -> Vec<Duration> {
+    let mut retry = RetryPolicy::from(settings).retry();
+    std::iter::from_fn(|| retry.next_interval()).collect()
+}
+
+/// The wait durations yielded by [`UNPROCESSED_KEYS_RETRY`], which has no jitter.
+const UNPROCESSED_KEYS_WAITS_MS: [u64; 3] = [20, 30, 30];
 
 #[test]
 fn test_immutable_store_factory_name() {
@@ -122,8 +143,9 @@ async fn test_config_deserialization_with_all_fields() {
             timeout_millis = 3000
             force_write = true
         "#;
+    let config_str = format!("{config_str}{UNPROCESSED_KEYS_RETRY}");
 
-    let config: toml::Value = toml::from_str(config_str).unwrap();
+    let config: toml::Value = toml::from_str(&config_str).unwrap();
     let plugin_config: AwsImmutableStorePluginConfig = config.try_into().unwrap();
 
     assert_eq!(plugin_config.s3_bucket, "test-bucket");
@@ -146,6 +168,13 @@ async fn test_config_deserialization_with_all_fields() {
     assert_eq!(plugin_config.dynamodb_slow_operation_threshold_millis, 500);
     assert_eq!(plugin_config.timeout_millis, 3000);
     assert!(plugin_config.force_write);
+    let retry = plugin_config
+        .dynamodb_unprocessed_keys_retry
+        .expect("the unprocessed keys retry is configured");
+    assert_eq!(
+        waits(&retry),
+        UNPROCESSED_KEYS_WAITS_MS.map(Duration::from_millis)
+    );
 }
 
 /// A configuration written before this change points at the table holding fragment metadata,
@@ -214,6 +243,23 @@ async fn test_config_deserialization_with_defaults() {
     );
     assert_eq!(plugin_config.timeout_millis, 5000);
     assert!(!plugin_config.force_write);
+    assert!(plugin_config.dynamodb_unprocessed_keys_retry.is_none());
+}
+
+#[tokio::test]
+async fn test_lock_store_config_reads_the_unprocessed_keys_retry() {
+    let config_str = format!("dynamodb_table = \"locks\"\n{UNPROCESSED_KEYS_RETRY}");
+
+    let config: toml::Value = toml::from_str(&config_str).unwrap();
+    let plugin_config: AwsLockStorePluginConfig = config.try_into().unwrap();
+
+    let retry = plugin_config
+        .dynamodb_unprocessed_keys_retry
+        .expect("the unprocessed keys retry is configured");
+    assert_eq!(
+        waits(&retry),
+        UNPROCESSED_KEYS_WAITS_MS.map(Duration::from_millis)
+    );
 }
 
 #[tokio::test]
@@ -234,4 +280,96 @@ async fn test_lock_store_config_error_includes_field_name() {
         "Error message should mention the missing field 'dynamodb_table', got: {}",
         config_err.message
     );
+}
+
+/// An immutable store config whose shared `http` table sets `shared` as its limit, and whose S3 and
+/// `DynamoDB` clients set `s3` and `dynamodb`.
+fn immutable_config(
+    shared: Option<usize>,
+    s3: Option<usize>,
+    dynamodb: Option<usize>,
+) -> AwsImmutableStorePluginConfig {
+    let limit = |key: &str, value: Option<usize>| {
+        value.map_or(String::new(), |value| format!("{key} = {value}\n"))
+    };
+    let text = format!(
+        "s3_bucket = \"b\"\n\
+         dynamodb_fragments_table = \"f\"\n\
+         dynamodb_fragment_state_table = \"s\"\n\
+         {}{}\
+         [http]\n\
+         pool_idle_timeout_seconds = 7\n\
+         nodelay = true\n\
+         connection_acquire_timeout_millis = 250\n\
+         {}",
+        limit("s3_max_connections", s3),
+        limit("dynamodb_max_connections", dynamodb),
+        limit("max_connections", shared),
+    );
+
+    toml::from_str(&text).expect("the config parses")
+}
+
+mod s3_http {
+    use std::num::NonZeroUsize;
+
+    use super::*;
+
+    /// The S3 client's own limit replaces the shared one, and the shared settings are otherwise
+    /// kept.
+    #[test]
+    fn its_own_limit_replaces_the_shared_limit() {
+        let s3 = immutable_config(Some(100), Some(40), Some(60)).s3_http();
+
+        assert_eq!(s3.max_connections, NonZeroUsize::new(40));
+        assert_eq!(s3.pool_idle_timeout_seconds, 7);
+        assert!(s3.nodelay);
+        assert_eq!(s3.connection_acquire_timeout_millis, Some(250));
+    }
+
+    #[test]
+    fn without_its_own_limit_the_shared_limit_applies() {
+        let s3 = immutable_config(Some(100), None, Some(60)).s3_http();
+
+        assert_eq!(s3.max_connections, NonZeroUsize::new(100));
+    }
+
+    #[test]
+    fn its_own_limit_applies_where_none_is_shared() {
+        let s3 = immutable_config(None, Some(40), None).s3_http();
+
+        assert_eq!(s3.max_connections, NonZeroUsize::new(40));
+    }
+}
+
+mod dynamodb_http {
+    use std::num::NonZeroUsize;
+
+    use super::*;
+
+    /// The `DynamoDB` client's own limit replaces the shared one, and the shared settings are
+    /// otherwise kept.
+    #[test]
+    fn its_own_limit_replaces_the_shared_limit() {
+        let dynamodb = immutable_config(Some(100), Some(40), Some(60)).dynamodb_http();
+
+        assert_eq!(dynamodb.max_connections, NonZeroUsize::new(60));
+        assert_eq!(dynamodb.pool_idle_timeout_seconds, 7);
+        assert!(dynamodb.nodelay);
+        assert_eq!(dynamodb.connection_acquire_timeout_millis, Some(250));
+    }
+
+    #[test]
+    fn without_its_own_limit_the_shared_limit_applies() {
+        let dynamodb = immutable_config(Some(100), Some(40), None).dynamodb_http();
+
+        assert_eq!(dynamodb.max_connections, NonZeroUsize::new(100));
+    }
+
+    #[test]
+    fn without_any_limit_there_is_none() {
+        let dynamodb = immutable_config(None, Some(40), None).dynamodb_http();
+
+        assert_eq!(dynamodb.max_connections, None);
+    }
 }

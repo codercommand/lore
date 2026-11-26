@@ -12,6 +12,8 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::runtime::CancellationCheck;
+use lore_revision::state::no_link_traversal;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::Stream;
@@ -77,7 +79,12 @@ pub async fn handler(
         LORE_CONTEXT
             .scope(execution, async move {
                 let mut tasks: JoinSet<()> = JoinSet::new();
+                let cancellation = CancellationCheck::current();
                 for id in candidate_ids {
+                    // Loads already started finish rather than being aborted part way.
+                    if cancellation.check().is_err() || tx.is_closed() {
+                        break;
+                    }
                     let immutable_store = immutable_store.clone();
                     let mutable_store = mutable_store.clone();
                     let creator_filter = creator_filter.clone();
@@ -126,6 +133,7 @@ async fn load_and_filter_repository(
         immutable_store,
         mutable_store,
         id,
+        no_link_traversal(),
     ));
 
     let metadata_hash = match repository::metadata_hash(repository.clone())

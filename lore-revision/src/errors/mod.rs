@@ -29,6 +29,7 @@ pub(crate) use lore_base::error::AlreadyLinked;
 pub(crate) use lore_base::error::BranchAdvanced;
 pub(crate) use lore_base::error::BranchAlreadyExists;
 pub(crate) use lore_base::error::BranchNotFound;
+pub(crate) use lore_base::error::Cancelled;
 pub(crate) use lore_base::error::Conflict;
 pub(crate) use lore_base::error::DeleteCurrent;
 pub(crate) use lore_base::error::DeleteDefault;
@@ -42,8 +43,10 @@ pub(crate) use lore_base::error::InvalidArguments;
 pub(crate) use lore_base::error::InvalidNodeHierarchy;
 pub(crate) use lore_base::error::InvalidPath;
 pub(crate) use lore_base::error::LayerNotFound;
+pub(crate) use lore_base::error::LinkDivergent;
 pub(crate) use lore_base::error::LinkNotFound;
 pub(crate) use lore_base::error::LinkPathNotFound;
+pub(crate) use lore_base::error::LinkPinsDiverge;
 pub(crate) use lore_base::error::LocalModifications;
 pub(crate) use lore_base::error::LockNotFound;
 pub(crate) use lore_base::error::LockNotOwned;
@@ -69,11 +72,15 @@ pub(crate) use lore_base::error::SharedStoreNotFound;
 pub(crate) use lore_base::error::SlowDown;
 pub(crate) use lore_base::error::TokenNotFound;
 pub(crate) use lore_base::error::WriteRequired;
+pub(crate) use lore_base::error::forward_refusal_or;
+pub(crate) use lore_base::error::is_refusal;
 
 #[error_set]
 pub enum StateErrors {
+    Cancelled,
     NodeNotFound,
     LinkNotFound,
+    LinkPinsDiverge,
     NotFound,
     RevisionNotFound,
     WriteRequired,
@@ -151,4 +158,18 @@ where
         Err(err) if propagate(&err) => Err(err).forward_any::<Target>(context),
         Err(_) => Ok(None),
     }
+}
+
+/// [`absent_unless`] holding back a refusal of the caller. `Target` must declare both refusal
+/// variants, as [`forward_refusal_or`] requires, so a refusal cannot become `Internal`.
+#[track_caller]
+pub(crate) fn absent_unless_refused<T, Source, Target>(
+    result: Result<T, Source>,
+    context: &str,
+) -> Result<Option<T>, Target>
+where
+    Source: ErrorSet + FfiError,
+    Target: ErrorSet + Has<NotAuthenticated> + Has<NotAuthorized>,
+{
+    absent_unless(result, is_refusal, context)
 }

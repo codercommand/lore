@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use lore_base::types::RepositoryId;
 use tonic::Status;
 
+use super::repository_authorizer::Action;
 use super::repository_authorizer::Grants;
 use super::repository_authorizer::RepositoryAuthorizer;
 use super::repository_authorizer::VerifiedToken;
@@ -17,8 +18,7 @@ use crate::auth::jwt::ResourcePermission;
 /// resource entries. An entry matches a repository when its resource name
 /// equals what `resource_id_template` renders for it, or equals
 /// `resource_wildcard`. Permissions are merged across all matching entries.
-/// A token with no matching resource entry is denied everything,
-/// `action: None` included.
+/// A token with no matching resource entry is denied everything.
 ///
 /// The two fields inside a resource entry follow the same rule: the resource
 /// name is read from the field named by `[server.auth].resource_id_claim`
@@ -47,6 +47,17 @@ impl ResourceGrantsAuthorizer {
             resource_id_claim,
             permission_claim: permission_claim.unwrap_or_else(|| "permission".to_string()),
             matcher: ResourceMatcher::new(resource_id_template, resource_wildcard),
+        }
+    }
+
+    /// Whether the token carries nothing at the resource claim: the claim is absent, null
+    /// or an empty array. A claim holding only entries that [`grants`](Self::grants) skips
+    /// as malformed is not empty.
+    fn has_no_resource_claim(&self, token: &VerifiedToken<'_>) -> bool {
+        match token.claims.claim_at(&self.resource_claim) {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::Array(entries)) => entries.is_empty(),
+            Some(_) => false,
         }
     }
 
@@ -113,7 +124,7 @@ impl ResourceGrantsAuthorizer {
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Result<(), Status> {
         let Some(token) = token else {
             return Err(Status::unauthenticated("No token"));
@@ -122,10 +133,10 @@ impl ResourceGrantsAuthorizer {
         if !self.matcher.any_match(&entries, repository_id) {
             return Err(Status::permission_denied("No grant for repository"));
         }
-        match action {
-            None => Ok(()),
-            Some(action) if self.matcher.permits(&entries, repository_id, action) => Ok(()),
-            Some(_) => Err(Status::permission_denied("Action not permitted")),
+        if self.matcher.permits(&entries, repository_id, action) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("Action not permitted"))
         }
     }
 }
@@ -136,16 +147,39 @@ impl RepositoryAuthorizer for ResourceGrantsAuthorizer {
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Result<(), Status> {
         self.check(token, repository_id, action)
+    }
+
+    /// A token with nothing at the resource claim is a login token, and looks any
+    /// repository up: the client does so before it can exchange for a token naming the
+    /// repository. A token with anything there is an exchanged access token, and looks up
+    /// only the repositories its entries match, so none when every entry is malformed. Nothing else tells the two apart when one issuer mints both, so
+    /// this relies on the issuer never minting an access token with an empty claim. See
+    /// ADR-00043.
+    async fn check_repository_lookup(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+    ) -> Result<(), Status> {
+        let Some(token) = token else {
+            return Err(Status::unauthenticated("No token"));
+        };
+        if self.has_no_resource_claim(token)
+            || self.matcher.any_match(&self.grants(token), repository_id)
+        {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("No grant for repository"))
+        }
     }
 
     fn check_repository_access_sync(
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Option<Result<(), Status>> {
         Some(self.check(token, repository_id, action))
     }

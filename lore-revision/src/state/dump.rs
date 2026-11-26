@@ -28,7 +28,7 @@ pub async fn dump(
     max_depth: usize,
 ) -> Result<(), StateError> {
     // Dump out the merkle tree
-    let tree_hash = state.data.read().hash_tree;
+    let tree_hash = state.data_read().hash_tree;
     let tree = state.tree(repository.clone()).await?;
     event::LoreEvent::RepositoryStateDump(LoreRepositoryStateDumpEventData {
         revision_number: state.revision_number(),
@@ -39,16 +39,16 @@ pub async fn dump(
     .send();
 
     if let Some(path) = path {
-        let node_link = state
-            .find_node_link(repository.clone(), path.as_str())
+        let held = state
+            .locate_held_node_below(repository.clone(), ROOT_NODE, path.as_str())
             .await?;
-        let link_repository = repository.to_link_context(node_link.repository).await;
-        let entry_node = state.node(link_repository.clone(), node_link.node).await?;
+        let entry_node = held.read().await?;
+        let (node_id, (link_repository, link_state)) = held.into_parts();
         let mut cycle = SiblingCycleGuard::new(entry_node.parent);
         dump_node(
-            state.clone(),
+            link_state,
             link_repository,
-            node_link.node,
+            node_id,
             entry_node.parent,
             RelativePathBuf::new(),
             0,

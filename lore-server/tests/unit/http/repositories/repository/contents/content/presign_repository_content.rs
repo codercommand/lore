@@ -1,57 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::Arc;
-
 use axum::http::StatusCode;
-use axum_test::TestServer;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_server::auth::jwt::AuthorizationToken;
-use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
-use lore_server::http::repositories::repository::contents::content::presign_repository_content::call_is_service_account;
 use lore_server::http::security_headers::ContentTypePolicy;
-use lore_server::http::server::LoreHttpServerSettings;
-use lore_server::http::server::ServerHealth;
-use lore_server::http::server::ServerState;
-use lore_server::http::server::create_router;
 use rand::random;
 use serde_json::json;
 
+use crate::http::test_utils::MISSING_ADDRESS;
+use crate::http::test_utils::build_test_server;
 use crate::http::test_utils::content_type_policy;
 use crate::http::test_utils::presign_config_with_policy;
 use crate::store::test_support::test_store_create;
-
-fn token_with_service_account(is_service_account: Option<bool>) -> AuthorizationToken {
-    AuthorizationToken {
-        is_service_account,
-        ..Default::default()
-    }
-}
-
-#[test]
-fn service_account_may_vend() {
-    assert!(call_is_service_account(&Some(token_with_service_account(
-        Some(true)
-    ))));
-}
-
-#[test]
-fn non_service_account_may_not_vend() {
-    assert!(!call_is_service_account(&Some(token_with_service_account(
-        Some(false)
-    ))));
-}
-
-#[test]
-fn missing_service_account_claim_may_not_vend() {
-    assert!(!call_is_service_account(&Some(token_with_service_account(
-        None
-    ))));
-}
-
-#[test]
-fn no_auth_configured_may_vend() {
-    assert!(call_is_service_account(&None));
-}
 
 async fn mint(body: serde_json::Value) -> axum_test::TestResponse {
     mint_with_policy(body, ContentTypePolicy::default()).await
@@ -70,23 +29,18 @@ async fn mint_with_policy(
         .scope(execution, async move {
             let repository = random::<lore_revision::lore::RepositoryId>();
             let repo_hex = format!("{repository}");
-            let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
+            let address = MISSING_ADDRESS;
 
-            let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-            let state = ServerState {
+            let server = build_test_server(
                 immutable_store,
                 mutable_store,
-                jwt_verifier: None,
-                repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-                max_file_size: 100,
-                presign_config: Some(presign_config_with_policy(policy)),
-            };
-            let settings = LoreHttpServerSettings::test_default();
-            let server =
-                TestServer::new(create_router(state, test_health, &settings)).unwrap();
+                Some(presign_config_with_policy(policy)),
+            );
 
             server
-                .post(&format!("/v1/repository/{repo_hex}/content/{address}/presign"))
+                .post(&format!(
+                    "/v1/repository/{repo_hex}/content/{address}/presign"
+                ))
                 .json(&body)
                 .await
         })
@@ -144,4 +98,66 @@ async fn returns_400_for_unserializable_header_value() {
     // an invalid header value; mint must reject rather than let redeem 500.
     let response = mint(json!({"content_type": "image/png; x=\u{7}"})).await;
     assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+}
+
+mod handler {
+    use std::sync::Arc;
+
+    use axum::Extension;
+    use axum::Json;
+    use axum::extract::Path;
+    use axum::extract::State;
+    use axum::http::Extensions;
+    use axum::http::HeaderMap;
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt as _;
+    use lore_server::http::presign_token::token_hash;
+    use lore_server::http::repositories::repository::contents::content::presign_repository_content::handler;
+
+    use super::*;
+    use crate::http::test_utils::presign_config;
+    use crate::http::test_utils::put_compressed_content;
+    use crate::http::test_utils::test_state;
+    use crate::log_capture::CapturedLogs;
+
+    /// Minting logs the same token hash a redemption of the URL logs, beside the minter.
+    #[tokio::test]
+    async fn a_minted_url_is_logged_with_its_token_hash_and_minter() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = random::<lore_revision::lore::RepositoryId>();
+                let address = put_compressed_content(immutable_store.clone(), repository).await;
+                let (repository, address) = (format!("{repository}"), format!("{address}"));
+                let state = test_state(immutable_store, mutable_store, Some(presign_config()));
+
+                let (logs, _guard) = CapturedLogs::start();
+                let response = handler(
+                    State(Arc::new(state)),
+                    Path((repository.clone(), address.clone())),
+                    Extension(None),
+                    Extensions::new(),
+                    HeaderMap::new(),
+                    Json(serde_json::from_value(json!({})).unwrap()),
+                )
+                .await
+                .into_response();
+
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let url_suffix = body["url_suffix"].as_str().expect("url_suffix");
+                let (_, token) = url_suffix.split_once("?token=").expect("token in URL");
+                let fields = logs.event("Minted presigned URL");
+                assert_eq!(fields["token_hash"], token_hash(token));
+                assert_eq!(fields["user_id"], "<unknown>");
+                assert_eq!(fields["key_id"], "test_key_id_1234");
+                assert_eq!(fields["repository"], repository);
+                assert_eq!(fields["address"], address);
+                assert_eq!(fields["expires_at"], body["expires_at"]);
+                assert!(!logs.text().contains(token), "{}", logs.text());
+            })
+            .await;
+    }
 }

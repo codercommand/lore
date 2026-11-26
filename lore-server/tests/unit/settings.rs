@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use lore_revision::cluster::peer::Locality;
+use lore_revision::store::composite::ReadReplicaSelection;
 use lore_server::plugins::PluginRegistry;
 use lore_server::settings::*;
 use lore_server::store::resolve_plugin_config_with_fallback;
@@ -53,6 +56,29 @@ fn server_settings_default_the_local_store_monitor_table() {
         server.local_store_monitor.low_space_threshold_bytes,
         TEN_GIB
     );
+}
+
+/// A `remote` store opens four storage connections to its upstream unless `[server]` names another
+/// count.
+#[test]
+fn server_settings_default_four_upstream_connections() {
+    let default: ServerSettings = toml::from_str("").expect("[server] with no keys");
+    let named: ServerSettings =
+        toml::from_str("upstream_connections = 2").expect("[server] naming a count");
+
+    assert_eq!(default.upstream_connections, 4);
+    assert_eq!(named.upstream_connections, 2);
+}
+
+/// Each socket limit that `[server.uds]` does not name takes its default.
+#[test]
+fn uds_settings_default_limits_of_their_own() {
+    let uds: UdsSettings = toml::from_str("enabled = true").expect("[server.uds] with defaults");
+
+    assert_eq!(uds.credits, 4000);
+    assert_eq!(uds.credit_bytes, 256 * 1024 * 1024);
+    assert_eq!(uds.max_connections_per_socket, 64);
+    assert_eq!(uds.socket_bytes, 1024 * 1024 * 1024);
 }
 
 #[test]
@@ -123,7 +149,6 @@ fn auth_settings_authorization_fields_round_trip() {
             resource_id_claim = "rsname"
             resource_id_template = "repo:{id}"
             resource_wildcard = "urc-*"
-            identity_claim = "preferred_username"
             baseline_access = "reachable"
             repository_catalog = "auth_service"
             repository_catalog_url = "https://catalog.example.com"
@@ -136,7 +161,6 @@ fn auth_settings_authorization_fields_round_trip() {
     assert_eq!(auth.resource_id_claim, "rsname");
     assert_eq!(auth.resource_id_template, "repo:{id}");
     assert_eq!(auth.resource_wildcard, "urc-*");
-    assert_eq!(auth.identity_claim, "preferred_username");
     assert_eq!(auth.baseline_access, BaselineAccess::Reachable);
     assert_eq!(
         auth.repository_catalog,
@@ -149,8 +173,8 @@ fn auth_settings_authorization_fields_round_trip() {
 }
 
 /// A config setting none of the authorization fields gets the documented
-/// defaults: the `urc-` template and wildcard literals, `sub` as the
-/// identity claim, and no permission or resource claim selected.
+/// defaults: the `urc-` template and wildcard literals, and no permission or
+/// resource claim selected.
 #[test]
 fn auth_settings_authorization_fields_have_backward_compatible_defaults() {
     let auth: AuthSettings = toml::from_str(
@@ -167,7 +191,6 @@ fn auth_settings_authorization_fields_have_backward_compatible_defaults() {
     assert_eq!(auth.baseline_access, BaselineAccess::Denied);
     assert_eq!(auth.permission_claim, None);
     assert_eq!(auth.resource_claim, None);
-    assert_eq!(auth.identity_claim, "sub");
     assert_eq!(auth.repository_catalog, None);
     assert_eq!(auth.repository_catalog_url, None);
     assert_eq!(auth.jwt_typ, None);
@@ -282,6 +305,80 @@ fn settings_with_oidc_keys(authorizer_keys: &str, oidc_keys: &str) -> Settings {
         "#
     ))
     .expect("[server.auth.oidc] must parse")
+}
+
+/// Only an exchange issuer `jwt_issuer` doesn't list gets keys of its own.
+#[test]
+fn a_separate_exchange_issuer_is_one_jwt_issuer_does_not_list() {
+    let separate_exchange_issuer = |oidc_keys: &str| {
+        settings_with_oidc_keys(TIER_2, oidc_keys)
+            .server
+            .auth
+            .expect("[server.auth] is present")
+            .separate_exchange_issuer()
+            .map(str::to_string)
+    };
+    let template = r#"resource_template = "https://lore.example.com/partitions/{id}""#;
+
+    assert_eq!(
+        separate_exchange_issuer(&format!(
+            "{template}\ntoken_exchange_issuer = \"https://sts.example.com\""
+        )),
+        Some("https://sts.example.com".to_string())
+    );
+    for not_separate in [
+        String::new(),
+        "token_exchange_issuer = \"\"".to_string(),
+        "token_exchange_issuer = \"https://auth.example.com\"".to_string(),
+    ] {
+        assert_eq!(
+            separate_exchange_issuer(&format!("{template}\n{not_separate}")),
+            None,
+            "{not_separate}"
+        );
+    }
+
+    // During an issuer cutover the exchange issuer can be the second jwt_issuer entry, whose
+    // tokens the jwt_issuer keys verify.
+    let cutover = settings_with_auth_keys(&format!(
+        r#"
+            jwt_issuer = ["https://auth.example.com", "https://sts.example.com"]
+            jwt_audience = ["lore-service"]
+            {TIER_2}
+
+            [server.auth.oidc]
+            client_id = "lore-cli"
+            {template}
+            token_exchange_issuer = "https://sts.example.com"
+        "#
+    ))
+    .expect("must parse")
+    .server
+    .auth
+    .expect("[server.auth] is present");
+    assert_eq!(cutover.separate_exchange_issuer(), None);
+}
+
+/// The exchange issuer's keys are found through its discovery document, which only an
+/// issuer URL has.
+#[test]
+fn a_token_exchange_issuer_that_is_not_a_url_fails_validation() {
+    for issuer in ["sts", "ftp://sts.example.com"] {
+        let settings = settings_with_oidc_keys(
+            TIER_2,
+            &format!(
+                "resource_template = \"https://lore.example.com/partitions/{{id}}\"\n\
+                 token_exchange_issuer = \"{issuer}\""
+            ),
+        );
+        assert!(validate_auth_config(&settings).is_err(), "{issuer}");
+    }
+    let settings = settings_with_oidc_keys(
+        TIER_2,
+        "resource_template = \"https://lore.example.com/partitions/{id}\"\n\
+         token_exchange_issuer = \"https://sts.example.com\"",
+    );
+    assert!(validate_auth_config(&settings).is_ok());
 }
 
 #[test]
@@ -421,6 +518,45 @@ fn oidc_invalid_tier_2_fails_validation_naming_both_settings() {
     }
 }
 
+/// A template without `{id}` names the same resource for every partition: the client
+/// would ask for one token for all of them, and the server would match one claim entry
+/// against every partition. Each is refused at startup, naming the setting.
+#[test]
+fn a_partition_template_without_its_placeholder_fails_validation() {
+    let cases = [
+        (
+            settings_with_oidc_keys(
+                TIER_2,
+                r#"resource_template = "https://lore.example.com/partitions/{ID}""#,
+            ),
+            "server.auth.oidc.resource_template",
+        ),
+        (
+            settings_with_oidc_keys(TIER_2, r#"scope_template = "partition""#),
+            "server.auth.oidc.scope_template",
+        ),
+        (
+            settings_with_oidc_keys(
+                r#"
+                    resource_claim = "resources"
+                    resource_id_template = "urc-all"
+                    "#,
+                r#"resource_template = "https://lore.example.com/partitions/{id}""#,
+            ),
+            "server.auth.resource_id_template",
+        ),
+    ];
+    for (settings, setting) in cases {
+        let error = validate_auth_config(&settings)
+            .expect_err("a template without {id} must fail validation");
+        let message = error.to_string();
+        assert!(
+            message.contains(setting) && message.contains("{id}"),
+            "the error must name {setting} and the placeholder: {message}"
+        );
+    }
+}
+
 #[test]
 fn oidc_with_a_keyword_jwt_issuer_fails_validation() {
     let settings = settings_with_auth_keys(
@@ -472,7 +608,7 @@ fn oidc_client_id_is_required_and_not_empty() {
 /// Minimal loadable settings with the given `[server.auth]` keys, for the
 /// startup-validation tests. `Settings` deserializes with a `'static`
 /// bound, so the assembled TOML is leaked; each test builds one.
-fn settings_with_auth_keys(auth_keys: &str) -> Result<Settings, toml::de::Error> {
+pub(crate) fn settings_with_auth_keys(auth_keys: &str) -> Result<Settings, toml::de::Error> {
     let config = format!(
         r#"
             [server]
@@ -552,6 +688,69 @@ fn auth_with_issuer_and_audience_passes_validation() {
     )
     .expect("a complete [server.auth] must parse");
     validate_auth_config(&settings).expect("a complete [server.auth] must validate");
+}
+
+#[test]
+fn trust_unsigned_identity_beside_server_auth_fails_validation() {
+    let mut settings = settings_with_auth_keys(
+        r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+
+            [environment.endpoint]
+            auth_url = "ucs-auth://auth.example.com"
+        "#,
+    )
+    .expect("a complete [server.auth] must parse");
+    settings.server.trust_unsigned_identity = true;
+    validate_auth_config(&settings)
+        .expect_err("trust_unsigned_identity with [server.auth] must fail validation");
+}
+
+#[test]
+fn trust_unsigned_identity_without_server_auth_passes_validation() {
+    let config = r#"
+        [server]
+        runtime_shutdown_timeout_seconds = 0
+        trust_unsigned_identity = true
+
+        [immutable_store]
+        mode = "local"
+
+        [mutable_store]
+        mode = "local"
+    "#;
+    let settings: Settings = toml::from_str(config).expect("must parse");
+    assert!(settings.server.trust_unsigned_identity);
+    validate_auth_config(&settings).expect("trust_unsigned_identity alone must validate");
+}
+
+/// The loader reads `user_url` from `[environment.endpoint]` for the catalog
+/// selection, so `repository_catalog = "user_service"` loads with it and is
+/// refused without it.
+#[test]
+fn user_service_catalog_needs_user_url_at_load() {
+    let settings_with = |endpoint_keys: &str| {
+        settings_with_auth_keys(&format!(
+            r#"
+                jwt_issuer = "LEGACY_AUTH_KEYWORD"
+                jwt_audience = ["lore-service"]
+                repository_catalog = "user_service"
+
+                [environment.endpoint]
+                auth_url = "ucs-auth://auth.example.com"
+                {endpoint_keys}
+            "#
+        ))
+        .expect("settings must parse")
+    };
+    validate_auth_config(&settings_with(
+        r#"user_url = "ucs-auth://directory.example.com""#,
+    ))
+    .expect("the user_service catalog with user_url must validate");
+    let error = validate_auth_config(&settings_with(""))
+        .expect_err("the user_service catalog without user_url must fail validation");
+    assert!(error.to_string().contains("user_url"), "{error}");
 }
 
 /// No `[server.auth]` at all keeps starting: verification stays off and
@@ -1061,6 +1260,55 @@ fn test_hook_settings_disabled_by_default() {
             .unwrap(),
         "value"
     );
+}
+
+#[test]
+fn composite_read_replica_selection_reads_each_mode() {
+    for (config, selection) in [
+        (
+            "local.mode = \"local\"\nread_replica_selection = \"fan_out\"",
+            ReadReplicaSelection::FanOut,
+        ),
+        (
+            "local.mode = \"local\"\nread_replica_selection = \"round_robin\"",
+            ReadReplicaSelection::RoundRobin,
+        ),
+    ] {
+        let settings: CompositeStoreSettings =
+            toml::from_str(config).expect("composite settings should deserialize");
+        assert_eq!(settings.read_replica_selection, Some(selection));
+    }
+}
+
+#[test]
+fn composite_read_replica_selection_rejects_an_unknown_mode() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nread_replica_selection = \"random\"");
+    assert!(result.is_err());
+}
+
+#[test]
+fn composite_round_robin_tries_are_read() {
+    let settings: CompositeStoreSettings = toml::from_str(
+        "local.mode = \"local\"\nround_robin_max_tries = 3\nround_robin_try_limit_ms = 25",
+    )
+    .expect("composite settings should deserialize");
+    assert_eq!(settings.round_robin_max_tries, NonZeroUsize::new(3));
+    assert_eq!(settings.round_robin_try_limit_ms, NonZeroU64::new(25));
+}
+
+#[test]
+fn composite_round_robin_max_tries_rejects_zero() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nround_robin_max_tries = 0");
+    assert!(result.is_err());
+}
+
+#[test]
+fn composite_round_robin_try_limit_rejects_zero() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nround_robin_try_limit_ms = 0");
+    assert!(result.is_err());
 }
 
 #[test]
@@ -2020,4 +2268,384 @@ fn http_health_only_is_opt_in() {
     assert!(!http_settings("").health_only);
     assert!(!http_settings("health_only = false").health_only);
     assert!(http_settings("health_only = true").health_only);
+}
+
+mod deserialize_quic_internal {
+    use lore_server::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+
+    use super::*;
+
+    const ENDPOINT_KEYS: &str = "host = \"0.0.0.0\"\nport = 41337\nnum_listeners = 10";
+
+    /// `[server]` with both QUIC endpoints, each with `extra_keys`.
+    pub(super) fn try_parse(extra_keys: &str) -> Result<ServerSettings, toml::de::Error> {
+        toml::from_str(&format!(
+            "[quic]\n{ENDPOINT_KEYS}\n{extra_keys}\n[quic_internal]\n{ENDPOINT_KEYS}\n{extra_keys}"
+        ))
+    }
+
+    pub(super) fn parse(extra_keys: &str) -> ServerSettings {
+        try_parse(extra_keys).expect("[server] should deserialize")
+    }
+
+    #[test]
+    fn internal_endpoint_defaults_to_the_peer_window() {
+        let quic_internal = parse("")
+            .quic_internal
+            .expect("[server.quic_internal] present");
+
+        assert_eq!(
+            quic_internal.initial_cwnd_bytes,
+            Some(DEFAULT_PEER_INITIAL_CWND_BYTES)
+        );
+    }
+
+    #[test]
+    fn internal_endpoint_keeps_a_configured_window() {
+        let quic_internal = parse("initial_cwnd_bytes = 65536")
+            .quic_internal
+            .expect("[server.quic_internal] present");
+
+        let initial_cwnd = quic_internal
+            .initial_cwnd_bytes
+            .expect("initial_cwnd_bytes set");
+        assert_eq!(initial_cwnd.get(), 65_536);
+    }
+
+    #[test]
+    fn absent_internal_endpoint_stays_absent() {
+        let server: ServerSettings =
+            toml::from_str("").expect("[server] with no tables should deserialize");
+
+        assert!(server.quic_internal.is_none());
+    }
+}
+
+mod replicated_store_settings_num_clients {
+    use super::*;
+
+    pub(super) const REQUIRED_KEYS: &str = r#"
+        remote_url = "lore://127.0.0.1:41340"
+        periodic_client_refresh_secs = 300
+
+        [regenerate_retry]
+        initial_backoff_ms = 250
+        max_backoff_ms = 10_000
+        max_attempts = 5
+    "#;
+
+    fn parse(num_clients: &str) -> Result<ReplicatedStoreSettings, toml::de::Error> {
+        toml::from_str(&format!("{num_clients}\n{REQUIRED_KEYS}"))
+    }
+
+    #[test]
+    fn omitted_num_clients_is_two() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.num_clients.get(), 2);
+    }
+
+    #[test]
+    fn configured_num_clients_is_kept() {
+        let settings = parse("num_clients = 4").expect("valid settings");
+
+        assert_eq!(settings.num_clients.get(), 4);
+    }
+
+    #[test]
+    fn zero_num_clients_is_rejected() {
+        let error = parse("num_clients = 0").expect_err("zero clients");
+
+        assert!(
+            error.to_string().contains("nonzero"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+mod replicated_store_settings_periodic_client_refresh_secs {
+    use super::*;
+
+    #[test]
+    fn zero_refresh_period_is_rejected() {
+        let error = toml::from_str::<ReplicatedStoreSettings>(
+            &super::replicated_store_settings_num_clients::REQUIRED_KEYS.replace(
+                "periodic_client_refresh_secs = 300",
+                "periodic_client_refresh_secs = 0",
+            ),
+        )
+        .expect_err("zero refresh period");
+
+        assert!(
+            error.to_string().contains("nonzero"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+mod replicated_store_settings_initial_cwnd_bytes {
+    use lore_server::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+    use lore_server::quic::initial_cwnd::InitialCwndBytes;
+
+    use super::*;
+
+    const REQUIRED_KEYS: &str = r#"
+        remote_url = "lore://127.0.0.1:41340"
+        periodic_client_refresh_secs = 300
+
+        [regenerate_retry]
+        initial_backoff_ms = 250
+        max_backoff_ms = 10_000
+        max_attempts = 5
+    "#;
+
+    fn parse(initial_cwnd: &str) -> Result<ReplicatedStoreSettings, toml::de::Error> {
+        toml::from_str(&format!("{initial_cwnd}\n{REQUIRED_KEYS}"))
+    }
+
+    #[test]
+    fn omitted_initial_cwnd_is_the_peer_default() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.initial_cwnd_bytes, DEFAULT_PEER_INITIAL_CWND_BYTES);
+    }
+
+    #[test]
+    fn configured_initial_cwnd_is_kept() {
+        let settings = parse("initial_cwnd_bytes = 65536").expect("valid settings");
+
+        assert_eq!(settings.initial_cwnd_bytes.get(), 65_536);
+    }
+
+    #[test]
+    fn initial_cwnd_below_minimum_is_rejected() {
+        let error = parse(&format!(
+            "initial_cwnd_bytes = {}",
+            InitialCwndBytes::MIN - 1
+        ))
+        .expect_err("below the minimum");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "initial_cwnd_bytes must be at least {}",
+                InitialCwndBytes::MIN
+            )),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+mod quic_settings_initial_cwnd_bytes {
+    use super::*;
+
+    #[test]
+    fn omitted_initial_cwnd_is_left_to_the_controller() {
+        let quic: QuicSettings =
+            toml::from_str("host = \"0.0.0.0\"\nport = 41337\nnum_listeners = 10")
+                .expect("[server.quic] should deserialize");
+
+        assert_eq!(quic.initial_cwnd_bytes, None);
+    }
+}
+
+mod quic_settings_congestion_algorithm {
+    use lore_server::quic::StreamHandlerFactory;
+    use lore_server::quic::quinn::QuinnConfigBuilder;
+    use lore_server::quic::quinn::service_store::StreamDataHandlerBuilder;
+    use lore_transport::quic::client::CongestionAlgorithm;
+
+    use super::deserialize_quic_internal::parse;
+    use super::deserialize_quic_internal::try_parse;
+    use super::*;
+
+    /// Offers one protocol and serves none, which is all building a configuration asks of it.
+    struct NoServices;
+
+    impl StreamHandlerFactory for NoServices {
+        fn supported_protocols(&self) -> Vec<String> {
+            vec!["none/0.1".to_string()]
+        }
+
+        fn get_stream_handler_builder(
+            &self,
+            _protocol: &str,
+        ) -> Option<(&&'static str, &StreamDataHandlerBuilder)> {
+            None
+        }
+    }
+
+    /// The congestion controller of the connections an endpoint configured by `settings` accepts.
+    fn endpoint_algorithm(settings: QuicSettings) -> CongestionAlgorithm {
+        QuinnConfigBuilder::from(settings)
+            .address("127.0.0.1:0".parse().expect("loopback address"))
+            .stream_handler_factory(Box::new(NoServices))
+            .build()
+            .expect("quinn configuration")
+            .congestion_algorithm
+    }
+
+    #[test]
+    fn unset_is_bbr_on_the_public_endpoint_and_cubic_on_the_internal_one() {
+        let server = parse("");
+
+        assert_eq!(
+            endpoint_algorithm(server.quic.expect("[server.quic] present")),
+            CongestionAlgorithm::Bbr
+        );
+        assert_eq!(
+            endpoint_algorithm(
+                server
+                    .quic_internal
+                    .expect("[server.quic_internal] present")
+            ),
+            CongestionAlgorithm::Cubic
+        );
+    }
+
+    #[test]
+    fn a_configured_algorithm_reaches_the_quinn_configuration_of_either_endpoint() {
+        for (name, algorithm) in [
+            ("bbr", CongestionAlgorithm::Bbr),
+            ("cubic", CongestionAlgorithm::Cubic),
+        ] {
+            let server = parse(&format!("congestion_algorithm = \"{name}\""));
+
+            assert_eq!(
+                endpoint_algorithm(server.quic.expect("[server.quic] present")),
+                algorithm
+            );
+            assert_eq!(
+                endpoint_algorithm(
+                    server
+                        .quic_internal
+                        .expect("[server.quic_internal] present")
+                ),
+                algorithm
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_algorithm_is_refused() {
+        assert!(try_parse("congestion_algorithm = \"reno\"").is_err());
+    }
+}
+
+mod remote_store_settings_congestion_algorithm {
+    use lore_transport::quic::client::CongestionAlgorithm;
+
+    use super::*;
+
+    fn parse(extra_keys: &str) -> Result<RemoteStoreSettings, toml::de::Error> {
+        toml::from_str(&format!(
+            "remote_url = \"lore://127.0.0.1:41340\"\n{extra_keys}"
+        ))
+    }
+
+    #[test]
+    fn omitted_congestion_algorithm_is_bbr() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.congestion_algorithm, CongestionAlgorithm::Bbr);
+    }
+
+    #[test]
+    fn configured_congestion_algorithm_is_kept() {
+        for (name, algorithm) in [
+            ("bbr", CongestionAlgorithm::Bbr),
+            ("cubic", CongestionAlgorithm::Cubic),
+        ] {
+            let settings =
+                parse(&format!("congestion_algorithm = \"{name}\"")).expect("valid settings");
+
+            assert_eq!(settings.congestion_algorithm, algorithm);
+        }
+    }
+
+    #[test]
+    fn unknown_congestion_algorithm_is_rejected() {
+        assert!(parse("congestion_algorithm = \"reno\"").is_err());
+    }
+}
+
+mod replicated_store_settings_congestion_algorithm {
+    use lore_transport::quic::client::CongestionAlgorithm;
+
+    use super::*;
+
+    fn parse(extra_keys: &str) -> Result<ReplicatedStoreSettings, toml::de::Error> {
+        toml::from_str(&format!(
+            "{extra_keys}\n{}",
+            super::replicated_store_settings_num_clients::REQUIRED_KEYS
+        ))
+    }
+
+    #[test]
+    fn omitted_congestion_algorithm_is_cubic() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.congestion_algorithm, CongestionAlgorithm::Cubic);
+    }
+
+    #[test]
+    fn configured_congestion_algorithm_is_kept() {
+        for (name, algorithm) in [
+            ("bbr", CongestionAlgorithm::Bbr),
+            ("cubic", CongestionAlgorithm::Cubic),
+        ] {
+            let settings =
+                parse(&format!("congestion_algorithm = \"{name}\"")).expect("valid settings");
+
+            assert_eq!(settings.congestion_algorithm, algorithm);
+        }
+    }
+
+    #[test]
+    fn unknown_congestion_algorithm_is_rejected() {
+        assert!(parse("congestion_algorithm = \"reno\"").is_err());
+    }
+}
+
+mod quic_settings_slow_send_threshold {
+    use super::deserialize_quic_internal::parse;
+
+    #[test]
+    fn unset_neither_endpoint_logs() {
+        let server = parse("");
+
+        assert_eq!(
+            server
+                .quic_internal
+                .expect("[server.quic_internal] present")
+                .slow_send_threshold_ms,
+            None
+        );
+        assert_eq!(
+            server
+                .quic
+                .expect("[server.quic] present")
+                .slow_send_threshold_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn a_configured_threshold_is_kept_on_either_endpoint() {
+        let server = parse("slow_send_threshold_ms = 50");
+
+        assert_eq!(
+            server
+                .quic
+                .expect("[server.quic] present")
+                .slow_send_threshold_ms,
+            Some(50)
+        );
+        assert_eq!(
+            server
+                .quic_internal
+                .expect("[server.quic_internal] present")
+                .slow_send_threshold_ms,
+            Some(50)
+        );
+    }
 }

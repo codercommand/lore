@@ -19,6 +19,7 @@ use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::store::event::LoreStorageObliterateItemCompleteEventData;
@@ -32,13 +33,20 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One obliterate item — the `(partition, address)` to delete.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageObliterateItem {
     /// Caller-chosen id echoed back in `OBLITERATE_ITEM_COMPLETE`
@@ -51,7 +59,16 @@ pub struct LoreStorageObliterateItem {
 
 /// Arguments for `lore_storage_obliterate`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(obliterate_local)]
 pub struct LoreStorageObliterateArgs {
     /// Open storage handle
@@ -61,12 +78,12 @@ pub struct LoreStorageObliterateArgs {
 }
 
 /// Delete one or more `(partition, address)` entries.
-pub async fn obliterate(
+pub fn obliterate(
     globals: LoreGlobalArgs,
     args: LoreStorageObliterateArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, obliterate_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, obliterate_local)
 }
 
 async fn obliterate_local(
@@ -224,7 +241,7 @@ fn emit_complete(
         remote_success,
         local_skipped,
         remote_skipped,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result

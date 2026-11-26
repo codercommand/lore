@@ -23,7 +23,7 @@ A future awaited inline is part of its parent's state, so a byte a callee holds 
 
 ## 1. Allocation
 
-- Do not add a heap allocation per call or per item to reduce a future or a frame. Reduce what the future holds.
+- Don't add a heap allocation to reduce a future or a frame on a path that runs per item: per fragment, file, node, request, or connection. Reduce what the future holds. Once per client command or C API call isn't per item.
 - Box only a cold path: a cache miss, an error or recovery path, a rarely taken branch. State in the function's doc comment that the path is cold.
 - Remove a box whose future fits in its parent's largest state. The box costs an allocation and saves nothing.
 - Use `async fn`, or `fn` returning `impl Future`, in a trait that is never used as `dyn`. `#[async_trait]` boxes every call.
@@ -141,7 +141,7 @@ pub(crate) fn run_handler<A: InvokableLoreArgs>(
 - Reserve the slot, then build the item in the permit's `send` call. The future of `send(item)` holds the item while it waits.
 
 ```rust
-let Ok(permit) = dispatcher.file_tx.reserve().await else {
+let Ok(permit) = clone.file_tx.reserve().await else {
     return Err(CloneError::internal("Recursion task failed"));
 };
 permit.send(CloneWorkItem {
@@ -167,7 +167,30 @@ lore_spawn!(tasks, count_worker(shared));
 
 ## 9. Cancellation
 
-- Assume a future is dropped at any await. Give work on another thread only memory that work owns, or memory whose release waits for that work. A buffer made by extending a borrow's lifetime, such as `Bytes::from_static` over a borrowed slice, is neither.
+A server request is cancelled cooperatively. Its handler is not dropped: the request is cancelled when the client goes away or the handler timeout elapses, and the work stops at its next check. The cancellation is carried on the execution context, so every task spawned with `lore_spawn!` inherits it, except work spawned under `outliving_request`.
+
+- Assume a future is dropped at any await all the same. A server shutting down and client code still drop futures. Give work on another thread only memory that work owns, or memory whose release waits for that work. A buffer made by extending a borrow's lifetime, such as `Bytes::from_static` over a borrowed slice, is neither.
+- Check with `lore_revision::runtime::check_cancelled()`, or with `check_request_cancelled()` in a `lore-server` handler. A check reads an atomic flag for the call and one for each cancellation it is a child of, and takes no lock.
+- Check at the start of every loop whose iteration count grows with the repository, its history, or client input, and before each phase of a long operation.
+- Check only where returning leaves no partial write: before an operation's first write, or between steps of read-only work. Never check after a write that later steps must follow up, such as storing a branch's latest revision, which a notification reports. Code that runs after such a write must not reach a check, including code in tasks it spawns. Spawn follow-up work that may outlive the response, such as post-handler hooks, under `lore_server::util::core_hop::outliving_request`, which runs it without the request's cancellation.
+- Never check inside a single store read or write.
+- At a check, stop spawning and drain the tasks in flight. Do not abort them: an aborted task drops a store operation part way.
+- Check again before returning from a function that swallows its tasks' errors, so a cancelled call returns an error rather than an incomplete result its caller acts on.
+- Return `Cancelled` as a declared variant of the error set. A set that receives it through `forward_any` declares the variant too, or it becomes `Internal`. Map it to `CANCELLED` in the handler with `filter_cancelled()` before any other mapping.
+
+```rust
+for to_named_node in to.children {
+    if check_cancelled().is_err() {
+        break;
+    }
+    // ... spawn the child's walk into `tasks` ...
+}
+while let Some(result) = tasks.join_next().await {
+    // ... collect, keeping the first failure ...
+}
+// The children swallow some of their errors, so a list gathered while cancelled may be short.
+check_cancelled()?;
+```
 
 ## 10. Measurement and tests
 

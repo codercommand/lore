@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use lore_base::error::NotAuthenticated;
+use lore_base::error::NotAuthorized;
 use lore_base::types::LockResource;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
@@ -12,6 +14,7 @@ use serde::Serialize;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::errors::is_refusal;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
 use crate::lore::Address;
@@ -22,13 +25,16 @@ use crate::lore_debug;
 use crate::repository::RepositoryContext;
 
 #[error_set]
-pub enum NotificationError {}
+pub enum NotificationError {
+    NotAuthenticated,
+    NotAuthorized,
+}
 
 impl crate::event::EventError for NotificationError {}
 
 /// Data for a notification that a branch received a new revision.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationBranchPushedEventData {
     /// Hash of the pushed revision.
@@ -43,7 +49,7 @@ pub struct LoreNotificationBranchPushedEventData {
 
 /// Data for a notification that a branch was created.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationBranchCreatedEventData {
     /// Identifier of the created branch.
@@ -52,7 +58,7 @@ pub struct LoreNotificationBranchCreatedEventData {
 
 /// Data for a notification that a branch was deleted.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationBranchDeletedEventData {
     /// Identifier of the deleted branch.
@@ -61,7 +67,7 @@ pub struct LoreNotificationBranchDeletedEventData {
 
 /// Data for a notification that resources were locked.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationResourceLockedEventData {
     /// Identifier of the user that locked the resources.
@@ -74,7 +80,7 @@ pub struct LoreNotificationResourceLockedEventData {
 
 /// Data for a notification that resources were unlocked.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationResourceUnlockedEventData {
     /// Identifier of the user that unlocked the resources.
@@ -105,7 +111,7 @@ pub struct LoreNotificationBinaryDataEventData {
 
 /// Data for a notification that a subscription to a repository was established.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationSubscribedEventData {
     /// Identifier of the subscribed repository.
@@ -114,7 +120,7 @@ pub struct LoreNotificationSubscribedEventData {
 
 /// Data for a notification that a subscription to a repository was removed.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreNotificationUnsubscribedEventData {
     /// Identifier of the unsubscribed repository.
@@ -191,10 +197,16 @@ pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), Notific
         stale.shutdown().await;
     }
 
-    let Ok(remote) = repository.remote().await else {
-        return Err(NotificationError::internal(
-            "notifications not available when offline",
-        ));
+    let remote = match repository.remote().await {
+        Ok(remote) => remote,
+        Err(err) if is_refusal(&err) => {
+            return Err(err).forward_any("connecting to remote for notifications");
+        }
+        Err(_) => {
+            return Err(NotificationError::internal(
+                "notifications not available when offline",
+            ));
+        }
     };
 
     let remote_url = remote.remote_url.to_string();
@@ -264,6 +276,8 @@ pub fn register_notification_service(id: &str, service: Arc<dyn NotificationServ
     notification_service_registry().insert(id.to_string(), service);
 }
 
+/// Sends a repository's notifications to their subscribers. A caller can await a call where no
+/// deadline stops it, so each call must return promptly.
 #[async_trait]
 pub trait NotificationSender
 where

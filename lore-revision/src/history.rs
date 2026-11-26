@@ -4,18 +4,20 @@ use std::sync::Arc;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+use lore_storage::options::ReadOptions;
+use lore_transport::ProtocolError;
+use lore_transport::RevisionItem;
+use lore_transport::RevisionListResponse;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::errors::*;
 use crate::find;
-use crate::lore::Address;
 use crate::lore::Hash;
 use crate::repository::RepositoryContext;
-use crate::state::State;
-use crate::store::StoreMatch;
-use crate::store::query_one;
 
 #[error_set]
 pub enum HistoryError {
+    Cancelled,
     AddressNotFound,
     Disconnected,
     InvalidArguments,
@@ -64,173 +66,498 @@ pub enum HistoryError {
 
 impl crate::event::EventError for HistoryError {}
 
-pub async fn find_branch_point(
-    repository: Arc<RepositoryContext>,
-    left_latest: Hash,
-    right_latest: Hash,
-) -> Result<(Hash, Vec<Hash>, Vec<Hash>), HistoryError> {
-    // Find the common ancestor of left branch and right branch, in case it has diverged
-    // TODO(mjansson): Accelerate by storing last synced hash for each remote and branch
-    let mut local_left = true;
-    let mut local_right = true;
-    let mut current_left = left_latest;
-    let mut current_right = right_latest;
-    let mut left_history = vec![];
-    let mut right_history = vec![];
-    while !current_left.is_zero() || !current_right.is_zero() {
-        let mut left_fetch_count = 0;
-        let mut right_fetch_count = 0;
+/// How a round takes a line further.
+enum Step {
+    /// The round walks the line in the local store.
+    Store,
+    /// The round asks the remote for the page holding the line's cursor, a revision the store
+    /// lacks.
+    Remote,
+    /// The request for the line failed, so the remote is not asked for the line again. Holds the
+    /// request's error; a failed request is a cold path, so the error is boxed rather than held in
+    /// every state of the walk.
+    Stopped(Box<ProtocolError>),
+}
 
-        if local_left {
-            for _fetch_count in 0..10 {
-                if current_left.is_zero() {
-                    break;
-                }
-                left_history.push(current_left);
-                left_fetch_count += 1;
+/// One line of the walk: its revisions, newest first, and its cursor. The cursor is the next
+/// revision to walk in the local store, zero once the line has ended, and the line's last revision
+/// from where the store lacks it until a page moves the line.
+struct Line {
+    history: Vec<Hash>,
+    /// The number of each revision in `history`. A revision the store lacks is numbered zero until
+    /// a page lists it, and stays zero where no page does, which ends the line there.
+    numbers: Vec<u64>,
+    cursor: Hash,
+    step: Step,
+    /// How many revisions the round added to the line.
+    added: usize,
+}
 
-                if let Ok(matched) = query_one(
-                    &repository.immutable_store(),
-                    repository.id,
-                    Address::zero_context_hash(current_left),
-                )
-                .await
-                    && matched.match_made != StoreMatch::MatchNone
-                {
-                    let hash = current_left;
-                    let state = State::deserialize(repository.clone(), current_left)
-                        .await
-                        .forward_with::<HistoryError, _>(|| {
-                        format!("failed to deserialize state {hash}")
-                    })?;
-                    // TODO(mjansson): Support finding through merged and other parent
-                    current_left = state.parent_self();
-                } else {
-                    local_left = false;
-                    break;
-                }
-            }
-        }
-        if local_right {
-            for _fetch_count in 0..10 {
-                if current_right.is_zero() {
-                    break;
-                }
-                right_history.push(current_right);
-                right_fetch_count += 1;
-
-                if let Ok(matched) = query_one(
-                    &repository.immutable_store(),
-                    repository.id,
-                    Address::zero_context_hash(current_right),
-                )
-                .await
-                    && matched.match_made != StoreMatch::MatchNone
-                {
-                    let hash = current_right;
-                    let state = State::deserialize(repository.clone(), current_right)
-                        .await
-                        .forward_with::<HistoryError, _>(|| {
-                            format!("failed to deserialize state {hash}")
-                        })?;
-                    // TODO(mjansson): Support finding through merged and other parent
-                    current_right = state.parent_self();
-                } else {
-                    local_right = false;
-                    break;
-                }
-            }
-        }
-
-        if !local_left || !local_right {
-            let revision = if let Ok(remote) = repository.remote().await {
-                remote.revision(repository.id).await.ok()
-            } else {
-                None
-            };
-            if let Some(revision) = revision.clone() {
-                // TODO(mjansson): Support finding through merged and other parent
-                let revision_remote = revision.clone();
-                let left_response = lore_spawn!(async move {
-                    if !local_left {
-                        Some(revision_remote.revision_list(current_left.into()).await)
-                    } else {
-                        None
-                    }
-                });
-                let revision_remote = revision.clone();
-                let right_response = lore_spawn!(async move {
-                    if !local_right {
-                        Some(revision_remote.revision_list(current_right.into()).await)
-                    } else {
-                        None
-                    }
-                });
-
-                let left_response = left_response.await.unwrap_or_default();
-                let right_response = right_response.await.unwrap_or_default();
-
-                // Only reset the side that needed a remote fetch. The other side may
-                // still be walking locally — zeroing its cursor unconditionally would
-                // halt the walk early and falsely report divergence even though a
-                // common ancestor is still reachable.
-                if !local_left {
-                    current_left = Hash::default();
-                    if let Some(Ok(left_response)) = left_response {
-                        find::cache_revision_list_states(repository.clone(), &left_response.items)
-                            .await;
-                        left_fetch_count += left_response.items.len();
-                        left_history.extend(left_response.items.iter().map(|item| item.signature));
-                        current_left = left_response.next_revision;
-                    }
-                }
-
-                if !local_right {
-                    current_right = Hash::default();
-                    if let Some(Ok(right_response)) = right_response {
-                        find::cache_revision_list_states(repository.clone(), &right_response.items)
-                            .await;
-                        right_fetch_count += right_response.items.len();
-                        right_history
-                            .extend(right_response.items.iter().map(|item| item.signature));
-                        current_right = right_response.next_revision;
-                    }
-                }
-            }
-        }
-
-        // Find intersection, the common ancestor
-        for iright in (right_history.len() - right_fetch_count)..right_history.len() {
-            if let Some(left_iter) = left_history
-                .iter()
-                .enumerate()
-                .find(|iter| *iter.1 == right_history[iright])
-            {
-                let branch_point = right_history[iright];
-                right_history.truncate(iright);
-                left_history.truncate(left_iter.0);
-                return Ok((branch_point, left_history, right_history));
-            }
-        }
-
-        for ileft in (left_history.len() - left_fetch_count)..left_history.len() {
-            // No need to test against the newly fetched right hashes, already done above
-            if let Some(right_iter) = right_history[..(right_history.len() - right_fetch_count)]
-                .iter()
-                .enumerate()
-                .find(|iter| *iter.1 == left_history[ileft])
-            {
-                let branch_point = left_history[ileft];
-                right_history.truncate(right_iter.0);
-                left_history.truncate(ileft);
-                return Ok((branch_point, left_history, right_history));
-            }
-        }
-
-        if current_left.is_zero() && current_right.is_zero() {
-            return Ok((Hash::default(), left_history, right_history));
+impl Line {
+    fn new(latest: Hash) -> Self {
+        Self {
+            history: Vec::new(),
+            numbers: Vec::new(),
+            cursor: latest,
+            step: Step::Store,
+            added: 0,
         }
     }
 
-    Err(HistoryError::internal("failed to find a branch point"))
+    /// The revision at `index` on the line, with its number.
+    fn at(&self, index: usize) -> Option<(u64, Hash)> {
+        Some((*self.numbers.get(index)?, *self.history.get(index)?))
+    }
+
+    /// The revision at `index` on the line, with its number, short of the revision the round asks
+    /// the remote to number. That revision is numbered zero until the page lists it, so [`meet`]
+    /// would pass the other line's revisions against it that a revision below it can still match.
+    fn numbered_at(&self, index: usize) -> Option<(u64, Hash)> {
+        if self.asks() && index + 1 >= self.history.len() {
+            return None;
+        }
+        self.at(index)
+    }
+
+    /// Add `revision`, numbered `number`, to the line in the round.
+    fn push(&mut self, number: u64, revision: Hash) {
+        self.numbers.push(number);
+        self.history.push(revision);
+        self.added += 1;
+    }
+
+    /// Whether the round asks the remote for the page holding the line's cursor. A line leaves the
+    /// local store only at a revision the store lacks, so its cursor is not zero then.
+    fn asks(&self) -> bool {
+        matches!(self.step, Step::Remote)
+    }
+
+    /// Whether a round can walk the line further: it has neither ended nor stopped.
+    fn advances(&self) -> bool {
+        matches!(self.step, Step::Store) && !self.cursor.is_zero()
+    }
+
+    /// Whether [`meet`] waits on the line, `passed` being the index of its first revision not
+    /// passed: each of its revisions is passed, and it can go further.
+    fn waits(&self, passed: usize) -> bool {
+        passed == self.history.len() && self.advances()
+    }
+
+    /// Whether the line can still meet `asking`, a line that asks the remote, in the local store:
+    /// [`meet`] waits on it, as [`Self::waits`] describes, and its oldest revision is numbered above
+    /// the lowest numbered revision of `asking`. Below that number `asking` holds only the revision
+    /// it asks for, which the store lacks.
+    fn can_meet_in_store(&self, passed: usize, asking: &Line) -> bool {
+        let (Some(&oldest), Some(&lowest)) =
+            (self.numbers.last(), asking.numbers.iter().rev().nth(1))
+        else {
+            return false;
+        };
+        self.waits(passed) && oldest > lowest
+    }
+
+    /// Walk up to ten revisions of the line in the local store, as far as the store holds them,
+    /// reading each state with a [`find::local_line_step`]. The first revision the store lacks is
+    /// added to the line, numbered zero, and the line asks the remote for the page holding it. A
+    /// blob that is not a revision state fails the walk.
+    async fn walk_store(
+        &mut self,
+        repository: &Arc<RepositoryContext>,
+    ) -> Result<(), HistoryError> {
+        for _ in 0..10 {
+            if self.cursor.is_zero() {
+                break;
+            }
+            let (number, parent) = match find::local_line_step(
+                repository,
+                self.cursor,
+                ReadOptions::default(),
+            )
+            .await
+            {
+                Ok(Some(step)) => step,
+                Ok(None) => {
+                    self.push(0, self.cursor);
+                    self.step = Step::Remote;
+                    break;
+                }
+                Err(err) => {
+                    let hash = self.cursor;
+                    return Err(err).forward_with::<HistoryError, _>(|| {
+                        format!("reading the state of revision {hash}")
+                    });
+                }
+            };
+            self.push(number, self.cursor);
+            // TODO(mjansson): Support finding through merged and other parent
+            self.cursor = parent;
+        }
+        Ok(())
+    }
+
+    /// Take `listing`, the remote's answer for the page holding the line's cursor. A page extends
+    /// the line and is returned so its states can be cached, with the number of items it lists
+    /// above the line's cursor, whose states the line did not verify. `NotFound` ends the line, and
+    /// any other failure stops it. A page moves the line, which is walked in the local store
+    /// again. Fails where the page does not continue the line, as [`Self::extend`] describes.
+    fn take(
+        &mut self,
+        listing: Result<RevisionListResponse, ProtocolError>,
+    ) -> Result<Option<(RevisionListResponse, usize)>, HistoryError> {
+        match listing {
+            Ok(page) => {
+                let listed = page.items_from(self.cursor);
+                let unverified = page.items.len() - listed.len();
+                self.extend(listed, page.next_revision)?;
+                self.step = Step::Store;
+                Ok(Some((page, unverified)))
+            }
+            Err(err) if err.is_not_found() => {
+                self.cursor = Hash::default();
+                self.step = Step::Store;
+                Ok(None)
+            }
+            Err(err) => {
+                self.stop(err);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Stop asking the remote for the line, keeping `err`, the error of its request.
+    fn stop(&mut self, err: ProtocolError) {
+        self.step = Step::Stopped(Box::new(err));
+    }
+
+    /// Extend the line with `listed`, the items of a page from the line's cursor on, and move the
+    /// cursor to the first parent of the page's last revision: the revision `next` names, where it
+    /// is set. The local walk adds the revision it stops at, with the number zero, before the line
+    /// asks for the page holding it, so the page numbers that revision rather than adding it
+    /// again. Each number and first parent is read once from the state the page carries, as
+    /// [`find::line_state`] reads it. Fails where the page does not hold the cursor, lists a
+    /// revision without its own state, or lists one that is not the first parent of the revision
+    /// above it, and where `next`, if set, is not the first parent of the page's last revision.
+    fn extend(&mut self, listed: &[RevisionItem], next: Hash) -> Result<(), HistoryError> {
+        let anchor = self.cursor;
+        let Some((first, older)) = listed.split_first() else {
+            return Err(HistoryError::internal(format!(
+                "the remote listed a page without revision {anchor}, which it was asked for"
+            )));
+        };
+        let (anchor_number, mut parent) = find::line_state(first, anchor)
+            .map(|state| (state.revision_number, state.parent[0]))
+            .map_err(broken_line)?;
+        let start = self.history.len();
+        for item in older {
+            let state = find::line_state(item, parent).map_err(broken_line)?;
+            self.numbers.push(state.revision_number);
+            self.history.push(item.signature);
+            parent = state.parent[0];
+        }
+        if !next.is_zero() {
+            find::LineFault::check(next, parent).map_err(broken_line)?;
+        }
+        if let Some(number) = start
+            .checked_sub(1)
+            .and_then(|index| self.numbers.get_mut(index))
+        {
+            *number = anchor_number;
+        }
+        self.added += older.len();
+        self.cursor = parent;
+        Ok(())
+    }
+
+    /// Fail where a revision the round added does not descend in number from the one before it.
+    /// Such a line is out of order, and may return to a revision and repeat without end.
+    fn check_round(&self) -> Result<(), HistoryError> {
+        match out_of_order(|index| self.at(index), self.history.len() - self.added) {
+            Some((number, revision)) => Err(HistoryError::internal(format!(
+                "the history line is out of order at revision {revision}, numbered {number}"
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The error for a page that breaks the line as `fault` describes.
+fn broken_line(fault: find::LineFault) -> HistoryError {
+    HistoryError::internal(fault.to_string())
+}
+
+/// The first revision of a line from index `from` on whose number is not below that of the
+/// revision before it, with its number, where `line` gives each revision of the line by its index,
+/// newest first, with its number. Revision numbers decrease strictly along self parents, as
+/// [`meet`] relies on, so a line with such a revision does not follow its self parents, and may
+/// return to a revision.
+#[inline]
+pub(crate) fn out_of_order(
+    line: impl Fn(usize) -> Option<(u64, Hash)>,
+    from: usize,
+) -> Option<(u64, Hash)> {
+    let mut index = from.max(1);
+    let (mut above, _) = line(index - 1)?;
+    while let Some((number, revision)) = line(index) {
+        if number >= above {
+            return Some((number, revision));
+        }
+        above = number;
+        index += 1;
+    }
+    None
+}
+
+/// Advance `passed`, the index on each of two lines of its first revision not yet passed, to
+/// where the lines meet, and return the index on each line of the newest revision both hold.
+/// `left` and `right` give each revision of their line by its index, with its number.
+///
+/// Each line runs newest first through self parents, and its revision numbers decrease strictly,
+/// as [`out_of_order`] checks. A revision has one number wherever it is listed, so a revision the
+/// lines share has the same number on both, and every revision below it is shared. While neither
+/// line is passed to its end, the revisions at `passed` are where the lines meet when they are
+/// the same revision. Otherwise the line whose revision has the higher number passes it, since the
+/// other line holds no revision that high from there on, and at equal numbers both lines pass
+/// theirs, which are siblings. A number of zero is unknown and ends its line, so the other line
+/// passes its revisions one by one, each tested against that one.
+///
+/// Returns `None` once one line is passed to its end, with `passed` left there, so a call after
+/// that line grows takes both lines on from where this one stopped.
+#[inline]
+pub(crate) fn meet(
+    left: impl Fn(usize) -> Option<(u64, Hash)>,
+    right: impl Fn(usize) -> Option<(u64, Hash)>,
+    passed: &mut (usize, usize),
+) -> Option<(usize, usize)> {
+    while let (Some((left_number, left_revision)), Some((right_number, right_revision))) =
+        (left(passed.0), right(passed.1))
+    {
+        if left_revision == right_revision {
+            return Some(*passed);
+        }
+        if left_number >= right_number {
+            passed.0 += 1;
+        }
+        if right_number >= left_number {
+            passed.1 += 1;
+        }
+    }
+    None
+}
+
+/// Which of the two lines the round walks, given `passed` as [`meet`] left it: each line `meet`
+/// waits on, with every revision passed, that can go further. That is the line whose oldest
+/// revision has the higher number, or both at equal numbers, so the other line is walked only
+/// once its revisions are needed. Where no line `meet` waits on can go further, the round walks
+/// every line that can, so a line that ended or stopped still has the other walked to its end.
+fn advancing(left: &Line, right: &Line, passed: (usize, usize)) -> (bool, bool) {
+    let left_waits = left.waits(passed.0);
+    let right_waits = right.waits(passed.1);
+    if left_waits || right_waits {
+        (left_waits, right_waits)
+    } else {
+        (left.advances(), right.advances())
+    }
+}
+
+/// Whether the round defers its remote request: one line asks, and the other can still meet it in
+/// the local store, as [`Line::can_meet_in_store`] describes, given `passed` as [`meet`] left it.
+fn defers(left: &Line, right: &Line, passed: (usize, usize)) -> bool {
+    (left.asks() && right.can_meet_in_store(passed.1, left))
+        || (right.asks() && left.can_meet_in_store(passed.0, right))
+}
+
+/// Ask the remote for the page holding the cursor of each line the round asks for, take the
+/// answers, and cache the states the pages carry as [`find::cache_page_states`] describes. When
+/// both lines are asked, the right line's request runs as a task beside the left line's, and is
+/// aborted if the walk is dropped. A round that asks for one line spawns nothing. A remote that
+/// cannot be reached stops every line asked for, and a page that does not continue its line fails
+/// the walk, as [`Line::extend`] describes.
+async fn ask_remote(
+    repository: &Arc<RepositoryContext>,
+    left: &mut Line,
+    right: &mut Line,
+) -> Result<(), HistoryError> {
+    let ask_left = left.asks();
+    let ask_right = right.asks();
+    if !ask_left && !ask_right {
+        return Ok(());
+    }
+    // Scoped so the future does not hold the revision client across the caching below.
+    let (first, second) = {
+        let revision = match repository.remote().await {
+            Ok(remote) => remote.revision(repository.id).await,
+            Err(err) => Err(err),
+        };
+        let revision = match revision {
+            Ok(revision) => revision,
+            Err(err) => {
+                if ask_left && ask_right {
+                    right.stop(err.clone());
+                }
+                if ask_left {
+                    left.stop(err);
+                } else {
+                    right.stop(err);
+                }
+                return Ok(());
+            }
+        };
+        // TODO(mjansson): Support finding through merged and other parent
+        let second = (ask_left && ask_right).then(|| {
+            let revision = revision.clone();
+            let cursor = right.cursor;
+            AbortOnDropHandle::new(lore_spawn!(async move {
+                revision.revision_list(cursor.into()).await
+            }))
+        });
+        let cursor = if ask_left { left.cursor } else { right.cursor };
+        (revision.revision_list(cursor.into()).await, second)
+    };
+    // Scoped so the future does not hold the first page across the second request.
+    {
+        let page = if ask_left {
+            left.take(first)?
+        } else {
+            right.take(first)?
+        };
+        if let Some((page, unverified)) = &page {
+            find::cache_page_states(repository.clone(), &page.items, *unverified).await;
+        }
+    }
+    if let Some(second) = second {
+        let listing = second
+            .await
+            .internal("listing the right line's revisions")?;
+        if let Some((page, unverified)) = &right.take(listing)? {
+            find::cache_page_states(repository.clone(), &page.items, *unverified).await;
+        }
+    }
+    Ok(())
+}
+
+/// The revision the lines meet at, whose index on each line `shared` holds, with the revisions
+/// above it on each line, newest first.
+fn branch_point(
+    mut left: Line,
+    mut right: Line,
+    shared: (usize, usize),
+) -> (Hash, Vec<Hash>, Vec<Hash>) {
+    let branch_point = left.history[shared.0];
+    left.history.truncate(shared.0);
+    right.history.truncate(shared.1);
+    (branch_point, left.history, right.history)
+}
+
+/// Fail a walk that neither line can take further. A round adds no revision to either line only
+/// where each line has ended or stopped, and not both ended, so a line has stopped. The walk fails
+/// with the error of the request that stopped it, the left line's when both stopped, or, where
+/// there was no remote to ask, with [`RevisionNotFound`] naming the revision the line stopped at.
+fn stall<T>(left: Line, right: Line) -> Result<T, HistoryError> {
+    let (cursor, err) = match (left.step, right.step) {
+        (Step::Stopped(err), _) => (left.cursor, err),
+        (_, Step::Stopped(err)) => (right.cursor, err),
+        _ => {
+            return Err(HistoryError::internal(
+                "the walk stalled with no line stopped",
+            ));
+        }
+    };
+    let context = format!("listing the revisions from {cursor}");
+    if err.is_no_remote() {
+        let stopped = RevisionNotFound {
+            revision: cursor.to_string(),
+        };
+        return Err(HistoryError::RevisionNotFound(
+            stopped.chain_err_from(*err, &context),
+        ));
+    }
+    Err(*err).forward::<HistoryError>(&context)
+}
+
+/// The newest revision both `left_latest` and `right_latest` descend from through self parents,
+/// with the revisions above it on each line, newest first. The revision is zero when both lines
+/// end without sharing one.
+///
+/// Each round walks up to ten revisions of a line in the local store. It walks the lines
+/// [`advancing`] names. Where a line reaches a revision the store lacks, the round asks the remote
+/// for the page holding that revision only where the lines have not met among the numbered
+/// revisions they hold, and the other line cannot meet it in the store, as [`defers`] describes. A
+/// round that defers ends there, before the lines are met against the revision the store lacks,
+/// and the next round walks the other line. Lines that have not met among the numbered revisions,
+/// but both reach the same revision the store lacks, meet at that revision without asking: it is
+/// the newest they share, since [`meet`] found none above it. A line the page moves is walked in
+/// the store again from its new cursor, and a line ends where the remote does not hold the
+/// revision asked for. A request that fails stops the line where it is, and the remote is not
+/// asked for it again. A page that does not continue the line fails the walk, as [`Line::extend`]
+/// describes, and so does a blob in the local store that is not a revision state, as
+/// [`Line::walk_store`] describes.
+///
+/// Each round takes the lines on to where they meet as [`meet`] describes, from where the round
+/// before left them: before the remote is asked, short of the revisions the page will number, as
+/// [`Line::numbered_at`] describes, and after it answers. The walk's time grows with the revisions
+/// it walks. A round that adds no revision to either line would only repeat, so the walk then
+/// fails as [`stall`] describes. A line whose revision numbers do not decrease is out of order,
+/// and may return to a revision and repeat without end, so the walk fails then as well.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[inline]
+#[allow(clippy::manual_async_fn)]
+pub fn find_branch_point(
+    repository: Arc<RepositoryContext>,
+    left_latest: Hash,
+    right_latest: Hash,
+) -> impl Future<Output = Result<(Hash, Vec<Hash>, Vec<Hash>), HistoryError>> {
+    let mut left = Line::new(left_latest);
+    let mut right = Line::new(right_latest);
+    async move {
+        // TODO(mjansson): Accelerate by storing last synced hash for each remote and branch
+        let mut passed = (0, 0);
+        while !left.cursor.is_zero() || !right.cursor.is_zero() {
+            let (walk_left, walk_right) = advancing(&left, &right, passed);
+            left.added = 0;
+            right.added = 0;
+            if walk_left {
+                left.walk_store(&repository).await?;
+            }
+            if walk_right {
+                right.walk_store(&repository).await?;
+            }
+            if left.asks() || right.asks() {
+                left.check_round()?;
+                right.check_round()?;
+                let shared = meet(
+                    |index| left.numbered_at(index),
+                    |index| right.numbered_at(index),
+                    &mut passed,
+                );
+                if let Some(shared) = shared {
+                    return Ok(branch_point(left, right, shared));
+                }
+                if left.asks() && right.asks() && left.cursor == right.cursor {
+                    let shared = (left.history.len() - 1, right.history.len() - 1);
+                    return Ok(branch_point(left, right, shared));
+                }
+                if defers(&left, &right, passed) {
+                    continue;
+                }
+                ask_remote(&repository, &mut left, &mut right).await?;
+            }
+
+            left.check_round()?;
+            right.check_round()?;
+            let shared = meet(|index| left.at(index), |index| right.at(index), &mut passed);
+            if let Some(shared) = shared {
+                return Ok(branch_point(left, right, shared));
+            }
+
+            if left.cursor.is_zero() && right.cursor.is_zero() {
+                return Ok((Hash::default(), left.history, right.history));
+            }
+            if left.added == 0 && right.added == 0 {
+                return stall(left, right);
+            }
+        }
+
+        Err(HistoryError::internal("failed to find a branch point"))
+    }
 }

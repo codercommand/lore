@@ -3,36 +3,40 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::task::Poll;
 use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::lore_spawn_core;
+use lore_base::lore_spawn_net;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::runtime::execution_context;
 use lore_transport::quic::QuicServiceError;
 use lore_transport::quic::chunking::ChunkingMetric;
 use lore_transport::quic::chunking::ParallelChunking;
 use lore_transport::quic::command_header::CommandHeader;
-use quinn::ClosedStream;
+use lore_transport::quic::frame_queue::FrameChunks;
+use lore_transport::quic::frame_queue::FrameQueue;
+use lore_transport::quic::slow_response::ReportRateLimit;
 use quinn::ReadError;
 use quinn::RecvStream;
 use quinn::SendStream;
 use quinn::VarInt;
 use quinn::WriteError;
-use tokio::sync::Mutex;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 use tracing::Instrument;
+use tracing::Span;
 use tracing::debug;
 use tracing::error;
-use tracing::info;
-use tracing::info_span;
 use tracing::trace;
 use tracing::warn;
 
 use crate::protocol::attribute_map::AttributeMap;
+use crate::protocol::attribute_map::QuinnConnection;
 use crate::quic::ProtocolErrorInfo;
 use crate::quic::QuicErrorStatus;
 use crate::quic::QuicService;
@@ -40,6 +44,7 @@ use crate::quic::StreamDataHandler;
 use crate::quic::StreamHandlerError;
 use crate::quic::stream_observer::MessageFailure;
 use crate::quic::stream_observer::MessageHandling;
+use crate::quic::stream_observer::ResponseWrite;
 use crate::quic::stream_observer::ServiceMetricEvent;
 use crate::quic::stream_observer::StreamMetricEvent;
 use crate::quic::stream_observer::StreamMetricSender;
@@ -52,8 +57,6 @@ const PERMIT_TIMEOUT_LABEL_VALUE: &str = "PermitTimeout";
 const ADMISSION_LIMIT_LABEL_VALUE: &str = "AdmissionLimit";
 /// Rejected because the service could not parse the request.
 const PARSE_ERROR_LABEL_VALUE: &str = "ParsingError";
-// todo(plockhart) differentiate this label value and add to alerting rules
-const HANDLE_MESSAGE_TIMEOUT_LABEL_VALUE: &str = "SlowDown";
 const HANDLE_MESSAGE_USER_ERROR_LABEL_VALUE: &str = "User";
 const HANDLE_MESSAGE_INTERNAL_ERROR_LABEL_VALUE: &str = "Internal";
 
@@ -64,6 +67,21 @@ const DEFAULT_PERMIT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Ceiling on a request's total time when no `handler_timeout_seconds` is configured.
 const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// The rejections a stream holds queued for its writer. A client that stops reading its responses
+/// stalls the writer, and past this many rejections the stream's read loop waits for the writer
+/// rather than queuing another, so the client's further requests wait on its flow control and
+/// none goes unanswered.
+#[lore_macro::test_pub]
+const QUEUED_REJECTIONS_PER_STREAM: usize = 64;
+
+/// The responses a stream's writer queue keeps room for once it empties. The queue holds every
+/// response waiting to be written, however many, but a server holds many streams, so a queue that
+/// grew in a burst gives most of its room back once it empties.
+const RESPONSES_KEPT_PER_STREAM: usize = 8;
+
+/// Slow responses logged across every connection the process serves.
+static SLOW_RESPONSE_REPORTS: ReportRateLimit = ReportRateLimit::new();
 
 fn is_graceful_close(err: &ReadError) -> bool {
     match err {
@@ -100,7 +118,8 @@ impl Drop for AdmissionGuard {
     }
 }
 
-/// Limits governing how much work a connection may have in progress.
+/// Limits governing how much work a connection may have in progress, and how long its requests
+/// may take.
 #[derive(Copy, Clone)]
 pub struct AdmissionLimits {
     /// Concurrent requests allowed per stream.
@@ -111,6 +130,9 @@ pub struct AdmissionLimits {
     pub handler_timeout: Option<Duration>,
     /// Wait for a stream permit; [`DEFAULT_PERMIT_ACQUIRE_TIMEOUT`] when unset.
     pub permit_timeout: Option<Duration>,
+    /// Wait for a response's stream writer, or time writing it, above which the response is
+    /// logged as slow. Unset, no response is logged.
+    pub slow_send_threshold: Option<Duration>,
 }
 
 pub struct StreamHandler<ServiceType>
@@ -132,6 +154,7 @@ where
     /// Clamped at construction to no more than [`StreamHandler::handler_duration_timeout`], so a
     /// short request deadline wins over the permit budget.
     permit_acquire_timeout: Duration,
+    slow_send_threshold: Option<Duration>,
 
     service_metrics: async_channel::Sender<ServiceMetricEvent>,
     stream_metrics: async_channel::Sender<StreamMetricEvent>,
@@ -169,49 +192,53 @@ where
                 .permit_timeout
                 .unwrap_or(DEFAULT_PERMIT_ACQUIRE_TIMEOUT)
                 .min(handler_duration_timeout),
+            slow_send_threshold: limits.slow_send_threshold,
             service_metrics,
             stream_metrics,
         }
     }
 
-    fn handle_write_error(e: WriteError) -> Result<(), StreamHandlerError> {
-        match &e {
+    /// Logs a failed write to a stream, at a level that depends on whether the peer ended the
+    /// stream or connection on purpose.
+    fn log_write_error(e: &WriteError) {
+        match e {
             WriteError::Stopped(error_code) => {
                 warn!(error_code = %error_code, "Peer closed stream during write");
-                Ok(())
             }
             // Peer closed the connection gracefully (CONNECTION_CLOSE, app code 0) while
             // we were still writing a response. Mirrors is_graceful_close on the read
-            // path so in-flight handle_message tasks don't warn per racing response.
+            // path so a writer racing the close does not warn.
             WriteError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(close))
                 if close.error_code == VarInt::from_u32(0) =>
             {
                 debug!("Peer closed connection gracefully during write");
-                Ok(())
             }
             WriteError::ConnectionLost(err) => {
                 warn!(error = %e, cause = %err, "Stream write failed");
-                Err(StreamHandlerError::WriteFailed(e))
             }
             _ => {
                 warn!(error = %e, "Stream write failed");
-                Err(StreamHandlerError::WriteFailed(e))
             }
         }
     }
 
-    /// Answer a request rejected before its handler ran, recording `reason` as the metric label
-    /// for what turned it away.
+    /// Answer a request that arrived at `start` and was rejected before its handler ran,
+    /// recording `reason` as the metric label for what turned it away. Waits only while the
+    /// stream's pool of rejections queued for its writer is used up.
     async fn reject(
         &self,
         header: CommandHeader,
-        send: Arc<Mutex<SendStream>>,
+        stream: &StreamQueues,
         code: QuicServiceError,
         reason: &'static str,
-        waited: Duration,
+        start: Instant,
     ) {
-        if let Err(err) = Self::send_response(
-            send,
+        // The pool is never closed.
+        let Ok(permit) = stream.rejections.clone().acquire_owned().await else {
+            return;
+        };
+        queue_response(
+            &stream.responses,
             Err((
                 header,
                 ProtocolErrorInfo {
@@ -221,23 +248,17 @@ where
                     is_appropriate_for_logging: false,
                 },
             )),
-        )
-        .await
-        {
-            warn!(reason, error = %err, "Failed sending rejection response");
-        }
-
-        let _ = self
-            .service_metrics
-            .try_send(ServiceMetricEvent::MessageHandling(MessageHandling {
-                elapsed: waited,
-                opcode: header.cmd,
+            ResponseHold {
+                elapsed: start.elapsed(),
                 error_info: Some(MessageFailure {
                     classification: HANDLE_MESSAGE_USER_ERROR_LABEL_VALUE,
                     error_label: reason,
                 }),
-            }))
-            .inspect_err(|err| error!(?err, "failed to send service reject metric"));
+                permit,
+                admission: None,
+                span: Span::none(),
+            },
+        );
     }
 
     /// Take a permit from `limiter`, waiting up to `permit_acquire_timeout` when none is free.
@@ -272,8 +293,7 @@ where
         &self,
         header: CommandHeader,
         message: ServiceType::ParsedRequestType,
-        send: Arc<Mutex<SendStream>>,
-        limiter: &Arc<Semaphore>,
+        stream: &StreamQueues,
         start: Instant,
     ) -> Result<(), StreamHandlerError> {
         let handler_duration_timeout = self.handler_duration_timeout;
@@ -281,44 +301,40 @@ where
         let Some(admission) = AdmissionGuard::take(&self.admission, self.inflight_limit) else {
             self.reject(
                 header,
-                send,
+                stream,
                 QuicServiceError::SlowDown,
                 ADMISSION_LIMIT_LABEL_VALUE,
-                start.elapsed(),
+                start,
             )
             .await;
             return Ok(());
         };
 
-        let Some(permit) = self.acquire_permit(limiter).await else {
+        let Some(permit) = self.acquire_permit(&stream.limiter).await else {
             self.reject(
                 header,
-                send,
+                stream,
                 QuicServiceError::SlowDown,
                 PERMIT_TIMEOUT_LABEL_VALUE,
-                start.elapsed(),
+                start,
             )
             .await;
             return Ok(());
         };
 
-        let context = self.context.clone();
-        let metrics_sender = self.service_metrics.clone();
+        let handler_context = self.context.clone();
+        let responses = stream.responses.clone();
         let service = self.service.clone();
-        let request_span = service.build_request_span(&header, &message, &context);
+        let request_span = service.build_request_span(&header, &message, &self.context);
+        let span = request_span.clone();
         let fut = Box::pin(async move {
             let result = tokio::select! {
                 _timeout = tokio::time::sleep(handler_duration_timeout.saturating_sub(start.elapsed())) => {
                     debug!("Timeout in message handling duration");
-                    Err(ProtocolErrorInfo {
-                        response_error_code: QuicServiceError::SlowDown as QuicErrorStatus,
-                        message_handle_label: HANDLE_MESSAGE_TIMEOUT_LABEL_VALUE,
-                        is_internal_error: true,
-                        is_appropriate_for_logging: true,
-                    })
+                    Err(ProtocolErrorInfo::timed_out())
                 },
                 result = async {
-                    service.run_request_handler(context, message).await.map_err(|protocol_error| {
+                    service.run_request_handler(handler_context, message).await.map_err(|protocol_error| {
                         service.transform_protocol_error(&protocol_error)
                     })
                 } => result
@@ -367,26 +383,17 @@ where
                 Err(error_status) => Err((header, error_status)),
             };
 
-            let elapsed = start.elapsed();
-            let success = result.is_ok();
-            if let Err(err) = Self::send_response(send, result).await {
-                if success {
-                    warn!(error = %err, "Failed to send response after successful message handling");
-                } else {
-                    warn!(error = %err, "Failed to send response after failed message handling");
-                }
-            }
-
-            drop(permit);
-            drop(admission);
-
-            let _ = metrics_sender
-                .try_send(ServiceMetricEvent::MessageHandling(MessageHandling {
-                    elapsed,
-                    opcode: header.cmd,
+            queue_response(
+                &responses,
+                result,
+                ResponseHold {
+                    elapsed: start.elapsed(),
                     error_info,
-                }))
-                .inspect_err(|err| error!(?err, "failed to send service handle metric"));
+                    permit,
+                    admission: Some(admission),
+                    span,
+                },
+            );
         });
         // The transport-to-handler boundary: everything above this point runs on
         // net, and request processing must not. Pinned rather than `lore_spawn!`,
@@ -400,8 +407,7 @@ where
         &self,
         header: CommandHeader,
         payload: Option<bytes::Bytes>,
-        send: Arc<Mutex<SendStream>>,
-        limiter: &Arc<Semaphore>,
+        stream: &StreamQueues,
     ) -> Result<(), StreamHandlerError> {
         let start = Instant::now();
         let parse_result = self
@@ -414,81 +420,276 @@ where
                 warn!(command_header = ?header, error = %e, "Request parse failed");
                 self.reject(
                     header,
-                    send,
+                    stream,
                     QuicServiceError::InvalidCommand,
                     PARSE_ERROR_LABEL_VALUE,
-                    start.elapsed(),
+                    start,
                 )
                 .await;
                 Ok(())
             }
             Ok(message) => {
                 trace!("Parsed message: {message:?}, sending off for processing",);
-                self.handle_message(header, message, send, limiter, start)
-                    .await
+                self.handle_message(header, message, stream, start).await
             }
         }
     }
 
-    async fn send_response(
-        send: Arc<Mutex<SendStream>>,
-        result: MessageProcessingResult,
-    ) -> Result<(), StreamHandlerError> {
-        match result {
-            Ok((header, mut data)) => {
-                let total_length: usize = data.iter().map(|chunk| chunk.len()).sum();
-                debug!(
-                    "Successfully handled request for {header:?}. response has {} bytes",
-                    total_length
-                );
+    /// What the writer of a stream of this connection reports its responses with.
+    fn response_reporter(&self) -> ResponseReporter<ServiceType> {
+        ResponseReporter {
+            service: self.service.clone(),
+            context: self.context.clone(),
+            slow_send_threshold: self.slow_send_threshold,
+            service_metrics: self.service_metrics.clone(),
+        }
+    }
+}
 
-                let response_header = header.response_success(total_length as u32);
-                let (header_buf, header_len) = response_header.response_bytes();
+/// The channel a stream's responses go to its writer on ([`write_responses`]).
+type ResponseSender = mpsc::UnboundedSender<QueuedResponse>;
 
-                let mut chunks = Vec::with_capacity(1 + data.len());
-                chunks.push(Bytes::copy_from_slice(&header_buf[..header_len]));
-                chunks.append(&mut data);
+struct StreamQueues {
+    /// The stream's permits for requests in handling.
+    limiter: Arc<Semaphore>,
+    responses: ResponseSender,
+    /// The stream's permits for rejections queued for its writer, of which there are
+    /// [`QUEUED_REJECTIONS_PER_STREAM`].
+    rejections: Arc<Semaphore>,
+}
 
-                send.lock()
-                    .await
-                    .write_all_chunks(chunks.as_mut_slice())
-                    .instrument(info_span!("send_response"))
-                    .await
-                    .map(|_| ())
-                    .or_else(Self::handle_write_error)?;
+/// A response on its way to its stream's writer.
+struct QueuedResponse {
+    chunks: FrameChunks,
+    report: ResponseReport,
+}
 
-                trace!(
-                    "Message for command: {header:?} was handled successfully, sent {} bytes of data in response",
-                    total_length,
-                );
-            }
-            Err((header, error)) => {
-                if error.is_appropriate_for_logging {
-                    if error.is_internal_error {
-                        warn!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "internal error handling message");
+/// What a response holds until its writer has written it or its write has failed.
+struct ResponseHold {
+    /// Time from the request's arrival until its response was ready to send.
+    elapsed: Duration,
+    error_info: Option<MessageFailure>,
+    /// The stream permit of a handled request, or the rejection permit of one turned away.
+    permit: OwnedSemaphorePermit,
+    admission: Option<AdmissionGuard>,
+    /// The request's span, kept open until its response is written or fails, so the response is
+    /// reported in it. Disabled when the request has none, as for a rejection, and the response
+    /// is then reported in its stream's span.
+    span: Span,
+}
+
+struct ResponseReport {
+    opcode: u8,
+    success: bool,
+    /// Bytes of the response, its header included.
+    bytes: usize,
+    queued: tokio::time::Instant,
+    hold: ResponseHold,
+}
+
+/// A response a stream's writer has taken from its channel.
+struct TakenResponse {
+    report: ResponseReport,
+    taken: tokio::time::Instant,
+}
+
+/// Queues the response to `result` for its stream's writer on `responses`, holding `hold` until
+/// it is written.
+fn queue_response(responses: &ResponseSender, result: MessageProcessingResult, hold: ResponseHold) {
+    let (header, success, chunks, bytes) = match result {
+        Ok((header, mut data)) => {
+            let total_length: usize = data.iter().map(|chunk| chunk.len()).sum();
+            debug!(command_header = ?header, total_length, "Request handled");
+            let (header_buf, header_len) = header
+                .response_success(total_length as u32)
+                .response_bytes();
+            let chunks =
+                FrameChunks::new(Bytes::copy_from_slice(&header_buf[..header_len]), &mut data);
+            (header, true, chunks, header_len + total_length)
+        }
+        Err((header, error)) => {
+            error.log(&header);
+            let (header_buf, header_len) = header
+                .response_error(error.response_error_code)
+                .response_bytes();
+            let chunks =
+                FrameChunks::new(Bytes::copy_from_slice(&header_buf[..header_len]), &mut []);
+            (header, false, chunks, header_len)
+        }
+    };
+    let report = ResponseReport {
+        opcode: header.cmd,
+        success,
+        bytes,
+        queued: tokio::time::Instant::now(),
+        hold,
+    };
+    // The writer stops only once every sender is gone, or with its runtime.
+    if responses.send(QueuedResponse { chunks, report }).is_err() {
+        debug!(command_header = ?header, "Stream writer has stopped, response dropped");
+    }
+}
+
+/// What the writer of a stream needs to report the responses it writes.
+struct ResponseReporter<ServiceType> {
+    service: Arc<ServiceType>,
+    context: Arc<AttributeMap>,
+    slow_send_threshold: Option<Duration>,
+    service_metrics: async_channel::Sender<ServiceMetricEvent>,
+}
+
+impl<ServiceType: QuicService> ResponseReporter<ServiceType> {
+    /// Releases what `response` holds, logs it in its request's span, and records its metrics, as
+    /// written in full at `now` when `written`, or as failed.
+    fn report(&self, response: TakenResponse, now: tokio::time::Instant, written: bool) {
+        let TakenResponse { report, taken } = response;
+        let ResponseReport {
+            opcode,
+            success,
+            bytes,
+            queued,
+            hold,
+        } = report;
+        let ResponseHold {
+            elapsed,
+            error_info,
+            permit,
+            admission,
+            span,
+        } = hold;
+        drop(permit);
+        drop(admission);
+        let _entered = span.enter();
+
+        let timing = ResponseWrite {
+            queue: taken - queued,
+            write: now - taken,
+            bytes,
+        };
+        if written {
+            report_slow_response(
+                self.slow_send_threshold,
+                &self.context,
+                self.service.command_to_metrics_label(opcode),
+                success,
+                timing,
+            );
+        }
+        let _ = self
+            .service_metrics
+            .try_send(ServiceMetricEvent::MessageHandling(MessageHandling {
+                elapsed,
+                opcode,
+                error_info,
+                response: timing,
+            }))
+            .inspect_err(|err| error!(?err, "failed to send service handle metric"));
+    }
+}
+
+/// Writes the responses queued on `responses` to `send`, the send half of one stream, each whole,
+/// in the order they are taken, and every response queued at once in as few writes as the
+/// stream's flow control allows ([`FrameQueue`]). Each response's permits are released once it is
+/// written, so a client that stops reading cannot make the stream admit more work. Runs as a task
+/// of its own on the net runtime until the channel is closed, which is once the stream's read loop
+/// and every handler it spawned are done, and every response queued is written or failed. Then it
+/// finishes the stream.
+///
+/// A write that fails fails every response queued, and every response queued after it. The stream
+/// is then left to `SendStream`'s drop, which finishes it, or resets it if the peer stopped it.
+async fn write_responses<ServiceType: QuicService>(
+    mut send: SendStream,
+    mut responses: mpsc::UnboundedReceiver<QueuedResponse>,
+    reporter: ResponseReporter<ServiceType>,
+) {
+    let mut queue = FrameQueue::new(RESPONSES_KEPT_PER_STREAM);
+    let mut failed = false;
+    std::future::poll_fn(|cx| {
+        let mut now = None;
+        let closed = loop {
+            match responses.poll_recv(cx) {
+                Poll::Ready(Some(QueuedResponse { chunks, report })) => {
+                    let taken = *now.get_or_insert_with(tokio::time::Instant::now);
+                    let response = TakenResponse { report, taken };
+                    if failed {
+                        reporter.report(response, taken, false);
                     } else {
-                        info!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "non-internal error handling message");
-                    }
-                } else {
-                    if error.is_internal_error {
-                        debug!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "internal error handling message");
-                    } else {
-                        debug!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "non-internal error handling message");
+                        queue.push(chunks, response);
                     }
                 }
-                let response_header = header.response_error(error.response_error_code);
-                let (header_buf, header_len) = response_header.response_bytes();
-                send.lock()
-                    .await
-                    .write_all(&header_buf[..header_len])
-                    .await
-                    .map_err(StreamHandlerError::WriteFailed)?;
-                trace!("Wrote error response header: {response_header:?}");
+                Poll::Ready(None) => break true,
+                Poll::Pending => break false,
+            }
+        };
+        while !failed && !queue.is_empty() {
+            let written = std::pin::pin!(send.write_chunks(queue.unwritten())).poll(cx);
+            match written {
+                Poll::Ready(Ok(_)) => {
+                    let now = tokio::time::Instant::now();
+                    queue.pop_written(|response| reporter.report(response, now, true));
+                }
+                Poll::Ready(Err(err)) => {
+                    let now = tokio::time::Instant::now();
+                    queue.fail(|response| reporter.report(response, now, false));
+                    failed = true;
+                    StreamHandler::<ServiceType>::log_write_error(&err);
+                }
+                Poll::Pending => break,
             }
         }
+        if closed && queue.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
 
-        Ok(())
+    if failed {
+        return;
     }
+    debug!("Sending finish");
+    if let Err(err) = send.finish() {
+        warn!(error = %err, "Stream finish failed");
+    }
+}
+
+/// Logs a response that waited for its stream's writer, or took to write, longer than
+/// `threshold`, with the state of the connection's path at that moment. Rate limited across the
+/// process, so a burst of slow responses is logged in part. Without a threshold nothing is logged.
+fn report_slow_response(
+    threshold: Option<Duration>,
+    context: &AttributeMap,
+    opcode: &'static str,
+    success: bool,
+    response: ResponseWrite,
+) {
+    let Some(threshold) = threshold else {
+        return;
+    };
+    if !response.exceeds(threshold) || !SLOW_RESPONSE_REPORTS.admit() {
+        return;
+    }
+
+    let stats = context
+        .get::<QuinnConnection>()
+        .map(|connection| connection.0.stats());
+    warn!(
+        opcode,
+        success,
+        response_bytes = response.bytes,
+        queue_ms = response.queue.as_secs_f64() * 1_000.,
+        write_ms = response.write.as_secs_f64() * 1_000.,
+        cwnd = stats.as_ref().map(|stats| stats.path.cwnd),
+        rtt_ms = stats
+            .as_ref()
+            .map(|stats| stats.path.rtt.as_secs_f64() * 1_000.),
+        data_blocked_sent = stats.as_ref().map(|stats| stats.frame_tx.data_blocked),
+        stream_data_blocked_sent = stats
+            .as_ref()
+            .map(|stats| stats.frame_tx.stream_data_blocked),
+        "Slow QUIC response"
+    );
 }
 
 type MessageProcessingResult =
@@ -515,12 +716,22 @@ where
             Some(metrics_sender),
         );
 
-        let send = Arc::new(Mutex::new(send));
-        let limiter = Arc::new(Semaphore::new(self.process_limit));
+        let (responses, queued) = mpsc::unbounded_channel();
+        lore_spawn_net!(write_responses(send, queued, self.response_reporter()).in_current_span());
+        let stream = StreamQueues {
+            limiter: Arc::new(Semaphore::new(self.process_limit)),
+            responses,
+            rejections: Arc::new(Semaphore::new(QUEUED_REJECTIONS_PER_STREAM)),
+        };
         // Kept across the loop so a chunk carrying several requests costs no allocation.
         let mut messages = Vec::new();
 
         loop {
+            // quinn's reads never use tokio's budget, and neither does handing a request to its
+            // handler while a permit is free, so while the stream keeps data buffered this loop
+            // would not return, holding its net worker and keeping the tasks waiting to run there,
+            // such as the connection's stream writers, from running.
+            tokio::task::consume_budget().await;
             let mut next_chunk = match recv.read_chunk(self.service.max_chunk_size(), false).await {
                 Ok(chunk) => chunk,
                 Err(err) => {
@@ -550,8 +761,10 @@ where
                     return Err(StreamHandlerError::BadHeader(message.header));
                 }
 
-                self.process_message(message.header, message.payload, send.clone(), &limiter)
+                self.process_message(message.header, message.payload, &stream)
                     .await?;
+                // A chunk can carry thousands of requests.
+                tokio::task::consume_budget().await;
             }
 
             while let Ok(metric) = metrics_receiver.try_recv() {
@@ -565,12 +778,6 @@ where
                 }
             }
         }
-
-        debug!("Sending finish");
-        send.lock().await.finish().or_else(|e: ClosedStream| {
-            debug!("Received closed stream error when sending finish: {e:?}",);
-            Self::handle_write_error(WriteError::ClosedStream)
-        })?;
 
         Ok(())
     }

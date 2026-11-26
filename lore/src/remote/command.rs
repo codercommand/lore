@@ -5,7 +5,7 @@ use lore_macro::LoreCommand;
 // The LoreCommand derive generates `invoke_local`, which runs a variant's handler as a future,
 // `run_local`, which runs it to completion on the calling thread, `ValidateText`, which checks the
 // variant's arguments, and a `From` conversion from each variant's arguments.
-#[derive(Debug, Clone, LoreCommand, bitcode::Encode, bitcode::Decode)]
+#[derive(Debug, Clone, LoreCommand, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 pub enum LoreCommand {
     AuthUserInfo(crate::auth::LoreAuthUserInfoArgs),
     AuthLoginWithToken(crate::auth::LoreAuthLoginWithTokenArgs),
@@ -169,4 +169,31 @@ pub enum LoreCommand {
     StorageGetFileResolved(crate::storage::get_file_resolved::LoreStorageGetFileResolvedArgs),
     StoragePutFileResolved(crate::storage::put_file_resolved::LoreStoragePutFileResolvedArgs),
     ServiceStatus(crate::service::LoreServiceStatusArgs),
+    FileAudit(crate::file::LoreFileAuditArgs),
+    RepositoryInstanceDelete(crate::repository::LoreRepositoryInstanceDeleteArgs),
+    RepositoryInstanceMove(crate::repository::LoreRepositoryInstanceMoveArgs),
+    RepositoryInstanceClone(crate::repository::LoreRepositoryInstanceCloneArgs),
+    RevisionGraphBranchList(crate::revision_graph::branch_list::LoreRevisionGraphBranchListArgs),
+    RevisionGraphRevisionResolve(
+        crate::revision_graph::revision_resolve::LoreRevisionGraphRevisionResolveArgs,
+    ),
+    RevisionGraphBranchResolve(
+        crate::revision_graph::branch_resolve::LoreRevisionGraphBranchResolveArgs,
+    ),
+    RevisionGraphBranchMetadataGet(
+        crate::revision_graph::branch_metadata_get::LoreRevisionGraphBranchMetadataGetArgs,
+    ),
+    RevisionGraphBranchMetadataSet(
+        crate::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataSetArgs,
+    ),
+    RevisionGraphBranchCreate(
+        crate::revision_graph::branch_create::LoreRevisionGraphBranchCreateArgs,
+    ),
+    RevisionGraphBranchArchive(
+        crate::revision_graph::branch_archive::LoreRevisionGraphBranchArchiveArgs,
+    ),
+    RevisionGraphBranchSync(crate::revision_graph::branch_sync::LoreRevisionGraphBranchSyncArgs),
+    BranchMergeConflictsList(crate::branch::LoreBranchMergeConflictsListArgs),
+    ServiceSetExternalDirectory(crate::service::LoreServiceSetExternalDirectoryArgs),
+    RevisionGraphBranchPush(crate::revision_graph::branch_push::LoreRevisionGraphBranchPushArgs),
 }

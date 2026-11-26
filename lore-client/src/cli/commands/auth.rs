@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
 use lore::auth::LoreAuthClearArgs;
@@ -33,6 +33,7 @@ struct CollectedIdentity {
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
 use crate::cli::output_formatter;
+use crate::cli::secret_from_flag_or_env;
 use crate::println;
 use crate::styling::CommonStyles;
 use crate::util;
@@ -48,9 +49,24 @@ pub struct AuthLoginArgs {
     /// Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
     #[clap(long = "token-type")]
     token_type: Option<String>,
-    /// Token value for non-interactive login (requires --token-type)
+    /// Token value for non-interactive login (requires --token-type). Read from
+    /// `LORE_TOKEN` when omitted. Unsafe: a value given here is visible to other users
+    /// in the process table and is kept in the shell history
     #[clap(long = "token")]
     token: Option<String>,
+    /// Log in as this confidential client registered with the identity provider,
+    /// authenticating with its client secret
+    #[clap(
+        long = "client-id",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        conflicts_with_all = ["token_type", "token"]
+    )]
+    client_id: Option<String>,
+    /// Client secret for --client-id. Read from `LORE_CLIENT_SECRET` when omitted.
+    /// Unsafe: a value given here is visible to other users in the process table and
+    /// is kept in the shell history
+    #[clap(long = "client-secret", requires = "client_id")]
+    client_secret: Option<String>,
     /// Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`).
     /// Required when logging in with `--token` outside a repository without a remote-url.
     #[clap(long = "auth-url")]
@@ -61,6 +77,9 @@ pub struct AuthLoginArgs {
     /// Avoid opening a browser to login
     #[clap(long = "no-browser")]
     no_browser: bool,
+    /// Keep the stored login instead of logging in again while its session is valid
+    #[clap(long = "reuse-session", conflicts_with_all = ["token_type", "token", "client_id"])]
+    reuse_session: bool,
 }
 
 #[derive(Args)]
@@ -94,6 +113,9 @@ pub struct AuthInfoCliArgs {
     /// Include the current repository's access token in the output
     #[clap(long = "with-access-token")]
     with_access_token: bool,
+    /// Include the claims of the current repository's access token in the output
+    #[clap(long = "with-claims")]
+    with_claims: bool,
 }
 
 #[derive(Subcommand)]
@@ -113,6 +135,9 @@ pub enum AuthCommands {
     /// Clear all stored authentication data
     Clear,
 }
+
+pub const TOKEN_VAR: &str = "LORE_TOKEN";
+pub const CLIENT_SECRET_VAR: &str = "LORE_CLIENT_SECRET";
 
 pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8 {
     let remote_url = LoreString::from(&args.remote_url);
@@ -145,21 +170,48 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
             .with_defaults(),
     ));
 
-    if let (Some(token_type), Some(token)) = (args.token_type.as_deref(), args.token.as_deref()) {
+    if let Some(client_id) = args.client_id.as_deref() {
+        let Some(client_secret) = secret_from_flag_or_env(
+            "--client-secret",
+            args.client_secret.as_deref(),
+            CLIENT_SECRET_VAR,
+        ) else {
+            crate::eprintln!(
+                "--client-id requires a client secret: set {CLIENT_SECRET_VAR}, or pass --client-secret"
+            );
+            return 1;
+        };
+        let args = LoreAuthLoginWithTokenArgs {
+            remote_url,
+            token: LoreString::default(),
+            token_type: LoreString::default(),
+            auth_url: args.auth_url.as_deref().into(),
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+        };
+        run_command(globals, args.into(), callback) as u8
+    } else if let Some(token_type) = args.token_type.as_deref()
+        && let Some(token) = secret_from_flag_or_env("--token", args.token.as_deref(), TOKEN_VAR)
+    {
         let args = LoreAuthLoginWithTokenArgs {
             remote_url,
             token: token.into(),
             token_type: LoreString::from(token_type),
             auth_url: args.auth_url.as_deref().into(),
+            client_id: LoreString::default(),
+            client_secret: LoreString::default(),
         };
         run_command(globals, args.into(), callback) as u8
     } else if args.token_type.is_some() || args.token.is_some() {
-        crate::eprintln!("Both --token-type and --token are required for non-interactive login");
+        crate::eprintln!(
+            "Both --token-type and --token (or {TOKEN_VAR}) are required for non-interactive login"
+        );
         1
     } else {
         let args = LoreAuthLoginInteractiveArgs {
             remote_url,
             no_browser: if args.no_browser { 1 } else { 0 },
+            reuse_session: args.reuse_session.into(),
         };
         run_command(globals, args.into(), callback) as u8
     }
@@ -212,6 +264,7 @@ fn resolve_identity_names(
             ),
             with_identity_token: 0,
             with_access_token: 0,
+            with_claims: 0,
         };
 
         run_command(globals.clone(), args.into(), callback);
@@ -310,13 +363,12 @@ pub fn handle_list_command(globals: LoreGlobalArgs, cli_args: &AuthListArgs) -> 
             );
         }
         if data.expires > 0
-            && let Some(time) = DateTime::from_timestamp_millis(data.expires as i64)
+            && let Some(time) = util::rfc2822_display(data.expires)
         {
             println!(
-                "  {}Expires:{} {}",
+                "  {}Expires:{} {time}",
                 CommonStyles::HEADERS,
-                anstyle::Reset,
-                time.to_rfc2822()
+                anstyle::Reset
             );
         }
         if !data.token.is_empty() {
@@ -379,9 +431,13 @@ pub fn handle_clear_command(globals: LoreGlobalArgs) -> u8 {
 }
 
 pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u8 {
+    let token_ids = Mutex::new(HashSet::new());
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::AuthUserInfo(data) => {
+                if token_ids.lock().contains(data.id.as_str()) {
+                    return;
+                }
                 println!(
                     "{}ID:{} {}",
                     CommonStyles::HEADERS,
@@ -396,6 +452,7 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                 );
             }
             LoreEvent::AuthUserToken(user_token) => {
+                token_ids.lock().insert(user_token.id.to_string());
                 println!(
                     "{}ID:{} {}",
                     CommonStyles::HEADERS,
@@ -418,29 +475,47 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                     println!("Service account");
                 }
                 if user_token.expires > 0
-                    && let Some(time) = DateTime::from_timestamp_millis(user_token.expires as i64)
+                    && let Some(time) = util::rfc2822_display(user_token.expires)
+                {
+                    println!("{}Expires:{} {time}", CommonStyles::HEADERS, anstyle::Reset);
+                }
+                if user_token.refresh_expires > 0
+                    && let Some(time) = util::rfc2822_display(user_token.refresh_expires)
                 {
                     println!(
-                        "{}Expires:{} {}",
+                        "{}Refreshable until:{} {time}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset
+                    );
+                } else if user_token.refreshable != 0 {
+                    println!("Refreshable");
+                }
+                if !user_token.token.is_empty() {
+                    println!(
+                        "{}Token:{} {}",
                         CommonStyles::HEADERS,
                         anstyle::Reset,
-                        time.to_rfc2822()
+                        user_token.token.as_str()
                     );
                 }
-                println!(
-                    "{}Token:{} {}",
-                    CommonStyles::HEADERS,
-                    anstyle::Reset,
-                    user_token.token.as_str()
-                );
             }
             LoreEvent::AuthIdentity(data) => {
-                println!(
-                    "{}Access Token:{} {}",
-                    CommonStyles::HEADERS,
-                    anstyle::Reset,
-                    data.token.as_str()
-                );
+                if !data.token.is_empty() {
+                    println!(
+                        "{}Access Token:{} {}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset,
+                        data.token.as_str()
+                    );
+                }
+                if !data.claims.is_empty() {
+                    println!(
+                        "{}Access Token Claims:{}\n{}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset,
+                        pretty_json(data.claims.as_str())
+                    );
+                }
             }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
@@ -461,9 +536,17 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
         ),
         with_identity_token: u8::from(args.with_identity_token),
         with_access_token: u8::from(args.with_access_token),
+        with_claims: u8::from(args.with_claims),
     };
 
     run_command(globals, api_args.into(), callback) as u8
+}
+
+/// `json` indented for reading, or as given when it does not parse.
+fn pretty_json(json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(json)
+        .and_then(|value| serde_json::to_string_pretty(&value))
+        .unwrap_or_else(|_| json.to_string())
 }
 
 pub fn handle_auth_commands(cmd: &AuthCommands, globals: LoreGlobalArgs) -> u8 {

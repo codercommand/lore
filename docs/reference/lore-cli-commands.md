@@ -45,6 +45,9 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * [`lore repository instance`↴](#lore-repository-instance)
 * [`lore repository instance list`↴](#lore-repository-instance-list)
 * [`lore repository instance prune`↴](#lore-repository-instance-prune)
+* [`lore repository instance delete`↴](#lore-repository-instance-delete)
+* [`lore repository instance move`↴](#lore-repository-instance-move)
+* [`lore repository instance clone`↴](#lore-repository-instance-clone)
 * [`lore repository config`↴](#lore-repository-config)
 * [`lore repository config get`↴](#lore-repository-config-get)
 * [`lore repository update-path`↴](#lore-repository-update-path)
@@ -63,6 +66,8 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * [`lore branch merge resolve mine`↴](#lore-branch-merge-resolve-mine)
 * [`lore branch merge resolve theirs`↴](#lore-branch-merge-resolve-theirs)
 * [`lore branch merge abort`↴](#lore-branch-merge-abort)
+* [`lore branch merge conflicts`↴](#lore-branch-merge-conflicts)
+* [`lore branch merge conflicts list`↴](#lore-branch-merge-conflicts-list)
 * [`lore branch diff`↴](#lore-branch-diff)
 * [`lore branch archive`↴](#lore-branch-archive)
 * [`lore branch reset`↴](#lore-branch-reset)
@@ -124,6 +129,7 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * [`lore file reset`↴](#lore-file-reset)
 * [`lore file obliterate`↴](#lore-file-obliterate)
 * [`lore file history`↴](#lore-file-history)
+* [`lore file audit`↴](#lore-file-audit)
 * [`lore file diff`↴](#lore-file-diff)
 * [`lore file write`↴](#lore-file-write)
 * [`lore file hash`↴](#lore-file-hash)
@@ -173,6 +179,7 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * [`lore service status`↴](#lore-service-status)
 * [`lore service set-executable`↴](#lore-service-set-executable)
 * [`lore service set-use-automatically`↴](#lore-service-set-use-automatically)
+* [`lore service set-external-directory`↴](#lore-service-set-external-directory)
 * [`lore notification`↴](#lore-notification)
 * [`lore notification subscribe`↴](#lore-notification-subscribe)
 * [`lore completions`↴](#lore-completions)
@@ -228,9 +235,13 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--local` — Use local data
 * `--identity <IDENTITY>` — Use given identity
 * `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity
-  the token was issued to
-* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
-* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10)
+  the token was issued to. Read from `LORE_IDENTITY_TOKEN` when omitted. Unsafe: a value given here is visible to other
+  users in the process table and is kept in the shell history
+* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service.
+  Read from `LORE_ACCESS_TOKEN` when omitted. Unsafe: a value given here is visible to other users in the process table
+  and is kept in the shell history
+* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10; always
+  1 when `LORE_UDS_SOCKET` names a socket)
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
@@ -239,7 +250,14 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on
   writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
+* `--fast-flush` — Have the command's flushes write the local stores' index in place rather than replacing each of its
+  files through a temporary file. Faster where creating files is slow, but if the process stops or a write fails while a
+  file is being written, the store drops every entry that file held, including those of revisions and branches not yet
+  pushed
 * `--cache` — Cache fragment payloads fetched from remote in the local store
+* `--trust-remote` — Trust the remote as part of this machine's infrastructure: data fetched from it is not hash
+  verified. For machines where performance comes first, such as a build server streaming from a server in its own
+  backend
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
 * `--stats <level>` — Report what the operation cost: `--stats` for totals, `--stats=2` to add per-fragment detail
 
@@ -340,7 +358,7 @@ Create a repository in the given directory
 
 * `--description <description>` — Optional description of repository
 * `--id <id>` — Optional ID of repository
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -350,19 +368,23 @@ Create a repository in the given directory
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
+    - `fuse`:
+      A writable virtual instance: a Linux FUSE mount served by the Lore service
 
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 
 ## `lore repository clone`
 
 Clone a remote repository into the given path
 
-A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
-instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
-writes no files and reads them from the remote when a command needs them.
+Cloning needs the remote, so `--offline` does not keep it from connecting: it prepares the new instance for working
+offline instead. With it, as with `--cache`, cloning into an instance that writes its files caches every file metadata
+block of the cloned revision, which staging and committing write to, so both work without the remote, and fails if it
+cannot. A bare or virtual instance writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
@@ -376,10 +398,13 @@ writes no files and reads them from the remote when a command needs them.
 * `--view <view>` — Optional client side view filter file
 * `--revision <revision>` — Optional revision to sync
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
-* `--bare` — Clone without files, only fetch latest revision tree
+* `--bare` — Clone without files, only fetch latest revision tree. Don't commit after merging, reverting or
+  cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything
+  in it
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
-  place
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+  place, and on Windows write files of one fragment past the file cache. Applies to this clone only: the new instance's
+  `[file] direct_write` setting is left as it is, and later commands follow that setting
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -389,20 +414,29 @@ writes no files and reads them from the remote when a command needs them.
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
+    - `fuse`:
+      A writable virtual instance: a Linux FUSE mount served by the Lore service
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — File containing list of files to prefetch
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--prefetch <file>` — Access recording whose paths a FUSE instance warms in the background (one path per line, directories ending with `/`)
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
-* `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
-* `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
+* `--root-file <path>` — Root files for dependency-based selective cloning (only clone these files and their
+  dependencies). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such
+  an instance: the commit can delete a directory the instance never had on disk, with everything in it
+* `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based cloning
+* `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based cloning
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
+
+* `--max-capacity <fragments>` — Fragments the new instance's store holds before eviction removes some, defaults to 2000000. The periodic eviction pass treats a value below 1048576 as 1048576. Ignored over a shared store and with --no-tracking
+* `--max-size <bytes>` — Bytes the new instance's store holds before compaction reclaims space, defaults to 10 GiB. Ignored over a shared store and with --no-tracking
 
 ## `lore repository delete`
 
@@ -563,24 +597,80 @@ Instance management
 
 ###### **Subcommands:**
 
-* `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now
-  hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when
-  it is not mounted
+* `list` — List the registered instances of this repository that the local store can read
+* `prune` — Remove stale instance registrations: paths that no longer exist, paths that hold no revision, paths that now
+  hold a different instance, and registrations whose data is missing from the local store or malformed. An SWFS instance
+  is kept while its `.lore` remains in the external root, even when it's not mounted, and so is an instance whose
+  external directory can't be checked, as while the external root is unavailable
+* `delete` — Delete the current instance: unmount (if a virtual instance), deregister from mutable store, and delete
+  associated directories
+* `move` — Move the current instance to a new path
+* `clone` — Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged
+  state. The new instance shares the instance's data blocks, and cloning is refused where the destination's filesystem
+  or volume cannot share them unless --allow-copy is given. A FUSE instance on Linux is cloned into a FUSE instance the
+  service mounts at the path, copying only its Lore directory and local changes, which the volume of the external root
+  holds. The instance must use a shared store, and the path must not be inside another instance. While cloning runs,
+  commands on the instance, and commands from other processes on every instance over the store, wait for it where they
+  open the store. An instance delete waits too, since it opens the store to deregister the instance before it removes
+  any file. An instance move renames an on-disk instance before it opens the store, so a move makes cloning fail, or on
+  Windows is refused while cloning lists one of its directories
 
 ## `lore repository instance list`
 
-List all registered instances for this repository
+List the registered instances of this repository that the local store can read
 
 **Usage:** `lore repository instance list`
 
 ## `lore repository instance prune`
 
-Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a
-different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not
-mounted
+Remove stale instance registrations: paths that no longer exist, paths that hold no revision, paths that now hold a
+different instance, and registrations whose data is missing from the local store or malformed. An SWFS instance is kept
+while its `.lore` remains in the external root, even when it's not mounted, and so is an instance whose external
+directory can't be checked, as while the external root is unavailable
 
 **Usage:** `lore repository instance prune`
+
+## `lore repository instance delete`
+
+Delete the current instance: unmount (if a virtual instance), deregister from mutable store, and delete associated
+directories
+
+**Usage:** `lore repository instance delete`
+
+## `lore repository instance move`
+
+Move the current instance to a new path
+
+**Usage:** `lore repository instance move <target-path>`
+
+###### **Arguments:**
+
+* `<target-path>` — Target path to move the instance to
+
+## `lore repository instance clone`
+
+Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged state. The
+new instance shares the instance's data blocks, and cloning is refused where the destination's filesystem or volume
+cannot share them unless --allow-copy is given. A FUSE instance on Linux is cloned into a FUSE instance the service
+mounts at the path, copying only its Lore directory and local changes, which the volume of the external root holds. The
+instance must use a shared store, and the path must not be inside another instance. While cloning runs, commands on the
+instance, and commands from other processes on every instance over the store, wait for it where they open the store. An
+instance delete waits too, since it opens the store to deregister the instance before it removes any file. An instance
+move renames an on-disk instance before it opens the store, so a move makes cloning fail, or on Windows is refused while
+cloning lists one of its directories
+
+**Usage:** `lore repository instance clone [OPTIONS] <target-path>`
+
+###### **Arguments:**
+
+* `<target-path>` — Path to create the new instance at; it must not exist, and must be on the instance's volume for the
+  new instance to share its data blocks
+
+###### **Options:**
+
+* `--allow-copy` — Copy the instance's files where the new instance cannot share their data blocks, rather than
+  refusing. A copy takes as long as writing every file, and commands wait for it as they wait while any instance is
+  cloned
 
 ## `lore repository config`
 
@@ -616,7 +706,7 @@ Branch commands
 
 ###### **Subcommands:**
 
-* `list` — List available branches
+* `list` — List the local branches, or the remote's branches with `--remote`
 * `info` — Get info about the given branch
 * `create` — Create a new branch
 * `switch` — Switch to a different branch
@@ -634,7 +724,7 @@ Branch commands
 
 ## `lore branch list`
 
-List available branches
+List the local branches, or the remote's branches with `--remote`
 
 **Usage:** `lore branch list [OPTIONS]`
 
@@ -682,7 +772,9 @@ Switch to a different branch
 * `--dry-run` — Do a dry run sync and only report what changes would be done, do not change anything in the file system
 * `--local` — Keep last local latest revision, do not sync latest revision from remote (implied by offline mode)
 * `--reset` — Reset any local modified files to match the incoming revision
-* `--bare` — Only update anchor tracking without modifying or verifying files, useful for bare repositories
+* `--bare` — Only update anchor tracking without modifying or verifying files, useful for bare repositories. Don't
+  commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance
+  never had on disk, with everything in it
 
 ## `lore branch push`
 
@@ -713,6 +805,7 @@ Merge two branches
 * `restart` — Restart the merge, resetting the current merge state
 * `resolve` — Resolves the merge
 * `abort` — Abort a merge process
+* `conflicts` — Conflicts held by the merge in progress
 
 ###### **Arguments:**
 
@@ -853,6 +946,22 @@ Abort a merge process
 
 * `--link <LINK>` — Abort only a specific linked repository merge at the given mount path
 * `--ignore-links` — Abort only the main repository merge, keeping link pin updates
+
+## `lore branch merge conflicts`
+
+Conflicts held by the merge in progress
+
+**Usage:** `lore branch merge conflicts <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List every conflict the merge still holds
+
+## `lore branch merge conflicts list`
+
+List every conflict the merge still holds
+
+**Usage:** `lore branch merge conflicts list`
 
 ## `lore branch diff`
 
@@ -1104,7 +1213,9 @@ Synchronize to a given state of a repository
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
-  dependencies)
+  dependencies, and the whole folder that replaces a link they lie in). A root file inside a link is skipped. Don't
+  commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance
+  never had on disk, with everything in it
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -1450,7 +1561,7 @@ File commands
 
 * `info` — Get info about the given file or directory
 * `metadata` — Manage metadata of a given file or directory
-* `dependency` — Manage file dependencies
+* `dependency` — Manage file dependencies of files outside links
 * `stage` — Stage changes for commit
 * `dirty` — Mark files as dirty so they show up in `lore status` and get picked up by directory-scoped `lore stage` (no
   content is read or staged)
@@ -1458,6 +1569,7 @@ File commands
 * `reset` — Reset changes to a path or file to the current revision, discarding your local changes
 * `obliterate` — Obliterate a file or fragment
 * `history` — List revisions of a file
+* `audit` — Attribute each line of a file to the revision that last changed it
 * `diff` — Show differences between two revisions of a file
 * `write` — Write data to a specific location
 * `hash` — Hash a local file
@@ -1533,7 +1645,7 @@ Set metadata on for a staged file
 
 ## `lore file dependency`
 
-Manage file dependencies
+Manage file dependencies of files outside links
 
 **Usage:** `lore file dependency <COMMAND>`
 
@@ -1739,7 +1851,9 @@ Reset changes to a path or file to the current revision, discarding your local c
 
 ###### **Options:**
 
-* `--purge` — Delete untracked files
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
+  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
+  excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the
@@ -1776,6 +1890,37 @@ List revisions of a file
 * `--branch <branch>` — Show branch revisions
 * `--depth <depth>` — Number of revisions to search initially
 * `--oneline` — Output each revision on one line only
+
+## `lore file audit`
+
+Attribute each line of a file to the revision that last changed it
+
+**Usage:** `lore file audit [OPTIONS] <PATH>`
+
+###### **Arguments:**
+
+* `<PATH>` — File path to attribute
+
+###### **Options:**
+
+* `--revision <revision>` — Revision to read the file at: a revision signature, `[branch]@<number>`, `[branch]@LATEST`
+  or `<branch>@<hash>`, optionally followed by `~<count>` to step back that many parents. Without it the file is read at
+  the revision the instance is synced to, and the file on disk is accounted for
+* `--max-revisions <n>` — Comparisons of the file's predecessor chain to make, 0 for no limit.
+
+  This bounds the work, not the number of revisions the answer can name. A comparison against the revision that added
+  the file resolves that revision too, and a comparison at a revision that left the file alone resolves none, so the
+  rows reported can be one more or one fewer than the bound allows.
+
+  Default value: `100`
+* `--ignore-space-at-eol` — Treat lines that differ only in trailing whitespace as unchanged
+
+  On by default, unlike `lore file diff`: attribution asks who wrote a line, and trailing-space or line-ending churn
+  does not answer that. Turn it off with --no-ignore-space-at-eol.
+* `--no-ignore-space-at-eol` — Count a line that differs only in trailing whitespace as changed
+* `--ignore-space-change` — Collapse runs of internal whitespace to a single space before comparing
+
+  Leaves a reindented line with the revision that wrote its text.
 
 ## `lore file diff`
 
@@ -1854,10 +1999,16 @@ Authenticate the CLI
 ###### **Options:**
 
 * `--token-type <TOKEN_TYPE>` — Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
-* `--token <TOKEN>` — Token value for non-interactive login (requires --token-type)
+* `--token <TOKEN>` — Token value for non-interactive login (requires --token-type). Read from `LORE_TOKEN` when omitted.
+  Unsafe: a value given here is visible to other users in the process table and is kept in the shell history
+* `--client-id <CLIENT_ID>` — Log in as this confidential client registered with the identity provider, authenticating
+  with its client secret
+* `--client-secret <CLIENT_SECRET>` — Client secret for --client-id. Read from `LORE_CLIENT_SECRET` when omitted. Unsafe:
+  a value given here is visible to other users in the process table and is kept in the shell history
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
   with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
+* `--reuse-session` — Keep the stored login instead of logging in again while its session is valid
 
 ## `lore auth info`
 
@@ -1873,6 +2024,7 @@ Display identity information for the current user or specified user IDs
 
 * `--with-identity-token` — Include cached identity tokens in the output
 * `--with-access-token` — Include the current repository's access token in the output
+* `--with-claims` — Include the claims of the current repository's access token in the output
 
 ## `lore auth list`
 
@@ -1981,10 +2133,16 @@ Authenticate the CLI
 ###### **Options:**
 
 * `--token-type <TOKEN_TYPE>` — Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
-* `--token <TOKEN>` — Token value for non-interactive login (requires --token-type)
+* `--token <TOKEN>` — Token value for non-interactive login (requires --token-type). Read from `LORE_TOKEN` when omitted.
+  Unsafe: a value given here is visible to other users in the process table and is kept in the shell history
+* `--client-id <CLIENT_ID>` — Log in as this confidential client registered with the identity provider, authenticating
+  with its client secret
+* `--client-secret <CLIENT_SECRET>` — Client secret for --client-id. Read from `LORE_CLIENT_SECRET` when omitted. Unsafe:
+  a value given here is visible to other users in the process table and is kept in the shell history
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
   with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
+* `--reuse-session` — Keep the stored login instead of logging in again while its session is valid
 
 ## `lore link`
 
@@ -1996,7 +2154,7 @@ Link commands
 
 * `add` — Link to the given point in the repository and subpath from the given repository
 * `remove` — Remove the link at the given point in the repository
-* `update` — Update the link to a new pin
+* `update` — Update every mount of the linked repository to a new pin
 * `list` — List all links in the repository
 * `info` — Show detailed information about the link at the given path
 
@@ -2014,7 +2172,8 @@ Link to the given point in the repository and subpath from the given repository
 
 ###### **Options:**
 
-* `--pin <pin>` — Branch or specific revision to pin the link to, defaulting to latest on the main branch
+* `--pin <pin>` — Branch or specific revision to pin the link to, defaulting to latest on the main branch, or to the
+  revision the other mounts of the repository pin
 * `--disable-branching` — Disable automatic branch creation in the linked repository
 
 ## `lore link remove`
@@ -2029,7 +2188,7 @@ Remove the link at the given point in the repository
 
 ## `lore link update`
 
-Update the link to a new pin
+Update every mount of the linked repository to a new pin
 
 **Usage:** `lore link update [OPTIONS] <link_path>`
 
@@ -2105,10 +2264,10 @@ are persisted so subsequent `lore stage` / `lore status` calls see an accurate p
 
 Clone a remote repository into the given path
 
-A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
-instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
-writes no files and reads them from the remote when a command needs them.
+Cloning needs the remote, so `--offline` does not keep it from connecting: it prepares the new instance for working
+offline instead. With it, as with `--cache`, cloning into an instance that writes its files caches every file metadata
+block of the cloned revision, which staging and committing write to, so both work without the remote, and fails if it
+cannot. A bare or virtual instance writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 
@@ -2122,10 +2281,13 @@ writes no files and reads them from the remote when a command needs them.
 * `--view <view>` — Optional client side view filter file
 * `--revision <revision>` — Optional revision to sync
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
-* `--bare` — Clone without files, only fetch latest revision tree
+* `--bare` — Clone without files, only fetch latest revision tree. Don't commit after merging, reverting or
+  cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything
+  in it
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
-  place
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+  place, and on Windows write files of one fragment past the file cache. Applies to this clone only: the new instance's
+  `[file] direct_write` setting is left as it is, and later commands follow that setting
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -2135,20 +2297,29 @@ writes no files and reads them from the remote when a command needs them.
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
+    - `fuse`:
+      A writable virtual instance: a Linux FUSE mount served by the Lore service
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — File containing list of files to prefetch
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--prefetch <file>` — Access recording whose paths a FUSE instance warms in the background (one path per line, directories ending with `/`)
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
-* `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
-* `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
+* `--root-file <path>` — Root files for dependency-based selective cloning (only clone these files and their
+  dependencies). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such
+  an instance: the commit can delete a directory the instance never had on disk, with everything in it
+* `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based cloning
+* `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based cloning
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
+
+* `--max-capacity <fragments>` — Fragments the new instance's store holds before eviction removes some, defaults to 2000000. The periodic eviction pass treats a value below 1048576 as 1048576. Ignored over a shared store and with --no-tracking
+* `--max-size <bytes>` — Bytes the new instance's store holds before compaction reclaims space, defaults to 10 GiB. Ignored over a shared store and with --no-tracking
 
 ## `lore stage`
 
@@ -2295,7 +2466,9 @@ Reset changes to a file or directory
 
 ###### **Options:**
 
-* `--purge` — Delete untracked files
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
+  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
+  excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the
@@ -2383,7 +2556,9 @@ Synchronize to a repository state
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
-  dependencies)
+  dependencies, and the whole folder that replaces a link they lie in). A root file inside a link is skipped. Don't
+  commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance
+  never had on disk, with everything in it
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -2485,9 +2660,10 @@ Manage the repository in a service process
 * `run` — Run this process as the service
 * `start` — Start the service, unless one is already running
 * `stop` — Stop the running service
-* `status` — Report whether the service is running, and what it is doing
+* `status` — Report whether the service is running, what it is doing, and where the external directories are
 * `set-executable` — Set which executable is started as the service
 * `set-use-automatically` — Set whether commands are carried out by the service
+* `set-external-directory` — Move every virtual instance's external directory to a new external root
 
 ## `lore service run`
 
@@ -2509,7 +2685,7 @@ Stop the running service
 
 ## `lore service status`
 
-Report whether the service is running, and what it is doing
+Report whether the service is running, what it is doing, and where the external directories are
 
 **Usage:** `lore service status`
 
@@ -2537,6 +2713,31 @@ Set whether commands are carried out by the service
   clap refuses a positional whose action takes none.
 
   Possible values: `true`, `false`
+
+## `lore service set-external-directory`
+
+Move every virtual instance's external directory to a new external root
+
+Stops the running service and holds its socket until the move ends, then starts the service again. Renames the external
+root within its volume, and copies it to another volume, keeping holes, owners, permissions, attributes, access control
+lists and times, and refusing what a copy can't keep, such as a hard link. Refuses a service that runs inside another
+program, and a stop while a program is inside a virtual instance, unless --force, which detaches busy mounts lazily.
+Ctrl-C before the final switch undoes a move; an --adopt or --abandon it interrupts is finished later, by recovery.
+Ctrl-C while the command finishes an earlier interrupted move ends it, and leaves that move to recovery. With --dry-run,
+runs every check that needs nothing stopped and reports what the move would do; while a move is interrupted, it reports
+that move, and the target is checked once recovery has finished it.
+
+**Usage:** `lore service set-external-directory [OPTIONS] <path>`
+
+###### **Arguments:**
+
+* `<path>` — The new external root: an absolute path, one relative to the working directory, or empty for the default
+  location in the global data directory
+
+###### **Options:**
+
+* `--adopt` — Point the setting at the path, a root that holds this global data directory's marker, and move nothing
+* `--abandon` — Give up the unavailable external root for a new, empty one at the path, and move nothing
 
 ## `lore notification`
 
@@ -2583,7 +2784,7 @@ Manage the shared store
 * `create` — Create a shared store backed by a remote
 * `info` — Show the shared store this repository uses
 * `list` — Show information about the registry of shared stores
-* `set-use-automatically` — Set whether new clones use a shared store without being asked to
+* `set-use-automatically` — Set whether new instances use a shared store without being asked to
 
 ## `lore shared-store create`
 
@@ -2602,6 +2803,9 @@ Create a shared store backed by a remote
 
   Possible values: `true`, `false`
 
+* `--max-size <bytes>` — Bytes the store holds before compaction reclaims space, defaults to 10 GiB. Change it later as `max_size` in the store's `shared_store.toml`
+* `--max-capacity <fragments>` — Fragments the store holds before eviction removes some, defaults to 2000000. The periodic eviction pass treats a value below 1048576 as 1048576. Change it later as `max_capacity` in the store's `shared_store.toml`
+
 ## `lore shared-store info`
 
 Show the shared store this repository uses
@@ -2616,13 +2820,14 @@ Show information about the registry of shared stores
 
 ###### **Options:**
 
-* `--include-instances <INCLUDE_INSTANCES>` — Look up all instances each shared store is used by
+* `--include-instances <INCLUDE_INSTANCES>` — Look up the instances using each shared store. A store another process
+  still holds after a 3-second wait is listed without them, with a warning
 
   Possible values: `true`, `false`
 
 ## `lore shared-store set-use-automatically`
 
-Set whether new clones use a shared store without being asked to
+Set whether new instances use a shared store without being asked to
 
 **Usage:** `lore shared-store set-use-automatically <enabled>`
 

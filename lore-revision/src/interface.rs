@@ -373,33 +373,25 @@ impl From<&str> for LoreString {
 
 impl From<Option<String>> for LoreString {
     fn from(value: Option<String>) -> Self {
-        value
-            .as_deref()
-            .map(LoreString::from_str)
-            .unwrap_or_default()
+        value.as_deref().map_or_default(LoreString::from_str)
     }
 }
 
 impl From<Option<&String>> for LoreString {
     fn from(value: Option<&String>) -> Self {
-        value
-            .map(|value| LoreString::from_str(value.as_str()))
-            .unwrap_or_default()
+        value.map_or_default(|value| LoreString::from_str(value.as_str()))
     }
 }
 
 impl From<&Option<String>> for LoreString {
     fn from(value: &Option<String>) -> Self {
-        value
-            .as_deref()
-            .map(LoreString::from_str)
-            .unwrap_or_default()
+        value.as_deref().map_or_default(LoreString::from_str)
     }
 }
 
 impl From<Option<&str>> for LoreString {
     fn from(value: Option<&str>) -> Self {
-        value.map(LoreString::from_str).unwrap_or_default()
+        value.map_or_default(LoreString::from_str)
     }
 }
 
@@ -651,8 +643,15 @@ pub enum LoreLoadConfig {
 pub const DEFAULT_EVENT_INTERVAL_MS: u64 = 100;
 
 /// Common options shared by repository operations.
+///
+/// Zero every byte of it, padding included, before setting the fields a call
+/// uses, as every structure passed to the library: a field left zero selects
+/// its default, and a field a release adds in its padding is left unset by
+/// code built against an earlier header.
 #[repr(C)]
-#[derive(Default, Debug, Clone, PartialEq, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Default, Debug, Clone, PartialEq, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 pub struct LoreGlobalArgs {
     /// Repository path
     pub repository_path: LoreString,
@@ -696,15 +695,19 @@ pub struct LoreGlobalArgs {
     pub compress_task_limit: u64,
     /// Keep store references alive after a repository call completes to avoid
     /// repeated store open/close cycles for consecutive API calls in the same process.
+    /// The stores stay locked meanwhile, so another process using them waits. With
+    /// `LORE_STORE_RETAIN` set to `1` or `true` in the environment of the process running
+    /// the call, the stores are kept after every call whether or not this is set,
+    /// unlocked, and the next call reloads them only if another process changed them.
     pub store_keep_alive: u8,
-    /// Duration in seconds to keep store references alive. Only used when
-    /// `store_keep_alive` is set. 0 means use the default (10 seconds).
+    /// Duration in seconds to keep store references alive, when `store_keep_alive` or
+    /// `LORE_STORE_RETAIN` is set. 0 means use the default (10 seconds).
     pub store_keep_alive_seconds: u64,
     /// Force sync data to storage media during store flush
     pub sync_data: u8,
-    /// Cache fragment payloads fetched from remote in the local store. Without
-    /// this only state fragments and fragments flagged for local cache priority
-    /// are retained
+    /// Cache fragment payloads fetched from remote, and those written, in the local store, as
+    /// a repository's `[store] cache_payloads` does for every command. Without either only state
+    /// fragments and fragments flagged for local cache priority are retained
     pub cache: u8,
     /// Authentication token to use instead of the one held in the secure token
     /// store. Authorization tokens are exchanged from it as they are needed.
@@ -721,11 +724,14 @@ pub struct LoreGlobalArgs {
     /// How much an operation reports about what it cost.
     ///
     /// - `0` — no statistics event, and no per-fragment counters kept for one.
-    /// - `1` — one statistics event when the operation finishes: per-action file
-    ///   counts, and the fragment, local-store and remote-store totals.
+    /// - `1` — one statistics event when the operation finishes: a commit reports
+    ///   per-action file counts and the fragment, local-store and remote-store
+    ///   totals, a storage put or upload call its item counts and the same totals,
+    ///   and a push the fragments it deduplicated, copied and put.
     /// - `2` — also a `FragmentWrite` event per stored fragment, which describes
     ///   the shape of what was written rather than its sums. One event per
-    ///   fragment is the cost of this level.
+    ///   fragment is the cost of this level. A storage put or upload call sends
+    ///   none, so this level reports for it what level `1` does.
     ///
     /// A level above the highest known behaves as the highest known.
     pub stats: u32,
@@ -736,7 +742,24 @@ pub struct LoreGlobalArgs {
     /// Which authentication path to take if the server advertises both its
     /// gRPC auth service and an OIDC issuer.
     pub auth_mode: AuthMode,
+    /// Treat the remote as a trusted source, for a caller within its
+    /// infrastructure where performance comes first: payloads fetched from it
+    /// have only their sizes checked against their length, are never hashed,
+    /// and are decompressed only where their content is read. A storage handle
+    /// takes it from the globals it is opened with. Any non-zero value trusts
+    /// the remote, so a caller zeroes the whole struct, padding included
+    pub trust_remote: u8,
+    /// Have the call's flushes write the local stores' index in place, rather than replacing each
+    /// of its files through a temporary file, which is faster where creating files is slow. If the
+    /// process stops or a write fails while a file is being written, the store drops every entry
+    /// that file held, including those of revisions and branches not yet pushed. Eviction and
+    /// compaction replace the files they write whatever it says, and it is independent of
+    /// `sync_data`, which syncs what is written either way. Any non-zero value writes in place
+    pub fast_flush: u8,
 }
+
+// Lock the C ABI size of `LoreGlobalArgs` (`lore_global_args_t`), which callers zero-initialize.
+const _: () = assert!(std::mem::size_of::<LoreGlobalArgs>() == 192);
 
 impl LoreGlobalArgs {
     pub fn repository_path(&self) -> &str {
@@ -862,8 +885,21 @@ impl LoreGlobalArgs {
         self.sync_data != 0
     }
 
+    /// The options of the flushes this call makes: its `sync_data` and `fast_flush`.
+    pub fn flush_options(&self) -> lore_storage::FlushOptions {
+        lore_storage::FlushOptions {
+            sync_data: self.sync_data(),
+            fast_flush: self.fast_flush != 0,
+        }
+    }
+
     pub fn cache(&self) -> bool {
         self.cache != 0
+    }
+
+    /// Whether the command trusts its remote.
+    pub fn trust_remote(&self) -> bool {
+        self.trust_remote != 0
     }
 
     /// Whether an operation should emit statistics events at all.
@@ -888,11 +924,11 @@ impl LoreGlobalArgs {
         std::time::Duration::from_millis(interval_ms)
     }
 
-    /// Returns the store keep-alive duration if enabled.
-    /// When `store_keep_alive` is not set, returns `None`.
-    /// When set with `store_keep_alive_seconds` of 0, uses the default duration.
+    /// Returns how long stores are kept after a call: `None` when neither `store_keep_alive`
+    /// is set nor this process retains stores ([`crate::store::retain_stores`]), and the
+    /// default duration where `store_keep_alive_seconds` is 0.
     pub fn store_keep_alive_duration(&self) -> Option<std::time::Duration> {
-        if self.store_keep_alive == 0 {
+        if self.store_keep_alive == 0 && !crate::store::retain_stores() {
             return None;
         }
         let seconds = if self.store_keep_alive_seconds == 0 {
@@ -984,7 +1020,7 @@ fn execution_initialize() {
     });
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ExecutionMode {
     Client,
     Server,
@@ -1011,14 +1047,16 @@ pub struct ExecutionContext {
     /// no counters, and only a push reads them whatever the level.
     fragment_stats: OnceLock<Arc<lore_storage::FragmentWriteStats>>,
     /// What this call's push registered with the peer, accumulated across every
-    /// revision, link and layer it covers.
-    ///
-    /// Kept whatever the statistics level: the per-revision progress event reads
-    /// its share out of these, so they are load-bearing rather than diagnostic.
+    /// revision, link and layer it covers, for the statistics event.
     push_stats: OnceLock<Arc<crate::branch::push::PushStats>>,
+    /// The query and upload slots every push this call makes shares.
+    push_budget: OnceLock<crate::branch::push::PushBudget>,
     /// The environment of the process that relayed this call, read in place of this process's
     /// through [`lore_base::env::var`]. `None` for a call made in this process.
     environment: Option<CallEnvironment>,
+    /// Cancelled once nobody is waiting for this call's result. `None` for a call nothing can
+    /// cancel, such as a client command.
+    cancellation: Option<crate::runtime::Cancellation>,
 }
 
 impl ExecutionContext {
@@ -1081,6 +1119,73 @@ impl ExecutionContext {
         }
     }
 
+    /// This context, for a call that stops at its next cancellation check once `cancellation` is
+    /// cancelled.
+    pub fn with_cancellation(self, cancellation: crate::runtime::Cancellation) -> Self {
+        Self {
+            cancellation: Some(cancellation),
+            ..self
+        }
+    }
+
+    pub fn cancellation(&self) -> Option<&crate::runtime::Cancellation> {
+        self.cancellation.as_ref()
+    }
+
+    /// This context for a holder that serves past the call that made it, a mounted filesystem,
+    /// for a caller with `environment` under `globals`: this mode, and a dispatcher that sends
+    /// nowhere, as no call awaits what the holder logs.
+    #[lore_macro::test_pub]
+    pub(crate) fn serving(
+        &self,
+        globals: LoreGlobalArgs,
+        environment: Option<CallEnvironment>,
+    ) -> Self {
+        let mut dispatcher = EventDispatcher::new(None);
+        dispatcher
+            .correlation_id
+            .clone_from(&self.dispatcher.correlation_id);
+        let user_id = self.user_id.try_lock().map_or_default(|id| id.clone());
+        Self {
+            globals,
+            dispatcher,
+            log_level: self.log_level,
+            user_id: Mutex::new(user_id),
+            mode: self.mode,
+            caller_state: self.caller_state.clone(),
+            environment,
+            ..Default::default()
+        }
+    }
+
+    /// This context for work a server call starts that runs to its end even once nobody waits for
+    /// the call, such as what follows a write: the same call and user, adding to the same write
+    /// accounting, with nothing to cancel it. Its dispatcher sends nowhere, as a server call's
+    /// does, and it has its own push statistics and slots.
+    pub async fn outliving(&self) -> Self {
+        let mut dispatcher = EventDispatcher::new(None);
+        dispatcher
+            .correlation_id
+            .clone_from(&self.dispatcher.correlation_id);
+        Self {
+            globals: self.globals.clone(),
+            dispatcher,
+            log_level: self.log_level,
+            user_id: Mutex::new(self.user_id().await),
+            mode: self.mode,
+            caller_state: self.caller_state.clone(),
+            fragment_stats: OnceLock::from(self.fragment_stats().clone()),
+            environment: self.environment.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// The environment of the process that relayed this call, `None` for a call made in this
+    /// process.
+    pub(crate) fn environment(&self) -> Option<&CallEnvironment> {
+        self.environment.as_ref()
+    }
+
     pub fn globals(&self) -> &LoreGlobalArgs {
         &self.globals
     }
@@ -1112,6 +1217,12 @@ impl ExecutionContext {
         self.push_stats
             .get_or_init(|| Arc::new(crate::branch::push::PushStats::new(self.globals().stats())))
     }
+
+    /// The slots this call's pushes share. See the field.
+    pub(crate) fn push_budget(&self) -> &crate::branch::push::PushBudget {
+        self.push_budget
+            .get_or_init(crate::branch::push::PushBudget::default)
+    }
 }
 
 impl Default for ExecutionContext {
@@ -1127,7 +1238,9 @@ impl Default for ExecutionContext {
             caller_state: None,
             fragment_stats: OnceLock::new(),
             push_stats: OnceLock::new(),
+            push_budget: OnceLock::new(),
             environment: None,
+            cancellation: None,
         }
     }
 }
@@ -1196,7 +1309,7 @@ pub enum LoreError {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C, u32)]
-#[derive(Clone, Debug, PartialEq, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, Debug, PartialEq, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 pub enum LoreMetadata {
     /// An address value.
     Address(Address) = LoreMetadataType::Address as u32,
@@ -1224,7 +1337,16 @@ pub enum LoreMetadata {
 ///
 /// There is deliberately no zero value: a zero-initialized field has not chosen
 /// a type and must not be passed as one.
-#[derive(Debug, Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreMetadataType {
     /// A content address: 48 bytes, the 32-byte hash followed by the 16-byte
@@ -1344,7 +1466,16 @@ impl ValidateText for LoreMetadata {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// The kind of a tracked node.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreNodeType {
     /// A directory.
@@ -1383,7 +1514,16 @@ pub enum LoreNodeStagedAction {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// The change applied to a file.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreFileAction {
     /// The file is unchanged.
@@ -1402,7 +1542,16 @@ pub enum LoreFileAction {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// Where a branch is located.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreBranchLocation {
     /// A branch held locally.
@@ -1422,7 +1571,16 @@ impl Display for LoreBranchLocation {
 
 /// A branch paired with a revision on that branch.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreBranchPoint {
     /// The branch.
     pub branch: BranchId,

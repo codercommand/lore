@@ -13,20 +13,20 @@ use crate::branch;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
-use crate::filter::FilterMode;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lock;
-use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
 use crate::lock::util::fold_batch_results;
+use crate::lock::util::lock_batch_size;
+use crate::lock::util::lock_path_node;
+use crate::lock::util::lock_tree;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
 use crate::lore_trace;
 use crate::repository::RepositoryContext;
-use crate::state;
 use crate::util::path::RelativePath;
 
 #[derive(Clone, Debug)]
@@ -39,6 +39,8 @@ pub struct ReleaseOptions {
 
 #[error_set]
 pub enum ReleaseError {
+    Cancelled,
+    LinkPinsDiverge,
     Disconnected,
     InvalidArguments,
     SlowDown,
@@ -97,7 +99,9 @@ impl EventError for ReleaseError {
 
 /// Data for an event that marks the start of a lock release report.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileReleaseBeginEventData {
     /// Number of release entries that follow.
@@ -108,7 +112,7 @@ pub struct LoreLockFileReleaseBeginEventData {
 
 /// Data for an event reporting a path whose lock is being released.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileReleaseEventData {
     /// The path whose lock is being released.
@@ -124,14 +128,9 @@ pub async fn release(
         .await
         .forward::<ReleaseError>("Unable to release lock while offline")?;
 
-    let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
+    let (state, current_branch) = lock_tree(&repository)
         .await
-        .forward::<ReleaseError>("Failed to deserialize current revision anchor")?;
-    let staged_revision = crate::instance::load_staged_revision(&repository)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(current_revision);
+        .forward::<ReleaseError>("Failed to deserialize state")?;
 
     let branch = if options.branch.is_empty() {
         current_branch
@@ -164,10 +163,6 @@ pub async fn release(
         // b)   Otherwise we verify the path is a valid node in the repository
         // REMARK: since locks are treated as an atomic operation if anything here fails we abort
 
-        let state = state::State::deserialize(repository.clone(), staged_revision)
-            .await
-            .forward::<ReleaseError>("Failed to deserialize state")?;
-
         lore_debug!("Inspecting {} path(s)", options.paths.len());
         for path in options.paths.as_slice().iter() {
             let relative_path = RelativePath::new_from_user_path(
@@ -176,20 +171,15 @@ pub async fn release(
             )
             .forward_with::<ReleaseError, _>(|| format!("Invalid path: {}", path.as_str()))?;
             if !force {
-                if repository
-                    .filter
-                    .emit_excludes(&relative_path, true, FilterMode::Full)
-                {
+                let Some(node) = lock_path_node(&repository, &state, &relative_path, false)
+                    .await
+                    .forward::<ReleaseError>("checking a lock path against the filter")?
+                else {
                     lore_trace!("Path excluded by filter: {}", relative_path.as_str());
                     continue;
-                }
+                };
 
-                let node_link = state
-                    .find_node_link(repository.clone(), relative_path.as_str())
-                    .await
-                    .unwrap_or_default();
-
-                if !node_link.is_valid() {
+                if node.is_err() || relative_path.is_empty() {
                     lore_error!(
                         "Path not found in repository. Use --force if file was deleted while being locked."
                     );
@@ -258,7 +248,7 @@ pub async fn release(
 
     let resources_count = resources.len();
     let resources_values = Vec::from_iter(resources);
-    let batch_iterator = resources_values.chunks(LOCK_BATCH_SIZE);
+    let batch_iterator = resources_values.chunks(lock_batch_size(&remote.environment));
     let num_batches = batch_iterator.len();
 
     let mut batches: JoinSet<Result<Vec<lock::LockResource>, ReleaseError>> = JoinSet::new();

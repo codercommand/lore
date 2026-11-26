@@ -14,12 +14,17 @@ use lore_revision::branch::MAX_DIVERGENT_HISTORY_LENGTH;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::runtime::Cancellation;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_diff::*;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
+use lore_server::util::core_hop::with_request_cancellation;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
 use tonic::Request;
@@ -81,13 +86,15 @@ async fn push_revision_on_branch(
 
     branch_push::push(
         repository_context.clone(),
+        None,
         branch,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("Failed to push head revision")
@@ -163,6 +170,7 @@ async fn divergence_returns_ok_for_exceeded_max_search_depth() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository.into(),
+            allow_all_repositories(),
         ));
 
         let (
@@ -354,6 +362,7 @@ async fn two_branch_divergence_returns_ok_for_exceeded_max_search_depth() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository.into(),
+            allow_all_repositories(),
         ));
 
         let (
@@ -597,6 +606,7 @@ async fn no_shared_branch_in_stacks_is_rejected() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository.into(),
+            allow_all_repositories(),
         ));
 
         let (_main_branch, main_revision) = create_test_main(repository_context.clone()).await;
@@ -688,6 +698,7 @@ async fn disjoint_histories_fall_back_to_the_older_branch_point() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository.into(),
+            allow_all_repositories(),
         ));
 
         let (main_branch, revision_1) = create_test_main(repository_context.clone()).await;
@@ -776,4 +787,68 @@ async fn disjoint_histories_fall_back_to_the_older_branch_point() {
         !base.is_zero(),
         "A zero base is the empty tree, which conflicts on every path in both branches"
     );
+}
+
+#[tokio::test]
+async fn a_cancelled_request_answers_cancelled() {
+    let repository = random::<Context>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let status = Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository.into(),
+            lore_revision::state::allow_all_repositories(),
+        ));
+
+        let (main_branch, mut main_latest_revision) =
+            create_test_main(repository_context.clone()).await;
+        for revision_number in 2..4 {
+            main_latest_revision = push_revision_on_branch(
+                repository_context.clone(),
+                main_branch,
+                main_latest_revision,
+                revision_number,
+            )
+            .await;
+        }
+        let branch = create_branch(
+            repository_context.clone(),
+            "branch_a",
+            vec![BranchPoint {
+                branch: main_branch,
+                revision: main_latest_revision,
+            }],
+        )
+        .await;
+        let branch_revision =
+            push_revision_on_branch(repository_context.clone(), branch, main_latest_revision, 4)
+                .await;
+
+        let mut request = Request::new(BranchDiffRequest {
+            branch_target: main_branch.into(),
+            branch_source: branch.into(),
+            revision_target: Some(main_latest_revision.into()),
+            revision_source: Some(branch_revision.into()),
+            autoresolve: false,
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        with_request_cancellation(
+            cancellation,
+            handler(request, immutable_store, mutable_store, allow_all()),
+        )
+        .await
+        .expect_err("a cancelled request stops before it answers")
+    }))
+    .await;
+
+    assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
 }

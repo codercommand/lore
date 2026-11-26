@@ -8,32 +8,56 @@
 
 mod auth;
 mod branch;
+mod case_folding;
 mod change;
 mod commit;
 mod dependency;
+/// The fixtures of the move tests, shared with the process-isolated tests of a commit's dirty
+/// moves.
+#[path = "../support/dirty_move_fixture.rs"]
+mod dirty_move_fixture;
 mod event;
 mod file;
 mod filter;
+mod filter_walk;
+mod find;
 mod fs;
 mod global;
 /// The fixtures the crate's process-isolated tests include, shared with these.
 #[path = "../helper.rs"]
 mod helper;
+mod history;
 mod immutable;
 mod infer;
 mod instance;
+mod instance_delete;
+mod instance_in_use_retry;
+mod instance_move_rollback;
 mod interface;
+mod layer;
 mod link;
 mod lock;
 mod merge;
 mod metadata;
 mod node;
+mod notification;
+mod paged_remote;
+mod progress;
+mod protocol;
+mod records;
+mod refusal;
 mod relay;
 mod repository;
 mod revision;
+mod runtime;
+mod service_state;
 mod stage;
 mod state;
+mod store;
 mod util;
+/// The seeded xorshift these tests share with the FUSE tests' own binaries.
+#[path = "../support/xorshift.rs"]
+mod xorshift;
 
 /// Points the unit tests at a global data and config directory of their own, rather than the
 /// machine's, so a test's external `.lore` lookups and shared store registry stay inside it

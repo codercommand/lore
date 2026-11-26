@@ -3,8 +3,14 @@
 import os
 
 import pytest
-from link_helpers import build_nested_link_repos_at
-from test_utils import unstaged_entries, working_tree_files
+from error_types import LOCAL_MODIFICATIONS, LocalChanges
+from link_helpers import build_nested_link_repos_at, fail_unless_holds, link_pin
+from lore_parsers import parse_status_json
+from test_utils import status_by_path, to_posix, unstaged_entries, working_tree_files
+
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
 
 
 @pytest.mark.smoke
@@ -303,6 +309,41 @@ def test_nested_link_update(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize(
+    "staged_parent", [False, True], ids=["nothing staged", "parent staged"]
+)
+@pytest.mark.parametrize("edited", [False, True], ids=["unchanged", "edited"])
+def test_nested_link_update_refuses_only_a_local_change_it_would_overwrite(
+    new_lore_repo, staged_parent, edited
+):
+    """`link update` of a nested link refuses where re-pinning it would overwrite a local edit,
+    and only there, whatever the top-level repository has staged."""
+    repo_a, _repo_b, repo_c, _b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
+    )
+    c_v1 = repo_c.branch_info().local_latest
+    repo_c.write_commit_push("C v2", {"c-data/inner.txt": "C revision two\n"})
+    c_v2 = repo_c.branch_info().local_latest
+    inner = f"{nested_mount}/c-data/inner.txt"
+    if edited:
+        repo_a.write_files({inner: "locally edited\n"})
+    if staged_parent:
+        repo_a.write_files({"staged.txt": "staged\n"})
+        repo_a.stage("staged.txt")
+
+    if edited:
+        with pytest.raises(LocalChanges) as refused:
+            repo_a.link_update(nested_mount, pin=c_v2)
+        assert refused.value.returncode == LOCAL_MODIFICATIONS, refused.value
+    else:
+        repo_a.link_update(nested_mount, pin=c_v2)
+
+    with repo_a.open_file(inner) as f:
+        assert f.read() == ("locally edited\n" if edited else "C revision two\n")
+    assert link_pin(repo_a, repo_c.get_id()) == (c_v1 if edited else c_v2)
+
+
+@pytest.mark.smoke
 def test_nested_link_remove(new_lore_repo):
     """`link remove` removes a NESTED link (B -> C) and its registry entry.
 
@@ -484,6 +525,39 @@ def test_nested_link_commit_scoped(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_nested_link_commit_keeps_the_intermediate_links_directories(new_lore_repo):
+    """`commit --link <nested-path>` commits the intermediate link's staged deletion alone.
+
+    The intermediate link's commit walks its tree from its root rather than from its mount,
+    so it must not read its directories as gone from the working tree.
+    """
+    repo_a, _repo_b, _repo_c, b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
+    )
+    removed = f"{b_mount}/b-data/removed.txt"
+    kept = f"{b_mount}/b-data/kept.txt"
+    repo_a.write_files({removed: "removed\n", kept: "kept\n"})
+    repo_a.stage(scan=True)
+    repo_a.commit("Add B's data")
+    repo_a.push()
+
+    repo_a.remove_file(removed)
+    repo_a.stage([removed])
+    inner_file = f"{nested_mount}/c-data/inner.txt"
+    repo_a.write_files({inner_file: "nested change\n"})
+    repo_a.stage([inner_file])
+    output = repo_a.commit("Scoped nested commit", link=nested_mount)
+    assert "Commit succeeded" in output, output
+    repo_a.commit("Record the scoped nested commit on the parent")
+    repo_a.push()
+
+    fresh = repo_a.clone()
+    assert fresh.file_exists(kept), "the rest of B's directory survives a fresh clone"
+    assert not fresh.file_exists(removed), "B's staged deletion reaches a fresh clone"
+    assert fresh.compare_file(repo_a, inner_file), "C's change reaches a fresh clone"
+
+
+@pytest.mark.smoke
 def test_nested_link_stage_delete_deep(new_lore_repo):
     """Staging a DELETE of a file two levels deep works.
 
@@ -585,12 +659,12 @@ def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
         new_lore_repo, "vendor/b", "vendor/c"
     )
 
-    nested_before = sorted(repo_c.branch_list().remote_branches)
+    nested_before = sorted(repo_c.branch_list(remote=True).remote_branches)
 
     repo_a.branch_create("feature")
     repo_a.push()
-    assert repo_b.branch_list().has_remote_branch("feature"), (
-        f"Expected create to cascade into the top-level link, got: {repo_b.branch_list()}"
+    assert repo_b.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected create to cascade into the top-level link, got: {repo_b.branch_list(remote=True)}"
     )
 
     repo_a.branch_switch("main")
@@ -599,6 +673,82 @@ def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
     assert repo_c.get_id() in output, (
         f"Expected the cascade to reach nested link {repo_c.get_id()}, got: {output}"
     )
-    assert sorted(repo_c.branch_list().remote_branches) == nested_before, (
-        f"Expected nested link branches {nested_before}, got: {repo_c.branch_list()}"
+    assert sorted(repo_c.branch_list(remote=True).remote_branches) == nested_before, (
+        f"Expected nested link branches {nested_before}, got: {repo_c.branch_list(remote=True)}"
     )
+
+
+@pytest.mark.smoke
+def test_merge_lands_an_edit_inside_a_nested_link(new_lore_repo):
+    """A branch editing a file inside a nested link and one inside its outer
+    link merges both edits."""
+    repo_a, _repo_b, _repo_c, b_mount, nested = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "deps/c"
+    )
+    repo_a.branch_create("feature")
+    outer_path, outer_edit = f"{b_mount}/b-root.txt", "b on feature\n"
+    nested_path, nested_edit = f"{nested}/c-data/inner.txt", "c on feature\n"
+    repo_a.write_commit_push(
+        "Edit both links", {outer_path: outer_edit, nested_path: nested_edit}
+    )
+
+    repo_a.branch_switch("main")
+    repo_a.branch_merge_start("feature", message="Merge feature")
+    repo_a.push()
+
+    fail_unless_holds(repo_a, outer_path, outer_edit)
+    with repo_a.open_file(nested_path) as f:
+        assert f.read() == nested_edit, "the merge must land the nested edit"
+
+
+@pytest.mark.smoke
+def test_unstage_below_a_nested_link_leaves_what_a_forced_stage_staged_past_the_view(
+    new_lore_repo, scratch_dir
+):
+    """A plain unstage of the tree leaves staged what a forced staging scan took past the view
+    in a link inside a link: the inner link's mark climbs into the outer linked tree, status lists
+    the file staged, and the commit takes it into the innermost repository."""
+    repo_a, _repo_b, repo_c, _b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "b", "c"
+    )
+    view = os.path.join(scratch_dir("view", create=True), "view.txt")
+    with open(view, "w") as view_file:
+        view_file.write(f"/{nested_mount}/Hidden/\n")
+    clone = repo_a.clone(view=view)
+    hidden, content = f"{nested_mount}/Hidden/new.txt", "new below a nested link\n"
+    clone.write_files({hidden: content})
+    clone.stage(".", scan=True, force=True)
+    clone.unstage(".", offline=True)
+
+    staged = {
+        to_posix(entry["path"])
+        for entry in parse_status_json(clone.status(json=True, offline=True))
+        if entry.get("flagStaged")
+    }
+    assert hidden in staged, staged
+
+    clone.commit("Past the view below a nested link")
+    clone.push()
+    repo_c.sync()
+    with repo_c.open_file("Hidden/new.txt") as committed:
+        assert committed.read() == content
+
+
+@pytest.mark.smoke
+def test_nested_link_commit_of_two_files_named_in_a_new_directory(new_lore_repo):
+    """Two files named in a new directory of a link inside a link (A -> B -> C), staged by name,
+    commit into C, after which a scan finds nothing changed."""
+    repo_a, _repo_b, repo_c, _b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "inner/c"
+    )
+    files = [f"{nested_mount}/new/a.txt", f"{nested_mount}/new/b.txt"]
+    repo_a.write_files(dict.fromkeys(files, "new\n"))
+
+    repo_a.stage(files)
+    repo_a.commit("Two files in C", non_interactive=True)
+    repo_a.push()
+
+    assert status_by_path(repo_a, scan=True) == {}
+    repo_c.sync()
+    for name in ("a.txt", "b.txt"):
+        assert os.path.isfile(os.path.join(repo_c.path, "new", name)), name

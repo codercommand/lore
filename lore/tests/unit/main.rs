@@ -10,13 +10,34 @@ mod auth;
 mod branch;
 mod call;
 mod call_delegation;
+mod close_race;
+mod file;
 mod log;
 mod remote;
 mod repository;
 mod revision;
+mod revision_graph;
 mod revision_tree;
 mod sandbox_tests;
+mod service;
+mod shared_store;
 mod storage;
+#[path = "../test_util.rs"]
+mod test_util;
+
+/// Held by each test that listens on or connects to this process's service socket. The name is
+/// per process, so a connect made while another test listens there reaches that test's listener,
+/// and each then waits on the other.
+/// The code of `ServiceUnavailable`.
+pub(crate) fn service_unavailable() -> i32 {
+    use lore_error_set::FfiError;
+    lore_base::error::ServiceUnavailable {
+        reason: String::new(),
+    }
+    .ffi_code()
+}
+
+pub(crate) static SERVICE_SOCKET_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Points the unit tests at a global config, credential store and service socket of
 /// their own, rather than the machine's, and keeps them from relaying.
@@ -42,6 +63,9 @@ fn sandbox_machine_settings() {
     // window where writing to the environment has no reader to race.
     unsafe {
         std::env::set_var("LORE_USE_SERVICE", "0");
+        // No executable to start a service from, so a call only the service may carry out fails
+        // here rather than starting one from a build a developer named for their own use.
+        std::env::remove_var("LORE_SERVICE_EXECUTABLE");
         std::env::set_var("LORE_GLOBAL_PATH", &sandbox);
         std::env::set_var("LORE_AUTH_PATH", &sandbox);
         std::env::set_var(

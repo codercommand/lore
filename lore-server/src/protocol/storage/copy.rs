@@ -10,10 +10,12 @@ use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::lore::RepositoryId;
 use lore_storage::ImmutableStore;
+use lore_storage::StoreError;
 use lore_storage::immutable_store::CopyBehavior;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
@@ -113,7 +115,8 @@ pub async fn handle_copy(
                 .await
             {
                 Ok(()) => Ok(LoreResponse::Copy(CopyResponse::default())),
-                Err(err) if err.is_address_not_found() => Err(MessageHandleError::FragmentNotFound),
+                Err(StoreError::SlowDown(_)) => Err(MessageHandleError::SlowDown),
+                Err(StoreError::AddressNotFound(_)) => Err(MessageHandleError::FragmentNotFound),
                 Err(err) => {
                     warn!(error = ?err, "Failed to copy fragment");
                     Err(MessageHandleError::StoreFailure)
@@ -148,11 +151,9 @@ impl Message for Copy {
                 _ => None,
             };
             repository_authorizer
-                .check_repository_access(token.as_ref(), self.source_repository, None)
+                .check_repository_access(token.as_ref(), self.source_repository, Action::Read)
                 .await
-                .map_err(|status| {
-                    MessageHandleError::AuthorizationFailure(status.message().to_string())
-                })?;
+                .map_err(MessageHandleError::from_authorization)?;
         }
 
         let user_id = get_user_id_from_context(&context);

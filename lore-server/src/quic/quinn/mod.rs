@@ -1,16 +1,22 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 mod config;
+#[cfg(not(feature = "test-util"))]
 mod metrics;
+#[cfg(feature = "test-util")]
+pub mod metrics;
 mod quinn_server;
 pub mod service_store;
 
 use std::path::Path;
 use std::sync::Arc;
 
+pub(crate) use config::DEFAULT_IDLE_TIMEOUT_MILLIS;
 pub use config::QuinnConfigBuilder;
 use lore_transport::tls;
 pub use quinn_server::QuinnServer;
+#[cfg(feature = "test-util")]
+pub use quinn_server::SocketConnectionIdGenerator;
 use rustls::RootCertStore;
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerifier;

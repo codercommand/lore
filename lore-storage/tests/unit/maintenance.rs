@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lore_base::test_util::TempDir;
+use lore_storage::FlushOptions;
 use lore_storage::immutable_store::ImmutableStore;
 use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::LocalImmutableStore;
@@ -21,16 +22,24 @@ async fn create_test_store(path: Option<PathBuf>) -> Arc<dyn ImmutableStore> {
     // These GC-mechanics tests put non-durable fragments and then expect
     // eviction/compaction to act on them, so they run with local-fragment
     // protection disabled (server behavior). Protection itself is covered by
-    // the `evict_bucket_*` unit tests.
+    // the `evict_bucket_*` unit tests. The passes act on what earlier claims
+    // loaded, so the store keeps its state across holds.
     LocalImmutableStore::new(
         path,
         ImmutableStoreSettings {
             protect_local_fragment: false,
+            reuse_state_across_holds: true,
             ..Default::default()
         },
     )
     .await
     .unwrap()
+}
+
+fn limits(max_size: usize, max_capacity: usize) -> Arc<GcCounters> {
+    let limits = Arc::new(GcCounters::new());
+    limits.set_caps(max_size, max_capacity, false);
+    limits
 }
 
 #[tokio::test]
@@ -65,7 +74,7 @@ async fn gc_compaction_reduces_fragment_count() {
             .unwrap();
     }
 
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let count_before = store.clone().fragment_count().await;
 
@@ -127,7 +136,7 @@ async fn gc_protects_non_durable_fragment() {
         )
         .await
         .unwrap();
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     gc(store.clone(), 1, 1, false, None).await;
 
@@ -176,7 +185,7 @@ async fn fragments_survive_a_stopped_gc_pass() {
             stored.push((address, payload.len()));
         }
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let store: Arc<dyn ImmutableStore> = store;
     let pass = {
@@ -229,7 +238,7 @@ async fn gc_runs_eviction_only() {
             .await
             .unwrap();
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     // max_size=0 skips compaction, max_capacity=1 triggers eviction
     gc(store.clone(), 0, 1, false, None).await;
@@ -247,7 +256,13 @@ async fn evictor_exits_when_store_dropped() {
     let weak = Arc::downgrade(&store);
     drop(store);
 
-    evictor(weak, 1024 * 1024, Some(Duration::from_millis(10)), false).await;
+    evictor(
+        weak,
+        limits(0, 1024 * 1024),
+        Some(Duration::from_millis(10)),
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -256,7 +271,13 @@ async fn compactor_exits_when_store_dropped() {
     let weak = Arc::downgrade(&store);
     drop(store);
 
-    compactor(weak, 1024, Some(Duration::from_millis(10)), false).await;
+    compactor(
+        weak,
+        limits(1024, 0),
+        Some(Duration::from_millis(10)),
+        false,
+    )
+    .await;
 }
 
 /// A store whose first compaction step fails, counting the steps it is asked for.
@@ -297,6 +318,15 @@ impl ImmutableStore for FailingCompactStore {
         address: lore_storage::Address,
     ) -> Result<lore_storage::StoreGetData, lore_storage::immutable_store::StoreError> {
         self.inner.clone().get(partition, address).await
+    }
+
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::immutable_store::StoreError,
+    > {
+        self.inner.clone().hold_for_command().await
     }
 
     async fn put(
@@ -365,9 +395,9 @@ impl ImmutableStore for FailingCompactStore {
 
     async fn flush(
         self: Arc<Self>,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), lore_storage::immutable_store::StoreError> {
-        self.inner.clone().flush(sync_data).await
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(
@@ -410,7 +440,12 @@ async fn compactor_goes_on_after_a_failed_step() {
     let dyn_store: Arc<dyn ImmutableStore> = store.clone();
     let weak = Arc::downgrade(&dyn_store);
     #[allow(clippy::disallowed_methods)] // Test-local task, joined below.
-    let compactor = tokio::spawn(compactor(weak, 1024, Some(Duration::from_millis(1)), false));
+    let compactor = tokio::spawn(compactor(
+        weak,
+        limits(1024, 0),
+        Some(Duration::from_millis(1)),
+        false,
+    ));
 
     for _ in 0..1000 {
         if store.steps.load(std::sync::atomic::Ordering::Relaxed) >= 2 {
@@ -709,6 +744,7 @@ fn test_group(dir: &TempDir) -> Arc<lore_storage::local::immutable_store::Immuta
     Arc::new(ImmutableStoreGroup {
         bucket: [const { OnceLock::new() }; BUCKET_COUNT],
         dirty: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
+        soft_dirty: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
         bucket_count: std::sync::atomic::AtomicUsize::new(
             lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
         ),
@@ -719,9 +755,13 @@ fn test_group(dir: &TempDir) -> Arc<lore_storage::local::immutable_store::Immuta
         committed_level: std::sync::atomic::AtomicUsize::new(
             lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
         ),
+        pending_level: std::sync::atomic::AtomicUsize::new(0),
         flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        writes: Arc::default(),
         packstore: PackStore::new(Some(dir.to_path_buf()), 1, None),
         flush: tokio::sync::Mutex::new(JoinSet::new()),
+        scheduled: std::sync::atomic::AtomicBool::new(false),
+        payload_gate: Default::default(),
     })
 }
 

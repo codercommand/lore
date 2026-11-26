@@ -22,9 +22,14 @@ use crate::state;
 use crate::store::StoreObliterateStats;
 use crate::util::path::RelativePath;
 
+#[cfg(not(feature = "test-util"))]
+mod impact;
+#[cfg(feature = "test-util")]
+pub mod impact;
+
 /// Data for the event emitted when file content is obliterated.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileObliterateEventData {
     /// Address of the obliterated content.
@@ -37,6 +42,8 @@ pub struct LoreFileObliterateEventData {
 
 #[error_set]
 pub enum ObliterateError {
+    Cancelled,
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     InvalidAddress,
@@ -118,32 +125,48 @@ pub(crate) async fn obliterate_file(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<ObliterateError>("Failed to deserialize state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<ObliterateError>("Failed to deserialize state")?;
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let found = state
+        .locate_node(repository.clone(), relative_path.as_str())
         .await
-        .map_err(|_err| {
-            ObliterateError::from(FileNotFound {
-                resource: relative_path.to_string(),
+        .map_err(|err| {
+            forward_refusal_or(err, "finding the node", |_err| {
+                ObliterateError::from(FileNotFound {
+                    resource: relative_path.to_string(),
+                })
             })
         })?;
 
-    if !node_link.is_valid() {
+    if !found.is_valid() {
         return Err(FileNotFound {
             resource: relative_path.to_string(),
         }
         .into());
     }
 
+    // TODO(vri): UCS-18010 - Implement obliterate for links
+    let Some(node_id) = found.own_node() else {
+        return Err(NotSupported {
+            operation: format!(
+                "obliterating {relative_path} inside a link - obliterate it by address in the linked \
+                 repository"
+            ),
+        }
+        .into());
+    };
+
     let node = state
-        .node(repository.clone(), node_link.node)
+        .node(repository.clone(), node_id)
         .await
-        .map_err(|_err| {
-            ObliterateError::from(FileNotFound {
-                resource: relative_path.to_string(),
+        .map_err(|err| {
+            forward_refusal_or(err, "reading the node", |_err| {
+                ObliterateError::from(FileNotFound {
+                    resource: relative_path.to_string(),
+                })
             })
         })?;
 
@@ -170,13 +193,22 @@ pub(crate) async fn obliterate_file(
         repository.clone(),
         state.clone(),
         relative_path.clone(),
-        node_link.node,
+        node_id,
         NodeFlags::NoFlags,
         stage_stats,
-        None, // TODO(vri): UCS-18010 - Implement obliterate for links
+        None,
     )
     .await
     .forward::<ObliterateError>("Failed to stage deleted path")?;
+    if state.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+            &repository,
+            &state,
+            None,
+        ))
+        .await
+        .forward::<ObliterateError>("Failed to stage the move of a directory the path is in")?;
+    }
 
     let signature = state
         .serialize(repository.clone(), token)
@@ -198,28 +230,43 @@ pub fn obliterate_file_boxed(
     Box::pin(obliterate_file(repository, token, path))
 }
 
+/// Obliterates `address` on the remote, then in the local store. A remote that refuses the caller
+/// or fails the request fails the obliterate with the local content in place. A remote that does
+/// not hold the address counts as obliterated, so an obliterate that failed after the remote's
+/// half completes when run again. A remote that can't be reached keeps its copy.
 pub(crate) async fn obliterate_address(
     repository: Arc<RepositoryContext>,
     address: Address,
 ) -> Result<(), ObliterateError> {
+    impact::warn(&repository, address).await;
+
     let stats = Arc::new(StoreObliterateStats::default());
 
-    repository
-        .immutable_store()
-        .obliterate(repository.id, address, stats.clone())
-        .await
-        .forward_with::<ObliterateError, _>(|| {
-            format!("Failed to obliterate an address: {address}")
-        })?;
+    // Obliterating removes the content here and on the remote, for good. A dry run reports the
+    // address with nothing counted.
+    if !crate::lore::execution_context().globals().dry_run() {
+        if let Some(remote) = absent_unless_refused::<_, _, ObliterateError>(
+            repository.remote().await,
+            "connecting to the remote",
+        )? && let Some(admin) = absent_unless_refused::<_, _, ObliterateError>(
+            remote.admin(repository.id).await,
+            "opening the remote admin service",
+        )? {
+            admin
+                .obliterate(address)
+                .await
+                .or_else(|err| if err.is_not_found() { Ok(()) } else { Err(err) })
+                .forward_with::<ObliterateError, _>(|| {
+                    format!("Failed to obliterate a remote address: {address}")
+                })?;
+        }
 
-    if let Ok(remote) = repository.remote().await
-        && let Ok(admin) = remote.admin(repository.id).await
-    {
-        admin
-            .obliterate(address)
+        repository
+            .immutable_store()
+            .obliterate(repository.id, address, stats.clone())
             .await
             .forward_with::<ObliterateError, _>(|| {
-                format!("Failed to obliterate a remote address: {address}")
+                format!("Failed to obliterate an address: {address}")
             })?;
     }
 

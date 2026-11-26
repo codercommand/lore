@@ -14,18 +14,20 @@ use lore_revision::metadata::MetadataType;
 use lore_revision::metadata::repository::READ_ONLY_KEYS;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_storage::hash;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::flatten_denial;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
 use crate::grpc::get_write_token;
-use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -112,6 +114,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id.into(),
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
@@ -120,10 +123,10 @@ pub async fn handler(
                 .check_repository_access(
                     get_verified_token(&extensions).as_ref(),
                     repository_id.into(),
-                    None,
+                    Action::Write,
                 )
                 .await
-                .map_err(|_err| no_repository_access_status())?;
+                .map_err(flatten_denial)?;
 
             // Deserialize current and proposed blobs for validation
             let current_metadata = if !expected_hash.is_zero() {

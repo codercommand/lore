@@ -2,16 +2,19 @@
 // SPDX-License-Identifier: MIT
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
 use lore_base::lore_spawn_net;
+use lore_proto::lock::forwarded_lock_service_server::ForwardedLockServiceServer;
 use lore_proto::lore::repository::v1::forwarded_repository_service_server::ForwardedRepositoryServiceServer;
 use lore_proto::lore::revision::v1::forwarded_revision_service_server::ForwardedRevisionServiceServer;
 use lore_proto::rpc::replication_service_server::ReplicationServiceServer;
 use lore_revision::environment::EnvironmentConfig;
+use lore_revision::lock::LockStore;
 use lore_revision::notification::NotificationSender;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
@@ -28,9 +31,11 @@ use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::grpc;
+use crate::grpc::forwarded_lock_service::LoreForwardedLockService;
 use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
 use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
 use crate::grpc::replication_service::LoreReplicationService;
+use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
 
@@ -39,27 +44,30 @@ use crate::hooks::HookDispatcher;
 // Copy and paste from the rust compiler for sanity
 type GrpcRouter = tonic::transport::server::Router<
     tower::layer::util::Stack<
-        tower::ServiceBuilder<
-            tower::layer::util::Stack<
-                lore_telemetry::grpc_tower_layer::GrpcMetricsLayer,
-                tower::layer::util::Identity,
-            >,
-        >,
+        grpc::tower::grpc_response_trace::GrpcResponseTraceLayer,
         tower::layer::util::Stack<
-            grpc::tower::tracing::LoreTracingLayer,
-            tower::layer::util::Stack<
+            tower::ServiceBuilder<
                 tower::layer::util::Stack<
-                    tower_http::trace::TraceLayer<
-                        tower_http::classify::SharedClassifier<
-                            tower_http::classify::GrpcErrorsAsFailures,
-                        >,
-                        crate::correlation::span::MakeCorrelationIdSpan,
-                    >,
-                    crate::correlation::layer::CorrelationIdLayer,
-                >,
-                tower::layer::util::Stack<
-                    crate::util::core_hop::CoreHopLayer,
+                    lore_telemetry::grpc_tower_layer::GrpcMetricsLayer,
                     tower::layer::util::Identity,
+                >,
+            >,
+            tower::layer::util::Stack<
+                grpc::tower::tracing::LoreTracingLayer,
+                tower::layer::util::Stack<
+                    tower::layer::util::Stack<
+                        tower_http::trace::TraceLayer<
+                            tower_http::classify::SharedClassifier<
+                                tower_http::classify::GrpcErrorsAsFailures,
+                            >,
+                            crate::correlation::span::MakeCorrelationIdSpan,
+                        >,
+                        crate::correlation::layer::CorrelationIdLayer,
+                    >,
+                    tower::layer::util::Stack<
+                        crate::util::core_hop::CoreHopLayer,
+                        tower::layer::util::Identity,
+                    >,
                 >,
             >,
         >,
@@ -82,11 +90,13 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         local_immutable_store: Arc<dyn ImmutableStore>,
         immutable_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
+        lock_store: Option<Arc<dyn LockStore>>,
         notification_sender: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
         environment: EnvironmentConfig,
         jwt_verifier: Option<JwtVerifier>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+        branch_list_concurrency: NonZeroUsize,
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsTlsConfig>> {
         if !local_immutable_store.is_local() {
             return Err(anyhow!("Immutable store must be a local store"));
@@ -96,11 +106,13 @@ impl GrpcInternalServerBuilder<WantsComponents> {
             local_immutable_store,
             immutable_store,
             mutable_store,
+            lock_store,
             notification_sender,
             hook_dispatcher,
             environment,
             jwt_verifier,
             repository_authorizer,
+            branch_list_concurrency,
         }))
     }
 }
@@ -109,11 +121,13 @@ pub struct WantsTlsConfig {
     local_immutable_store: Arc<dyn ImmutableStore>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     environment: EnvironmentConfig,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    branch_list_concurrency: NonZeroUsize,
 }
 
 impl GrpcInternalServerBuilder<WantsTlsConfig> {
@@ -160,11 +174,13 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
             local_immutable_store: self.0.local_immutable_store,
             immutable_store: self.0.immutable_store,
             mutable_store: self.0.mutable_store,
+            lock_store: self.0.lock_store,
             notification_sender: self.0.notification_sender,
             hook_dispatcher: self.0.hook_dispatcher,
             environment: self.0.environment,
             jwt_verifier: self.0.jwt_verifier,
             repository_authorizer: self.0.repository_authorizer,
+            branch_list_concurrency: self.0.branch_list_concurrency,
             tls_config,
         }))
     }
@@ -174,11 +190,13 @@ pub struct WantsHttp2Config {
     local_immutable_store: Arc<dyn ImmutableStore>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     environment: EnvironmentConfig,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    branch_list_concurrency: NonZeroUsize,
     tls_config: Option<ServerTlsConfig>,
 }
 
@@ -211,6 +229,7 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
             )
             .layer(LoreTracingLayer {})
             .layer(metrics_layer)
+            .layer(GrpcResponseTraceLayer {})
             .add_service(ReplicationServiceServer::new(LoreReplicationService::new(
                 self.0.local_immutable_store,
             )?));
@@ -222,6 +241,7 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 self.0.notification_sender.clone(),
                 self.0.hook_dispatcher.clone(),
                 rpc_timeout,
+                self.0.branch_list_concurrency,
             ),
         ));
 
@@ -236,6 +256,12 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 rpc_timeout,
             ),
         ));
+
+        if let Some(lock_store) = self.0.lock_store {
+            router = router.add_service(ForwardedLockServiceServer::new(
+                LoreForwardedLockService::new(lock_store, self.0.notification_sender, rpc_timeout),
+            ));
+        }
 
         Ok(GrpcInternalServerBuilder(WantsAddress { router }))
     }

@@ -11,6 +11,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_revision::util;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
@@ -20,15 +21,22 @@ use tonic::Status;
 use tracing::debug;
 
 use super::branch_record::build_branch;
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::BranchWriteFollowUp;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::check_request_cancelled;
+use crate::grpc::create_branch_detached;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
-use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_action;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
+use crate::hooks::context::METADATA_BRANCH_NAME;
+use crate::hooks::context::METADATA_IS_SERVICE_ACCOUNT;
 use crate::util::setup_execution;
 
 /// Reject oversized string fields early to prevent resource exhaustion.
@@ -64,16 +72,19 @@ fn validate_create_input(name: &str, category: &str, creator: &str) -> Result<()
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRevisionService`
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchCreate::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchCreateRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
-    hook_dispatcher: &HookDispatcher,
-    instrument_provider: &impl InstrumentProvider,
+    hook_dispatcher: &Arc<HookDispatcher>,
+    instrument_provider: &(impl InstrumentProvider + Clone + Send + 'static),
 ) -> Result<Response<BranchCreateResponse>, Status> {
+    require_action(authorizer, &request, Action::Write).await?;
     let caller_context = CallerContext::from_original_request(&request)?;
     let req = request.into_inner();
     if let Some(forwarded_requests) = forwarded_requests
@@ -121,8 +132,8 @@ pub async fn branch_create_implementation(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
-    hook_dispatcher: &HookDispatcher,
-    instrument_provider: &impl InstrumentProvider,
+    hook_dispatcher: &Arc<HookDispatcher>,
+    instrument_provider: &(impl InstrumentProvider + Clone + Send + 'static),
 ) -> Result<Response<BranchCreateResponse>, Status> {
     let name = req.name;
     let category = req.category;
@@ -142,53 +153,60 @@ pub async fn branch_create_implementation(
         immutable_store,
         mutable_store,
         context.repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
+            validate_create_input(&name, &category, &creator)?;
+
             let hook_ctx = HookContext::builder()
                 .correlation_id(&context.correlation_id)
                 .hook_point(HookPoint::BranchCreate)
                 .repository(context.repository_id)
                 .user(&context.user_id)
                 .branch(branch)
+                .metadata(METADATA_BRANCH_NAME, &name)
+                .metadata(
+                    METADATA_IS_SERVICE_ACCOUNT,
+                    context.is_service_account.to_string(),
+                )
                 .build();
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::BranchCreate, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
-
-            validate_create_input(&name, &category, &creator)?;
 
             debug!({BRANCH_ID} = %branch, branch_name = %name, stack = ?stack, "Creating branch");
 
-            let write_token = get_write_token();
-            let branch_id = branch::create(
+            check_request_cancelled()?;
+            let branch_id = create_branch_detached(
                 repository.clone(),
-                &write_token,
                 branch,
-                name.as_str(),
-                category.as_str(),
-                creator.as_str(),
+                name,
+                category,
+                creator,
                 created,
-                stack.clone(),
-                false,
-                false,
+                stack,
+                BranchWriteFollowUp {
+                    notification_sender,
+                    hook_dispatcher: hook_dispatcher.clone(),
+                    hook_context: hook_ctx,
+                    instrument_provider: instrument_provider.clone(),
+                },
             )
-            .await
+            .await?
             .filter_slow_down()?
-            .map_err(|err| {
+            .warn_map_err(|err| {
                 if err.is_branch_already_exists() {
                     Status::already_exists(err.to_string())
-                } else {
+                } else if err.is_invalid_arguments() {
                     Status::invalid_argument(err.to_string())
+                } else {
+                    Status::internal(err.to_string())
                 }
             })?;
-
-            notification_sender
-                .branch_created(context.repository_id, branch_id)
-                .await;
-            hook_dispatcher.spawn_post(HookPoint::BranchCreate, hook_ctx);
 
             // no filter_slow_down()? usage here: the branch is already created,
             // so these response reads must not return a retryable status — the
@@ -200,7 +218,7 @@ pub async fn branch_create_implementation(
                 .await
                 .warn_map_err(|err| Status::internal(err.to_string()))?;
 
-            debug!({BRANCH_ID} = %branch_id, %name, "Created branch");
+            debug!({BRANCH_ID} = %branch_id, "Created branch");
 
             // no filter_slow_down()? usage here: the branch exists, so an
             // unreadable latest must not fail a create that has already
@@ -209,10 +227,6 @@ pub async fn branch_create_implementation(
                 .await
                 .unwrap_or_default();
             let response_branch = build_branch(branch_id, &metadata, metadata_hash, false, latest);
-
-            instrument_provider
-                .counter("num_branches_created")
-                .add(1, &[]);
 
             Ok(Response::new(BranchCreateResponse {
                 branch: Some(response_branch),

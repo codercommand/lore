@@ -29,6 +29,7 @@ fn endpoint_to_proto(endpoint: &Option<lore_transport::Endpoint>) -> Option<Endp
 fn config_to_proto(config: &Option<lore_revision::environment::Config>) -> Option<Config> {
     config.as_ref().map(|config| Config {
         max_query_batch: config.max_query_batch.unwrap_or_default() as u32,
+        max_lock_batch: config.max_lock_batch.unwrap_or_default() as u32,
         compression_mode: config.compression_mode.as_ref().map(|mode| {
             let v1_mode = match mode {
                 CompressionMode::NotSpecified => {
@@ -58,7 +59,9 @@ fn oidc_to_proto(oidc: &lore_transport::Oidc) -> Oidc {
         resource_template: oidc.resource_template.clone().unwrap_or_default(),
         scope_template: oidc.scope_template.clone().unwrap_or_default(),
         token_exchange_issuer: oidc.token_exchange_issuer.clone().unwrap_or_default(),
-        identity_claim: oidc.identity_claim.clone().unwrap_or_default(),
+        client_credentials_scopes: oidc.client_credentials_scopes.clone(),
+        // `identity_claim` (8) is deprecated and left empty.
+        ..Default::default()
     }
 }
 

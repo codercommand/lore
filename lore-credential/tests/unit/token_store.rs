@@ -3,9 +3,21 @@
 use base64::prelude::BASE64_STANDARD;
 use base64::prelude::Engine as _;
 use lore_credential::IdentityToken;
+use lore_credential::token_store::Refreshed;
 use lore_credential::token_store::RemoteIdentity;
+use lore_credential::token_store::RemovedRefreshToken;
 use lore_credential::token_store::TokenMap;
+use lore_credential::token_store::TokenStoreError;
+use lore_credential::token_store::load_refresh_expires;
 use lore_credential::token_store::load_user_token;
+use lore_credential::token_store::load_user_token_from_store;
+use lore_credential::token_store::logins_in_map;
+use lore_credential::token_store::refresh_user_token;
+use lore_credential::token_store::remove_all_tokens_for_auth_url;
+use lore_credential::token_store::remove_user_token_if;
+use lore_credential::token_store::remove_user_tokens_for_auth_url;
+use lore_credential::token_store::store_user_token;
+use lore_credential::token_store::store_user_token_and_refresh_token;
 use lore_credential::token_store::test_util::encryption_key_from_stored;
 use lore_credential::token_store::test_util::generate_encryption_key;
 use lore_credential::token_store::test_util::is_entry_for_auth_url;
@@ -13,7 +25,10 @@ use lore_credential::token_store::test_util::open_token;
 use lore_credential::token_store::test_util::seal_token;
 use lore_credential::token_store::test_util::single_nonce_sequence;
 use lore_credential::token_store::test_util::split_remote_resource;
+use lore_credential::token_store::test_util::store_file;
+use lore_credential::token_store::test_util::stored_login;
 use lore_credential::token_store::tokens_only_for_recipient_domain;
+use lore_credential::token_store::vulnerable_all_tokens;
 use ring::aead::AES_256_GCM;
 use ring::aead::NONCE_LEN;
 use ring::aead::NonceSequence;
@@ -28,6 +43,7 @@ acceptable_root_domains = ["example.com"]
 "#;
     let token: IdentityToken = toml::from_str(toml_str).unwrap();
     assert!(token.refresh_token().is_none());
+    assert!(token.scope().is_none());
     assert_eq!(token.user_id(), "user-1");
     assert_eq!(token.token(), "encrypted-token");
 }
@@ -39,11 +55,95 @@ fn refresh_token_serde_roundtrip() {
         "encrypted-auth",
         vec!["example.com".into()],
         Some("encrypted-refresh".into()),
+        None,
     );
     let serialized = toml::to_string_pretty(&token).unwrap();
     let deserialized: IdentityToken = toml::from_str(&serialized).unwrap();
     assert_eq!(deserialized.refresh_token(), Some("encrypted-refresh"));
     assert_eq!(deserialized.user_id(), "user-1");
+}
+
+/// An entry the new client writes, read by a client that predates the scope field, loses only
+/// that field.
+#[test]
+fn an_older_client_reads_an_entry_with_a_scope() {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OlderIdentityToken {
+        user_id: String,
+        token: String,
+        #[serde(default)]
+        acceptable_root_domains: Vec<String>,
+        #[serde(default)]
+        refresh_token: Option<String>,
+    }
+    let token = IdentityToken::new(
+        "user-1",
+        "encrypted-auth",
+        vec!["example.com".into()],
+        Some("encrypted-refresh".into()),
+        Some("openid offline_access".into()),
+    );
+    let serialized = toml::to_string_pretty(&token).unwrap();
+
+    let older: OlderIdentityToken = toml::from_str(&serialized).unwrap();
+    assert_eq!(older.token, "encrypted-auth");
+    assert_eq!(older.refresh_token.as_deref(), Some("encrypted-refresh"));
+
+    let newer: IdentityToken = toml::from_str(&serialized).unwrap();
+    assert_eq!(newer.scope(), Some("openid offline_access"));
+}
+
+/// An entry the new client writes with a refresh deadline, read by a client that predates the
+/// field, loses only that field.
+#[test]
+fn an_older_client_reads_an_entry_with_a_refresh_deadline() {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OlderIdentityToken {
+        user_id: String,
+        token: String,
+        #[serde(default)]
+        acceptable_root_domains: Vec<String>,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        scope: Option<String>,
+    }
+    let token = IdentityToken::new(
+        "user-1",
+        "encrypted-auth",
+        vec!["example.com".into()],
+        Some("encrypted-refresh".into()),
+        Some("openid offline_access".into()),
+    )
+    .with_refresh_expires(1_900_000_000_000);
+    let serialized = toml::to_string_pretty(&token).unwrap();
+
+    let older: OlderIdentityToken = toml::from_str(&serialized).unwrap();
+    assert_eq!(older.refresh_token.as_deref(), Some("encrypted-refresh"));
+    assert_eq!(older.scope.as_deref(), Some("openid offline_access"));
+
+    let newer: IdentityToken = toml::from_str(&serialized).unwrap();
+    assert_eq!(newer.refresh_expires(), 1_900_000_000_000);
+}
+
+/// An entry without a refresh deadline is written as before, so a store with none is unchanged.
+#[test]
+fn an_entry_without_a_refresh_deadline_is_written_without_the_field() {
+    let token = IdentityToken::new(
+        "user-1",
+        "encrypted-auth",
+        Vec::new(),
+        Some("encrypted-refresh".into()),
+        None,
+    );
+
+    let serialized = toml::to_string_pretty(&token).unwrap();
+
+    assert!(!serialized.contains("refresh_expires"), "{serialized}");
+    let read: IdentityToken = toml::from_str(&serialized).unwrap();
+    assert_eq!(read.refresh_expires(), 0);
 }
 
 #[test]
@@ -78,6 +178,7 @@ fn token_map_with_refresh_token_roundtrip() {
             "auth-tok",
             vec!["example.com".into()],
             Some("refresh-tok".into()),
+            None,
         )],
     )]);
     let serialized = toml::to_string_pretty(&map).unwrap();
@@ -263,4 +364,651 @@ async fn no_supplied_token_reads_the_store() {
     )
     .await;
     assert!(result.is_err());
+}
+
+/// A token removed only where it is a given one is compared with the store as its file holds it,
+/// so a token another process stored in its place after this process cached the store is left
+/// alone, and the given one is removed. The test stands in for the other process by writing the
+/// store's file back as it was before this process stored the given token.
+#[tokio::test]
+async fn a_conditional_removal_leaves_a_token_another_process_stored() {
+    let _alone = STORE_FILE.write().await;
+    const ENDPOINT: &str = "https://auth.conditional-removal.test.invalid/repository";
+    let file = store_file().expect("the token store's file");
+    store_user_token(ENDPOINT, "alice", "newer", Vec::new())
+        .await
+        .expect("store the newer token");
+    let newer = std::fs::read(&file).expect("read the store holding the newer token");
+    store_user_token(ENDPOINT, "alice", "refused", Vec::new())
+        .await
+        .expect("store the refused token");
+    std::fs::write(&file, newer).expect("store the newer token from another process");
+
+    remove_user_token_if(ENDPOINT, "alice", "refused")
+        .await
+        .expect("remove the refused token");
+    let kept = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
+    assert_eq!(kept.ok().as_deref(), Some("newer"));
+
+    remove_user_token_if(ENDPOINT, "alice", "newer")
+        .await
+        .expect("remove the newer token");
+    let removed = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
+    assert!(removed.is_err(), "the given token was left in the store");
+}
+
+/// Held exclusively by a test that rewrites the store's file directly, which would undo what a
+/// test writing through the store meanwhile stored, and shared by those.
+static STORE_FILE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// An unsigned JWT naming `subject`, expiring at `exp`, told apart from others by `serial`.
+fn jwt(subject: &str, exp: u64, serial: u32) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let claims = format!(
+        r#"{{"iss":"https://issuer.test.invalid","sub":"{subject}","aud":["lore.test.invalid"],"exp":{exp},"serial":{serial}}}"#
+    );
+    format!(
+        "{}.{}.signature",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#),
+        URL_SAFE_NO_PAD.encode(claims)
+    )
+}
+
+const EXPIRED: u64 = 1_000_000_000;
+const VALID: u64 = 2_000_000_000;
+
+fn refused() -> TokenStoreError {
+    TokenStoreError::internal("as scripted")
+}
+
+const LOGIN_REFRESH_EXPIRES: u64 = 1_900_000_000_000;
+const GRANT_REFRESH_EXPIRES: u64 = 1_950_000_000_000;
+
+/// Stores `token` for alice at `endpoint`, with `refresh_token`, expiring at
+/// [`LOGIN_REFRESH_EXPIRES`], and `scope`.
+async fn logged_in(endpoint: &str, token: &str, refresh_token: Option<&str>, scope: Option<&str>) {
+    logged_in_until(endpoint, token, refresh_token, LOGIN_REFRESH_EXPIRES, scope).await;
+}
+
+async fn logged_in_until(
+    endpoint: &str,
+    token: &str,
+    refresh_token: Option<&str>,
+    refresh_expires: u64,
+    scope: Option<&str>,
+) {
+    store_user_token_and_refresh_token(
+        endpoint,
+        "alice",
+        token,
+        Vec::new(),
+        refresh_token,
+        refresh_expires,
+        scope,
+    )
+    .await
+    .expect("store the login");
+}
+
+/// A grant that answers `token` with `refresh_token`, expiring at [`GRANT_REFRESH_EXPIRES`],
+/// recording the refresh token presented.
+fn grant(
+    token: String,
+    refresh_token: Option<&'static str>,
+    presented: &std::sync::Mutex<Vec<String>>,
+) -> impl FnOnce(String) -> std::future::Ready<Refreshed<TokenStoreError>> {
+    move |refresh| {
+        presented.lock().unwrap().push(refresh);
+        std::future::ready(Refreshed::Token {
+            token,
+            lifetime_ms: None,
+            refresh_token: refresh_token.map(str::to_owned),
+            refresh_expires: GRANT_REFRESH_EXPIRES,
+            scope: None,
+        })
+    }
+}
+
+/// The grant receives the stored refresh token, and the store then holds the new token and the
+/// rotated refresh token in place of the presented one. The scope stays, since the answer names
+/// none.
+#[tokio::test]
+async fn a_refresh_stores_the_new_token_and_the_rotated_refresh_token() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-rotates.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    let fresh = jwt("alice", VALID, 2);
+    logged_in(
+        ENDPOINT,
+        &expired,
+        Some("refresh-1"),
+        Some("openid offline_access"),
+    )
+    .await;
+    let presented = std::sync::Mutex::new(Vec::new());
+
+    let token = refresh_user_token(
+        ENDPOINT,
+        "alice",
+        &expired,
+        grant(fresh.clone(), Some("refresh-2"), &presented),
+    )
+    .await
+    .expect("the refresh succeeds");
+
+    assert_eq!(token, fresh);
+    assert_eq!(*presented.lock().unwrap(), ["refresh-1"]);
+    let stored = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
+    assert_eq!(stored.ok(), Some(fresh));
+    assert_eq!(
+        stored_login(ENDPOINT, "alice").await,
+        Some((
+            Some("refresh-2".to_owned()),
+            Some("openid offline_access".to_owned())
+        ))
+    );
+    assert_eq!(
+        load_refresh_expires(ENDPOINT, "alice").await,
+        Some(GRANT_REFRESH_EXPIRES)
+    );
+}
+
+/// RFC 6749 §6: an issuer that rotates no refresh token leaves the presented one valid, so the
+/// store keeps it. Its deadline is the answer's, since the refresh moved the idle deadline.
+#[tokio::test]
+async fn a_refresh_without_a_rotated_refresh_token_keeps_the_presented_one() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-keeps.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    let fresh = jwt("alice", VALID, 2);
+    logged_in(ENDPOINT, &expired, Some("refresh-1"), None).await;
+    let presented = std::sync::Mutex::new(Vec::new());
+
+    refresh_user_token(ENDPOINT, "alice", &expired, grant(fresh, None, &presented))
+        .await
+        .expect("the refresh succeeds");
+
+    assert_eq!(
+        stored_login(ENDPOINT, "alice").await,
+        Some((Some("refresh-1".to_owned()), None))
+    );
+    assert_eq!(
+        load_refresh_expires(ENDPOINT, "alice").await,
+        Some(GRANT_REFRESH_EXPIRES)
+    );
+}
+
+/// A stored token other than the expired one was stored by another caller, which presented the
+/// refresh token already. It is returned, and the refresh token is not presented again.
+#[tokio::test]
+async fn a_token_replaced_already_is_returned_without_a_grant() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-replaced.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    let replacement = jwt("alice", VALID, 2);
+    logged_in(ENDPOINT, &replacement, Some("refresh-2"), None).await;
+    let presented = std::sync::Mutex::new(Vec::new());
+
+    let token = refresh_user_token(
+        ENDPOINT,
+        "alice",
+        &expired,
+        grant(jwt("alice", VALID, 3), Some("refresh-3"), &presented),
+    )
+    .await
+    .expect("the replacement is returned");
+
+    assert_eq!(token, replacement);
+    assert!(presented.lock().unwrap().is_empty());
+}
+
+/// Without a refresh token nothing is presented, and the caller learns there is no token.
+#[tokio::test]
+async fn without_a_refresh_token_nothing_is_presented() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-none.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    logged_in(ENDPOINT, &expired, None, None).await;
+    let presented = std::sync::Mutex::new(Vec::new());
+
+    let result = refresh_user_token(
+        ENDPOINT,
+        "alice",
+        &expired,
+        grant(jwt("alice", VALID, 2), None, &presented),
+    )
+    .await;
+
+    assert!(result.is_err_and(|err| err.is_token_not_found()));
+    assert!(presented.lock().unwrap().is_empty());
+}
+
+/// A refused refresh token is dropped, so it is not presented again; the expired token stays
+/// for the caller to replace with a new login.
+#[tokio::test]
+async fn a_refused_refresh_token_is_dropped() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-refused.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    logged_in(ENDPOINT, &expired, Some("refresh-1"), None).await;
+
+    let result = refresh_user_token(ENDPOINT, "alice", &expired, |_| {
+        std::future::ready(Refreshed::Refused(refused()))
+    })
+    .await;
+
+    assert!(result.is_err_and(|err| err.is_not_authenticated()));
+    assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
+    assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, None);
+    let stored = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
+    assert_eq!(stored.ok(), Some(expired));
+}
+
+/// A grant that was not sent, such as one to an unreachable issuer, keeps the refresh token for
+/// the next attempt.
+#[tokio::test]
+async fn an_unsent_refresh_keeps_the_refresh_token() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-unsent.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    logged_in(ENDPOINT, &expired, Some("refresh-1"), None).await;
+
+    let result = refresh_user_token(ENDPOINT, "alice", &expired, |_| {
+        std::future::ready(Refreshed::Unsent(refused()))
+    })
+    .await;
+
+    assert!(result.is_err_and(|err| err.is_disconnected()));
+    assert_eq!(
+        stored_login(ENDPOINT, "alice").await,
+        Some((Some("refresh-1".to_owned()), None))
+    );
+    assert_eq!(
+        load_refresh_expires(ENDPOINT, "alice").await,
+        Some(LOGIN_REFRESH_EXPIRES)
+    );
+}
+
+/// A grant that failed after it may have reached the issuer, such as one whose answer was lost,
+/// drops the refresh token: the issuer may have consumed it, and presenting it again would be a
+/// replay.
+#[tokio::test]
+async fn a_failed_refresh_drops_the_refresh_token() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-failed.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    logged_in(ENDPOINT, &expired, Some("refresh-1"), None).await;
+
+    let result = refresh_user_token(ENDPOINT, "alice", &expired, |_| {
+        std::future::ready(Refreshed::Failed(refused()))
+    })
+    .await;
+
+    assert!(result.is_err_and(|err| err.is_not_authenticated()));
+    assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
+    assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, None);
+}
+
+/// The refresh token is removed from the store's file before the grant is sent, so a process
+/// that dies during the grant leaves nothing to present again.
+#[tokio::test]
+async fn the_refresh_token_leaves_the_file_before_the_grant() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-removed-first.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    logged_in(ENDPOINT, &expired, Some("refresh-1"), None).await;
+    let on_disk = || {
+        let file = std::fs::read_to_string(store_file().expect("the store's file"))
+            .expect("read the store");
+        let map: TokenMap = toml::from_str(&file).expect("parse the store");
+        map.remotes()
+            .iter()
+            .find(|remote| remote.remote() == ENDPOINT)
+            .and_then(|remote| remote.tokens().first())
+            .map(|token| token.refresh_token().is_some())
+    };
+
+    let during = std::sync::Mutex::new(None);
+    refresh_user_token(ENDPOINT, "alice", &expired, |_| {
+        *during.lock().unwrap() = on_disk();
+        std::future::ready(Refreshed::Unsent(refused()))
+    })
+    .await
+    .expect_err("the grant was not sent");
+
+    assert_eq!(*during.lock().unwrap(), Some(false));
+    assert_eq!(on_disk(), Some(true), "an unsent grant puts it back");
+}
+
+/// A grant cancelled while it waits for the answer leaves the refresh token removed, since the
+/// issuer may have received it.
+#[tokio::test]
+async fn a_cancelled_refresh_leaves_the_refresh_token_removed() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-cancelled.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    logged_in(ENDPOINT, &expired, Some("refresh-1"), None).await;
+
+    // Cancel once the grant has started rather than after a deadline: where opening the store is
+    // slow, as on the macOS CI runners, a deadline expires before the refresh token is removed.
+    let started = tokio::sync::Notify::new();
+    let refresh = refresh_user_token(ENDPOINT, "alice", &expired, |_| {
+        started.notify_one();
+        std::future::pending::<Refreshed<TokenStoreError>>()
+    });
+    tokio::select! {
+        result = refresh => panic!("the refresh ended without waiting for the grant: {result:?}"),
+        () = started.notified() => {}
+    }
+
+    assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
+    let stored = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
+    assert_eq!(stored.ok(), Some(expired));
+}
+
+/// A token naming someone else is not stored under alice. The grant has consumed the refresh
+/// token, so it stays removed rather than presented again.
+#[tokio::test]
+async fn an_answer_naming_someone_else_is_refused() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-other-user.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    logged_in(ENDPOINT, &expired, Some("refresh-1"), None).await;
+    let presented = std::sync::Mutex::new(Vec::new());
+
+    let result = refresh_user_token(
+        ENDPOINT,
+        "alice",
+        &expired,
+        grant(jwt("mallory", VALID, 2), Some("refresh-2"), &presented),
+    )
+    .await;
+
+    assert!(result.is_err_and(|err| err.is_internal()));
+    assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
+    let stored = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
+    assert_eq!(stored.ok(), Some(expired));
+}
+
+/// Two callers that find the same expired token present the refresh token once between them,
+/// and both get the new token.
+#[tokio::test]
+async fn concurrent_refreshes_present_the_refresh_token_once() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://refresh-concurrent.test.invalid";
+    let expired = jwt("alice", EXPIRED, 1);
+    let fresh = jwt("alice", VALID, 2);
+    logged_in(ENDPOINT, &expired, Some("refresh-1"), None).await;
+    let presented = std::sync::Mutex::new(Vec::new());
+    let refresh = || async {
+        refresh_user_token(ENDPOINT, "alice", &expired, |refresh| async {
+            presented.lock().unwrap().push(refresh);
+            tokio::task::yield_now().await;
+            Refreshed::<TokenStoreError>::Token {
+                token: fresh.clone(),
+                lifetime_ms: None,
+                refresh_token: Some("refresh-2".to_owned()),
+                refresh_expires: GRANT_REFRESH_EXPIRES,
+                scope: None,
+            }
+        })
+        .await
+    };
+
+    let (first, second) = tokio::join!(refresh(), refresh());
+
+    assert_eq!(first.ok().as_ref(), Some(&fresh));
+    assert_eq!(second.ok().as_ref(), Some(&fresh));
+    assert_eq!(*presented.lock().unwrap(), ["refresh-1"]);
+}
+
+/// Storing a token with a refresh token replaces the entry's refresh token and scope, also with
+/// none, while storing a token alone keeps them.
+#[tokio::test]
+async fn storing_a_refresh_token_replaces_it_and_storing_a_token_alone_keeps_it() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://login-replaces.test.invalid";
+    logged_in(
+        ENDPOINT,
+        &jwt("alice", VALID, 1),
+        Some("refresh-1"),
+        Some("openid"),
+    )
+    .await;
+
+    store_user_token(ENDPOINT, "alice", &jwt("alice", VALID, 2), Vec::new())
+        .await
+        .expect("store the token");
+    assert_eq!(
+        stored_login(ENDPOINT, "alice").await,
+        Some((Some("refresh-1".to_owned()), Some("openid".to_owned())))
+    );
+    assert_eq!(
+        load_refresh_expires(ENDPOINT, "alice").await,
+        Some(LOGIN_REFRESH_EXPIRES)
+    );
+
+    logged_in(ENDPOINT, &jwt("alice", VALID, 3), None, None).await;
+    assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
+    assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, None);
+}
+
+/// A refresh token stored without a deadline reads as refreshable with none, apart from no
+/// refresh token at all. A deadline given without a refresh token is not stored.
+#[tokio::test]
+async fn a_refresh_token_without_a_deadline_is_told_from_none() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://login-no-deadline.test.invalid";
+
+    logged_in_until(
+        ENDPOINT,
+        &jwt("alice", VALID, 1),
+        Some("refresh-1"),
+        0,
+        None,
+    )
+    .await;
+    assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, Some(0));
+
+    logged_in_until(
+        ENDPOINT,
+        &jwt("alice", VALID, 2),
+        None,
+        LOGIN_REFRESH_EXPIRES,
+        None,
+    )
+    .await;
+    assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, None);
+}
+
+fn removed_refresh_tokens(removed: Vec<RemovedRefreshToken>) -> Vec<(String, String)> {
+    let mut removed: Vec<_> = removed
+        .into_iter()
+        .map(|removed| (removed.user_id, removed.refresh_token))
+        .collect();
+    removed.sort();
+    removed
+}
+
+/// Removing a user's tokens returns their refresh token, for the caller to revoke. Their
+/// authorization tokens are removed but not returned, and other users' tokens are kept.
+#[tokio::test]
+async fn removing_a_users_tokens_returns_their_refresh_token() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://remove-user.test.invalid";
+    let resource = format!("{ENDPOINT}/00112233445566778899aabbccddeeff");
+    logged_in(ENDPOINT, "alice-token", Some("refresh-1"), None).await;
+    store_user_token(&resource, "alice", "alice-partition-token", Vec::new())
+        .await
+        .expect("store the authorization token");
+    store_user_token(ENDPOINT, "bob", "bob-token", Vec::new())
+        .await
+        .expect("store bob's token");
+
+    let removed = remove_user_tokens_for_auth_url(ENDPOINT, "alice")
+        .await
+        .expect("remove alice's tokens");
+
+    assert_eq!(
+        removed_refresh_tokens(removed),
+        [("alice".to_owned(), "refresh-1".to_owned())]
+    );
+    let partition = load_user_token_from_store(&resource, "alice", vulnerable_all_tokens()).await;
+    assert!(partition.is_err(), "the authorization token was kept");
+    let bob = load_user_token_from_store(ENDPOINT, "bob", vulnerable_all_tokens()).await;
+    assert_eq!(bob.ok().as_deref(), Some("bob-token"));
+}
+
+/// Removing every token for an endpoint returns every refresh token there. A login without one
+/// is removed and returns nothing, and so does a second removal.
+#[tokio::test]
+async fn removing_all_tokens_returns_every_refresh_token() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://remove-all.test.invalid";
+    logged_in(ENDPOINT, "alice-token", Some("refresh-1"), None).await;
+    store_user_token(ENDPOINT, "bob", "bob-token", Vec::new())
+        .await
+        .expect("store bob's token");
+
+    let removed = remove_all_tokens_for_auth_url(ENDPOINT)
+        .await
+        .expect("remove every token");
+
+    assert_eq!(
+        removed_refresh_tokens(removed),
+        [("alice".to_owned(), "refresh-1".to_owned())]
+    );
+    let bob = load_user_token_from_store(ENDPOINT, "bob", vulnerable_all_tokens()).await;
+    assert!(bob.is_err(), "bob's token was kept");
+    let again = remove_all_tokens_for_auth_url(ENDPOINT)
+        .await
+        .expect("remove every token again");
+    assert!(again.is_empty());
+}
+
+#[tokio::test]
+async fn receipt_round_trips_clamps_to_toml_max_and_legacy_entry_loads_as_empty() {
+    use lore_credential::token_store::TokenReceipt;
+    use lore_credential::token_store::load_stored_token_from_store;
+    use lore_credential::token_store::store_user_token_and_refresh_token_with_receipt;
+
+    let _alone = STORE_FILE.write().await;
+    const ENDPOINT: &str = "oidc+https://receipt-roundtrip.test.invalid";
+
+    // Round-trip a populated receipt through disk and verify u64::MAX is clamped for TOML i64.
+    let huge_receipt = TokenReceipt {
+        received_at: Some(1_700_000_000_000),
+        lifetime_ms: Some(u64::MAX),
+    };
+    store_user_token_and_refresh_token_with_receipt(
+        ENDPOINT,
+        "alice",
+        "token-with-receipt",
+        Vec::new(),
+        Some("refresh-1"),
+        0,
+        None,
+        huge_receipt,
+    )
+    .await
+    .expect("store with huge lifetime_ms");
+
+    let file = store_file().expect("the token store's file");
+    let raw = std::fs::read_to_string(&file).expect("read tokenstore.toml");
+    assert!(raw.contains("received_at"), "{raw}");
+    assert!(raw.contains("lifetime_ms"), "{raw}");
+
+    let stored = load_stored_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens())
+        .await
+        .expect("load stored token");
+    assert_eq!(stored.token, "token-with-receipt");
+    assert_eq!(stored.receipt.received_at, Some(1_700_000_000_000));
+    assert_eq!(stored.receipt.lifetime_ms, Some(i64::MAX as u64));
+
+    // Refresh persists the new lifetime_ms (clamped) and refreshes received_at.
+    let fresh = jwt("alice", VALID, 9);
+    let fresh_clone = fresh.clone();
+    refresh_user_token(ENDPOINT, "alice", "token-with-receipt", |_| {
+        std::future::ready(Refreshed::<TokenStoreError>::Token {
+            token: fresh_clone,
+            lifetime_ms: Some(3_600_000),
+            refresh_token: Some("refresh-2".to_owned()),
+            refresh_expires: GRANT_REFRESH_EXPIRES,
+            scope: None,
+        })
+    })
+    .await
+    .expect("refresh succeeds");
+    let refreshed = load_stored_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens())
+        .await
+        .expect("load refreshed token");
+    assert_eq!(refreshed.token, fresh);
+    assert!(refreshed.receipt.received_at.is_some());
+    assert_eq!(refreshed.receipt.lifetime_ms, Some(3_600_000));
+
+    // Strip receipt fields from the on-disk TOML and reload to simulate an entry written by an
+    // older client.
+    let raw_after_refresh = std::fs::read_to_string(&file).expect("read tokenstore.toml");
+    let legacy_raw: String = raw_after_refresh
+        .lines()
+        .filter(|line| {
+            !line.trim_start().starts_with("received_at")
+                && !line.trim_start().starts_with("lifetime_ms")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&file, legacy_raw).expect("write legacy tokenstore.toml");
+    let _ = remove_user_token_if(ENDPOINT, "alice", "non-matching").await;
+
+    let reloaded = load_stored_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens())
+        .await
+        .expect("load legacy entry from disk");
+    assert_eq!(reloaded.token, fresh);
+    assert_eq!(reloaded.receipt, TokenReceipt::default());
+}
+
+#[test]
+fn logins_in_map_are_the_identity_tokens_the_domain_accepts() {
+    let login = |user_id: &str, domains: &[&str]| {
+        IdentityToken::new(
+            user_id,
+            "sealed",
+            domains.iter().map(|domain| domain.to_string()).collect(),
+            None,
+            None,
+        )
+    };
+    let map = TokenMap::new(vec![
+        RemoteIdentity::new(
+            "https://auth.example.com",
+            vec![
+                login("other-domain", &[".other.example", "auth.example.com"]),
+                login("accepted", &[".example.com"]),
+                login("legacy", &[]),
+                login("look-alike", &[".badexample.com"]),
+            ],
+        ),
+        RemoteIdentity::new(
+            "https://auth.example.com/0123456789abcdef0123456789abcdef",
+            vec![login("authorization", &[".example.com"])],
+        ),
+        RemoteIdentity::new(
+            "https://second.example.net",
+            vec![login("second", &["example.com"])],
+        ),
+    ]);
+
+    assert_eq!(
+        logins_in_map(&map, "lore.example.com"),
+        [
+            (
+                "https://auth.example.com".to_string(),
+                vec!["accepted".to_string()]
+            ),
+            (
+                "https://second.example.net".to_string(),
+                vec!["second".to_string()]
+            ),
+        ]
+    );
 }

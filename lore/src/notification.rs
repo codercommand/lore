@@ -10,7 +10,9 @@ use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(subscribe_local)]
 /// Arguments for subscribing to repository notifications (no parameters).
 pub struct LoreNotificationSubscribeArgs {}
@@ -40,16 +42,18 @@ pub struct LoreNotificationSubscribeArgs {}
 /// | [`LoreEvent::NotificationBranchPushed`](crate::interface::LoreEvent::NotificationBranchPushed) | Emitted when a branch is pushed to (push notification) |
 /// | [`LoreEvent::NotificationResourceLocked`](crate::interface::LoreEvent::NotificationResourceLocked) | Emitted when a resource is locked (push notification) |
 /// | [`LoreEvent::NotificationResourceUnlocked`](crate::interface::LoreEvent::NotificationResourceUnlocked) | Emitted when a resource is unlocked (push notification) |
-pub async fn subscribe(
+pub fn subscribe(
     globals: LoreGlobalArgs,
     args: LoreNotificationSubscribeArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, subscribe_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, subscribe_local)
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(unsubscribe_local)]
 /// Arguments for unsubscribing from repository notifications (no parameters).
 pub struct LoreNotificationUnsubscribeArgs {}
@@ -74,12 +78,12 @@ pub struct LoreNotificationUnsubscribeArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::NotificationUnsubscribed`](crate::interface::LoreEvent::NotificationUnsubscribed) | Emitted when successfully unsubscribed from repository notifications |
-pub async fn unsubscribe(
+pub fn unsubscribe(
     globals: LoreGlobalArgs,
     args: LoreNotificationUnsubscribeArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, unsubscribe_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, unsubscribe_local)
 }
 
 static INITIALIZER: Once = Once::new();

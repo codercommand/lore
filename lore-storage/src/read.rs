@@ -9,7 +9,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use bytes::BytesMut;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::KeyType;
@@ -28,105 +27,73 @@ use crate::fragment_flags::FragmentFlags;
 use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
+use crate::immutable_store::claim_for_task;
 use crate::mutable_store::MutableStore;
 use crate::options::ReadOptions;
+use crate::resume::Opened;
 use crate::store_types::PayloadRead;
-use crate::store_types::StoreGetData;
+use crate::store_types::StoreMatch;
 use crate::types::Address;
 use crate::types::Fragment;
 use crate::types::Partition;
 
 /// Load a single raw fragment from store with retry backoff. How widely the store searches for it
-/// is the store's own business - see [`ImmutableStore::read_scope`].
+/// is the store's own business - see [`ImmutableStore::read_scope`]. The payload is returned as
+/// stored, with the content the store expanded where it checked the payload on receipt; nothing
+/// here hashes it. A store's answer that it does not hold the content ([`StoreError::is_absent`])
+/// is `AddressNotFound` at `address`.
 ///
-/// Under debug assertions the payload is hashed against its address, unless `verified_by_caller`:
-/// the caller hashes it once this returns, which reports corruption as an error to heal from, or
-/// trusts local bytes ([`ReadOptions::trust_local`]).
-pub async fn read_raw(
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn read_raw(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
-    verified_by_caller: bool,
-) -> Result<(Fragment, Bytes), StorageError> {
-    let mut retry = crate::store_retry();
-    loop {
-        debug_assert!(
-            !address.hash.is_zero(),
-            "Cannot request zero hash from store"
-        );
-        match store
-            .clone()
-            .get(partition, address)
-            .await
-            .and_then(StoreGetData::into_payload)
-        {
-            Ok((fragment, payload)) => {
-                debug_assert!(
-                    verified_by_caller
-                        || match hash::hash_fragment(fragment, payload.as_ref()) {
-                            Ok(loaded_hash) => loaded_hash == address.hash,
-                            Err(_) => true,
-                        },
-                    "Local store loaded data failed hash validation"
-                );
-                return Ok((fragment, payload));
-            }
-            Err(StoreError::SlowDown(_)) => {
-                if !retry.wait().await {
-                    return Err(StorageError::from(SlowDown));
+) -> impl Future<Output = Result<Loaded, StorageError>> {
+    async move {
+        let mut retry = crate::store_retry();
+        loop {
+            debug_assert!(
+                !address.hash.is_zero(),
+                "Cannot request zero hash from store"
+            );
+            match store
+                .clone()
+                .get(partition, address)
+                .await
+                .and_then(|mut data| {
+                    let content = data.content.take();
+                    data.into_payload().map(|raw| Loaded { content, raw })
+                }) {
+                Ok(loaded) => return Ok(loaded),
+                Err(StoreError::SlowDown(_)) => {}
+                Err(err) if err.is_absent() => {
+                    return Err(StorageError::from(crate::errors::AddressNotFound::from(
+                        address,
+                    )));
                 }
+                Err(err) => return Err(err).forward::<StorageError>("store get failed"),
             }
-            Err(StoreError::AddressNotFound(_) | StoreError::PayloadNotFound(_)) => {
-                return Err(StorageError::from(crate::errors::AddressNotFound::from(
-                    address,
-                )));
-            }
-            Err(err) => {
-                return Err(StorageError::internal_with_context(err, "store get failed"));
+            if !retry.wait().await {
+                return Err(StorageError::from(SlowDown));
             }
         }
     }
 }
 
-/// Expands `buffer` when `options.decompress` is set and hashes its content against `address` when
-/// `options.verify` is set, returning the fragment and payload expanded only if asked.
-pub fn decompress_and_verify(
+/// The content `payload` holds and the fragment describing it, its sizes checked
+/// ([`check_payload_sizes`]): a compressed payload expanded, any other as it is.
+pub fn expand_payload(
     fragment: Fragment,
-    buffer: Bytes,
-    address: Address,
-    options: ReadOptions,
+    payload: Bytes,
 ) -> Result<(Fragment, Bytes), StorageError> {
-    if !options.decompress && !options.verify {
-        return Ok((fragment, buffer));
+    check_payload_sizes(&fragment, payload.len())?;
+    if (fragment.flags & FragmentFlags::PayloadCompressed) == 0 {
+        return Ok((fragment, payload));
     }
-
-    let mut fragment = fragment;
-    let mut buffer = buffer;
-
-    let mut content_hash = address.hash;
-    // Compressed is a group flag, check if any of the flags are set
-    if (fragment.flags & FragmentFlags::PayloadCompressed) != 0 {
-        let (decompressed_fragment, decompressed_buffer) =
-            compress::decompress(fragment, buffer.as_ref())
-                .forward::<StorageError>("failed to decompress fragment")?;
-        if options.verify {
-            content_hash = hash::hash_slice(decompressed_buffer.as_ref());
-        }
-        if options.decompress {
-            buffer = decompressed_buffer.freeze();
-            fragment = decompressed_fragment;
-        }
-    } else if options.verify {
-        content_hash = hash::hash_slice(buffer.as_ref());
-    }
-
-    if options.verify && content_hash != address.hash {
-        Err(StorageError::internal(format!(
-            "fragment hash mismatch, got {content_hash}"
-        )))
-    } else {
-        Ok((fragment, buffer))
-    }
+    let (fragment, content) = compress::decompress(fragment, payload.as_ref())
+        .forward::<StorageError>("failed to decompress fragment")?;
+    Ok((fragment, content.freeze()))
 }
 
 /// Process-wide count of remote fetches in flight across every [`remote_get_retry`] path; shared by all concurrent operations, layer per-op attribution on top if needed.
@@ -160,11 +127,10 @@ impl Drop for RemoteFetchGuard {
     }
 }
 
-/// Fetch a fragment from a remote session with retry on `SlowDown` and on
-/// transient `NotConnected` responses (e.g. the server's session-id map was
-/// reset by a QUIC reconnect; the storage layer mapping turns this into
-/// `StorageError::NotConnected`, which we recover from by invalidating the
-/// cached session and retrying with a fresh `session_start`).
+/// Fetch a fragment from a remote session. A `SlowDown` is retried with back-off, and a
+/// `NotConnected` or a refusal, as
+/// [`protocol_error_to_storage`](crate::error::protocol_error_to_storage) maps a failure of the
+/// session, is retried on a fresh session as [`SessionRetries::retry`] bounds and paces it.
 ///
 /// `Disconnected` is deliberately not retried here: on both transports it means the
 /// transport already exhausted its own reconnect-and-reissue and gave up, so the remote
@@ -181,7 +147,7 @@ async fn remote_get_retry(
         return Ok(served);
     }
     let mut retry = crate::store_retry();
-    let mut stale_session_retries: u32 = 0;
+    let mut session_retries = SessionRetries::default();
     loop {
         debug_assert!(
             !address.hash.is_zero(),
@@ -201,97 +167,171 @@ async fn remote_get_retry(
             }
             Err(err) => {
                 let storage_err = crate::error::protocol_error_to_storage(err, address);
-                if matches!(storage_err, StorageError::NotConnected(_))
-                    && stale_session_retries < MAX_STALE_SESSION_RETRIES
+                if !session_retries
+                    .retry(&storage_err, session, &mut retry)
+                    .await
                 {
-                    stale_session_retries += 1;
-                    session.invalidate().await;
-                    if !retry.wait().await {
-                        return Err(storage_err);
-                    }
-                    continue;
+                    return Err(storage_err);
                 }
-                return Err(storage_err);
             }
         }
     }
 }
 
-/// Bound on retries for `StorageError::NotConnected` in `remote_get_retry`.
+/// Bound on retries for `StorageError::NotConnected` in a remote read ([`SessionRetries`]).
 /// Picked so a genuinely permanent server-side failure surfaces quickly
 /// rather than looping through the full `store_retry` backoff schedule (60
-/// attempts up to 10 s apart). Recovery from a QUIC reconnect typically
-/// succeeds on the first or second retry once the session has been
-/// re-established.
-const MAX_STALE_SESSION_RETRIES: u32 = 5;
+/// attempts, up to 1 s apart).
+const MAX_STALE_SESSION_RETRIES: u8 = 5;
 
-/// Outcome of probing the local store for a fragment, distinguishing a plain miss
-/// (nothing to report, fall through to remote) from data that was found but failed
-/// verification (the refetched payload overwrites the local copy), from a durable payload this
-/// build no longer decodes (also refetched and overwritten), and from a fatal error that must
-/// short-circuit the caller immediately rather than fall through.
+/// The retries a remote read has made on a fresh session ([`StorageSession::invalidate`]).
+#[derive(Default)]
+struct SessionRetries {
+    /// Retries of a `NotConnected`, a session the server may no longer know.
+    stale: u8,
+    /// Whether a refusal was retried.
+    refused: bool,
+}
+
+impl SessionRetries {
+    /// Whether a read that failed with `err` is retried on a fresh session, counting the retry: a
+    /// `NotConnected` up to [`MAX_STALE_SESSION_RETRIES`] times, and a refusal once, since an
+    /// expired token is refused and a fresh session can carry a fresh one.
+    fn admit(&mut self, err: &StorageError) -> bool {
+        match err {
+            StorageError::NotConnected(_) if self.stale < MAX_STALE_SESSION_RETRIES => {
+                self.stale += 1;
+                true
+            }
+            StorageError::NotAuthenticated(_) | StorageError::NotAuthorized(_) if !self.refused => {
+                self.refused = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a read that failed with `err` is retried, readying the retry. An admitted failure
+    /// ([`admit`](Self::admit)) invalidates `session`, so a lazy one starts its server-side
+    /// sessions again. A `NotConnected` then waits on `back_off`, and is not retried once that is
+    /// spent; a refusal is retried at once, as only a fresh session can change its outcome.
+    async fn retry(
+        &mut self,
+        err: &StorageError,
+        session: &StorageSession,
+        back_off: &mut crate::Retry,
+    ) -> bool {
+        if !self.admit(err) {
+            return false;
+        }
+        session.invalidate().await;
+        !err.is_not_connected() || back_off.wait().await
+    }
+}
+
+/// Outcome of probing the local store for a fragment, distinguishing a miss and a failed read (fall
+/// through to remote) from data that was found but fails its size check or to decompress, from a
+/// durable payload this build does not decode, and from a fatal error that must short-circuit the
+/// caller immediately rather than fall through. Where a remote is in reach, a `Corrupt` or
+/// `DurableMigrated` payload is refetched as well, and the refetched payload overwrites the local
+/// copy unless `options.no_local_write` is set.
 enum LocalFailure {
-    Corrupt,
-    /// A durably stored payload in an encoding this build no longer decodes, which the remote
+    /// The store does not hold the address, the probe is off, or the key a resolve loads is
+    /// unmapped or a tombstone.
+    Missing,
+    /// The store failed to read the address, or the key a resolve loads.
+    Failed(StorageError),
+    /// The held payload fails its size check or does not decompress, with that error.
+    Corrupt(StorageError),
+    /// A durably stored payload in an encoding this build does not decode, which the remote
     /// holds re-encoded. Carries the decode error to report when there is no remote to fetch
     /// from.
     DurableMigrated(StorageError),
-    Other,
+    /// A held payload this build does not decode, other than a `DurableMigrated` one, or a read
+    /// the store answers `NotSupported`, with that error.
     Fatal(StorageError),
 }
 
-/// Probe the local store for `address`: read, decompress, and verify. A caller disables it via
-/// `options.local`: a remote-only handle, or a read that has probed already.
-async fn probe_local(
+impl LocalFailure {
+    /// The error a load answers for this failure with no remote in reach. A miss is
+    /// `AddressNotFound` at `address`, and so are a failed read and a corrupt payload unless
+    /// `strict` ([`ReadOptions::strict_local`]) asks for the read's error and an internal error
+    /// naming `address`. A payload this build cannot decode fails with its decode error, which a
+    /// miss would misreport.
+    fn error_without_remote(self, address: Address, strict: bool) -> StorageError {
+        match self {
+            Self::Fatal(err) | Self::DurableMigrated(err) => err,
+            Self::Failed(err) if strict => err,
+            Self::Corrupt(err) if strict => StorageError::internal_with_context(
+                err,
+                &format!("loading what the local store holds for {}", address.hash),
+            ),
+            Self::Missing | Self::Failed(_) | Self::Corrupt(_) => {
+                StorageError::from(crate::errors::AddressNotFound::from(address))
+            }
+        }
+    }
+}
+
+/// Probe the local store for `address`: read, check the payload's sizes ([`check_payload_sizes`]),
+/// and decompress when `options.decompress` asks, taking the content the store expanded where it
+/// checked the payload. The payload is trusted as stored: nothing here hashes it. A payload the
+/// store answers `NotSupported` for is fatal, as a non-durable payload this build cannot decode is.
+/// A store's answer that it does not hold the address ([`StoreError::is_absent`]) is `Missing`, and
+/// any other store failure is a failed read. A caller disables it via `options.local`: a
+/// remote-only handle, or a read that has probed already.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn probe_local(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     options: ReadOptions,
-) -> Result<(Fragment, Bytes), LocalFailure> {
-    if !options.local {
-        return Err(LocalFailure::Other);
-    }
+) -> impl Future<Output = Result<(Fragment, Bytes), LocalFailure>> {
+    async move {
+        if !options.local {
+            return Err(LocalFailure::Missing);
+        }
 
-    match read_raw(
-        store,
-        partition,
-        address,
-        options.verify || options.trust_local,
-    )
-    .await
-    {
-        Ok((fragment, buffer)) => {
-            let durable_oodle = (fragment.flags & FragmentFlags::PayloadCompressedOodle2) != 0
-                && (fragment.flags & FragmentFlags::PayloadStoredDurable) != 0;
-            match decompress_and_verify(fragment, buffer, address, options) {
-                Ok((fragment, buffer)) => Ok((fragment, buffer)),
-                // The remote re-encodes Oodle on ingress, so it holds a durable payload in a
-                // form this build decodes. A local-only one has no such copy to fall back on.
-                Err(err) if durable_oodle && matches!(err, StorageError::NotSupported(_)) => {
-                    Err(LocalFailure::DurableMigrated(err))
-                }
-                Err(err) if matches!(err, StorageError::NotSupported(_)) => {
-                    Err(LocalFailure::Fatal(err))
-                }
-                Err(err) => {
-                    lore_base::lore_debug!(
-                        "Fragment {} failed decompression/verification: {err}",
-                        address.hash
-                    );
-                    debug_assert!(
-                        false,
-                        "Local store data failed decompression or verification"
-                    );
-                    Err(LocalFailure::Corrupt)
+        match read_raw(store, partition, address).await {
+            Ok(loaded) => {
+                let flags = loaded.raw.0.flags;
+                let durable_oodle = (flags & FragmentFlags::PayloadCompressedOodle2) != 0
+                    && (flags & FragmentFlags::PayloadStoredDurable) != 0;
+                let loaded = if options.decompress {
+                    loaded.take(true)
+                } else {
+                    check_payload_sizes(&loaded.raw.0, loaded.raw.1.len()).map(|()| loaded.raw)
+                };
+                match loaded {
+                    Ok((fragment, buffer)) => Ok((fragment, buffer)),
+                    // The remote re-encodes Oodle on ingress, so it holds a durable payload in a
+                    // form this build decodes. A local-only one has no such copy to fall back on.
+                    Err(err) if durable_oodle && matches!(err, StorageError::NotSupported(_)) => {
+                        Err(LocalFailure::DurableMigrated(err))
+                    }
+                    Err(err) if matches!(err, StorageError::NotSupported(_)) => {
+                        Err(LocalFailure::Fatal(err))
+                    }
+                    Err(err) => {
+                        lore_base::lore_debug!("Fragment {} failed to load: {err}", address.hash);
+                        Err(LocalFailure::Corrupt(err))
+                    }
                 }
             }
-        }
-        Err(e) => {
-            lore_base::lore_trace!(
-                "Fragment {} failed loading from local store: {e:?}",
-                address.hash
-            );
-            Err(LocalFailure::Other)
+            Err(err) if err.is_not_supported() => Err(LocalFailure::Fatal(err)),
+            Err(err) => {
+                lore_base::lore_trace!(
+                    "Fragment {} failed loading from local store: {err:?}",
+                    address.hash
+                );
+                Err(if err.is_address_not_found() {
+                    LocalFailure::Missing
+                } else {
+                    LocalFailure::Failed(err)
+                })
+            }
         }
     }
 }
@@ -304,69 +344,190 @@ fn landed_before_probe(address: Address, options: ReadOptions) -> Option<u64> {
     (options.local && !options.never_wait).then(|| crate::write::stores_landed(address))
 }
 
-/// Whether a store of `address` may have written its payload since the count `landed` was read
-/// ([`landed_before_probe`]): a store in flight is waited for, and one waited on or one landed
-/// since may have written it, so only then is the local store worth probing again.
-async fn stored_since(partition: Partition, address: Address, landed: Option<u64>) -> bool {
-    let Some(landed) = landed else {
-        return false;
-    };
-    crate::write::wait_if_in_flight(partition, address).await
-        || crate::write::stores_landed(address) != landed
+/// Whether a store of `address` in `store` may have written its payload since the count `landed`
+/// was read ([`landed_before_probe`]): a store in flight is waited for, and one waited on or one
+/// landed since may have written it, so only then is the local store worth probing again.
+///
+/// Looks for the store in flight at the call, so the future holds only the wait for it, `address`
+/// and `landed`.
+#[lore_macro::test_pub]
+fn stored_since(
+    store: &dyn ImmutableStore,
+    partition: Partition,
+    address: Address,
+    landed: Option<u64>,
+) -> impl Future<Output = bool> + use<> {
+    let since = landed.map(|landed| {
+        futures::FutureExt::map(
+            crate::write::wait_if_in_flight(store, partition, address),
+            move |waited| waited || crate::write::stores_landed(address) != landed,
+        )
+    });
+    futures::FutureExt::map(futures::future::OptionFuture::from(since), |stored| {
+        stored == Some(true)
+    })
 }
 
-/// Checks a remote payload on receipt, its sizes against its length and its content against
-/// `address`, and returns that content expanded. A payload that is neither compressed nor a
-/// fragment list is the content, so its content size must equal its payload size.
+/// Checks a remote payload on receipt, its sizes ([`check_payload_sizes`]) and its content against
+/// `address`, and returns that content expanded.
 pub fn verify_receipt(
     fragment: Fragment,
     buffer: Bytes,
     address: Address,
 ) -> Result<(Fragment, Bytes), StorageError> {
-    crate::validate_fragment_payload(&fragment, buffer.len())
-        .and_then(|()| crate::immutable_store::validate_plain_payload_size(&fragment))
-        .forward::<StorageError>("remote fragment sizes disagree with its payload")?;
-    let receipt = ReadOptions::default().with_decompress().with_verify();
-    decompress_and_verify(fragment, buffer, address, receipt)
+    let (fragment, content) = expand_payload(fragment, buffer)?;
+    let content_hash = hash::hash_slice(content.as_ref());
+    if content_hash != address.hash {
+        return Err(StorageError::internal(format!(
+            "fragment hash mismatch, got {content_hash}"
+        )));
+    }
+    Ok((fragment, content))
 }
 
-/// Fetches `address` from the remote through [`fetch_remote`], and stores it locally where
-/// `options.cache`, `local_replace` or the fragment's local cache priority asks. A read
-/// single-flight leader runs it for itself and its followers, and a follower whose leader failed on
-/// another address runs it for itself; it answers the flight's form, so the flight awaits its
-/// future directly rather than through a wrapper holding a second copy.
-async fn fetch_and_store(
-    store: Arc<dyn ImmutableStore>,
-    partition: Partition,
+/// Checks the sizes `fragment` gives against the payload's length `len` and, for a plain payload,
+/// which is the content, against each other. Only the fragment is inspected, never the content, so
+/// every payload has its sizes checked, whatever its source and however far that is trusted.
+pub fn check_payload_sizes(fragment: &Fragment, len: usize) -> Result<(), StorageError> {
+    crate::validate_fragment_payload(fragment, len)
+        .and_then(|()| crate::immutable_store::validate_plain_payload_size(fragment))
+        .forward::<StorageError>("fragment sizes disagree with its payload")
+}
+
+/// Checks `raw`, the payload at `address` as fetched, on receipt, and returns the content the check
+/// expanded. From an untrusted remote that is [`verify_receipt`]. From a trusted one
+/// ([`ReadOptions::trust_remote`]) only the sizes are checked, and the payload is expanded only
+/// where `options.decompress` asks.
+pub fn check_receipt(
+    raw: &(Fragment, Bytes),
     address: Address,
     options: ReadOptions,
-    session: Arc<StorageSession>,
-    local_replace: bool,
-) -> Result<Flown, StorageError> {
-    let fetched = fetch_remote(session.as_ref(), address, options.priority).await?;
-    let (fragment, payload) = &fetched.raw;
-    if options.cache
-        || local_replace
-        || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0
-    {
-        let _ = store
-            .clone()
-            .put(
-                partition,
-                address,
-                *fragment,
-                Some(payload.clone()),
-                local_replace,
-            )
-            .await;
+) -> Result<Option<(Fragment, Bytes)>, StorageError> {
+    if !options.trust_remote {
+        return verify_receipt(raw.0, raw.1.clone(), address).map(Some);
     }
-    Ok(Flown::Fetched(fetched))
+    if !options.decompress {
+        return check_payload_sizes(&raw.0, raw.1.len()).map(|()| None);
+    }
+    expand_payload(raw.0, raw.1.clone()).map(Some)
+}
+
+/// What a read keeps locally of the content it fetches, each keeping what the one before keeps.
+/// Each records the fragment, marked durable as the fetch marks it, where it does not store the
+/// payload ([`store_fetched`]).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Keep {
+    /// Stores the payload where the fragment asks for it, with its local cache priority or as a
+    /// revision state ([`fetch_is_stored`]).
+    Priority,
+    /// Stores the payload.
+    Store,
+    /// Stores the payload, overwriting the local copy, which failed to load.
+    Replace,
+}
+
+impl Keep {
+    /// What a read with `options` keeps of what it fetches, replacing its local copy where
+    /// `replace`: nothing with `options.no_local_write`, and otherwise the payload where
+    /// `options.cache` or `replace` asks, or where the fragment asks for it ([`fetch_is_stored`]).
+    pub fn of(options: ReadOptions, replace: bool) -> Option<Self> {
+        match (options.no_local_write, options.cache, replace) {
+            (true, _, _) => None,
+            (false, _, true) => Some(Self::Replace),
+            (false, true, false) => Some(Self::Store),
+            (false, false, false) => Some(Self::Priority),
+        }
+    }
+}
+
+/// The fragment flags with which a fragment asks every read that fetches it to store its payload
+/// locally: its local cache priority, and a revision state.
+const FETCH_STORED_FLAGS: u32 =
+    FragmentFlags::PayloadLocalCachePriority.bits() | FragmentFlags::PayloadRevisionState.bits();
+
+/// Whether the payload of a fetch of `fragment` is stored locally: where its read stores what it
+/// fetches (`stores`), or where the fragment asks for it with one of [`FETCH_STORED_FLAGS`].
+fn fetch_is_stored(stores: bool, fragment: &Fragment) -> bool {
+    stores || fragment.flags & FETCH_STORED_FLAGS != 0
+}
+
+/// Stores what a read fetched from the remote for `address`, which `fragment` describes, in `store`
+/// as `keep` asks: `payload`, where there is one and [`fetch_is_stored`] says, answering whether it
+/// stored it. Otherwise it records the fragment without the payload, so that a later write of the
+/// content finds it durable and uploads nothing; a payload the store holds stays. A read that
+/// fetched no payload, as [`fetch_metadata`], is only ever recorded. Either way the entry is marked
+/// durable: the remote holds what a read fetched. With no `keep` nothing is stored. A failed put
+/// fails nothing: the read holds what it fetched.
+///
+/// Not an `async fn`, which would hold its arguments beside the put's future.
+fn store_fetched(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    payload: Option<&Bytes>,
+    keep: Option<Keep>,
+) -> impl Future<Output = bool> + use<> {
+    let put = keep.map(|keep| {
+        let fragment = Fragment {
+            flags: fragment.flags | FragmentFlags::PayloadStoredDurable.bits(),
+            ..fragment
+        };
+        let payload = payload
+            .filter(|_| fetch_is_stored(keep >= Keep::Store, &fragment))
+            .cloned();
+        let stores = payload.is_some();
+        let put = store
+            .clone()
+            .put(partition, address, fragment, payload, keep == Keep::Replace);
+        (put, stores)
+    });
+    async move {
+        match put {
+            Some((put, stores)) => put.await.is_ok() && stores,
+            None => false,
+        }
+    }
+}
+
+/// Asks the remote through `session` for the fragment stored at `address`, without its payload,
+/// and records it in `store` as [`store_fetched`] records a fetch it does not keep, marked durable,
+/// unless `options.no_local_write` is set. Answers the fragment as the remote describes it, and a
+/// failure of the session as [`crate::error::protocol_error_to_storage`] maps it. A failed write of
+/// the entry fails nothing.
+///
+/// Not an `async fn`, which would hold `options` rather than what it keeps.
+#[inline]
+#[allow(clippy::manual_async_fn)]
+pub fn fetch_metadata<'a>(
+    store: &'a Arc<dyn ImmutableStore>,
+    partition: &'a Partition,
+    address: &'a Address,
+    options: ReadOptions,
+    session: &'a StorageSession,
+) -> impl Future<Output = Result<Fragment, StorageError>> + 'a {
+    let keep = Keep::of(options, false);
+    async move {
+        #[cfg(feature = "test-util")]
+        let served = crate::test_util::remote_metadata(*address);
+        #[cfg(not(feature = "test-util"))]
+        let served = None;
+        let fragment = match served {
+            Some(fragment) => fragment,
+            None => session
+                .get_metadata(address)
+                .await
+                .map_err(|err| crate::error::protocol_error_to_storage(err, *address))?,
+        };
+        store_fetched(store, *partition, *address, fragment, None, keep).await;
+        Ok(fragment)
+    }
 }
 
 /// Fetches `address` from the remote, retrying as [`remote_get_retry`] does, marks it durable, as
 /// the remote holds it, and counts its payload bytes ([`remote_fetch_bytes`]): the payload as
 /// fetched, unchecked.
-pub async fn fetch_payload(
+async fn fetch_payload(
     session: &StorageSession,
     address: Address,
     priority: bool,
@@ -377,154 +538,201 @@ pub async fn fetch_payload(
     Ok((fragment, buffer))
 }
 
-/// Fetches `address` as [`fetch_payload`] does, and checks it as [`check_fetched`] does.
-pub async fn fetch_remote(
+/// Asks the remote to heal `address`, whose payload failed the check on receipt with `err`, once
+/// per fetch: `heal_attempted` is whether this fetch already did. Answers whether it healed, and so
+/// whether to fetch the payload again. A payload this build cannot decode (`NotSupported`) is not
+/// corrupt, and is not healed.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn heal_on_receipt(
     session: &StorageSession,
     address: Address,
-    priority: bool,
-) -> Result<Fetched, StorageError> {
-    lore_base::lore_trace!("Fetch immutable fragment {} from remote", address);
-    let raw = fetch_payload(session, address, priority).await?;
-    check_fetched(session, address, priority, raw).await
+    err: &StorageError,
+    heal_attempted: bool,
+) -> impl Future<Output = bool> {
+    async move {
+        if err.is_not_supported() {
+            return false;
+        }
+        if heal_attempted {
+            lore_base::lore_error!(
+                "Fragment {} still corrupt after heal: {}",
+                address.hash,
+                err
+            );
+            return false;
+        }
+        lore_base::lore_warn!("Fragment {}: {}. Attempting heal.", address.hash, err);
+        let healed = session
+            .verify(&address, true)
+            .await
+            .is_ok_and(|r| r.healed == lore_base::types::HealResult::Healed);
+        if healed {
+            lore_base::lore_debug!("Server healed fragment {}, retrying fetch", address.hash);
+        } else {
+            lore_base::lore_error!("Server did not heal fragment {}", address.hash);
+        }
+        healed
+    }
 }
 
-/// Checks `raw`, the payload at `address` as fetched ([`fetch_payload`]), on receipt
-/// ([`verify_receipt`]): its sizes against its length, and its content against the address. A
-/// payload that fails the check is asked of the server to heal once, and fetched again. The content
-/// the check expands is handed back, so no caller decodes or hashes a fetched payload again.
-pub async fn check_fetched(
+/// Fetches `address` as [`fetch_payload`] does, with `options.priority`, and checks it on receipt
+/// as `options` asks ([`check_receipt`]). A payload that fails the check is fetched again once
+/// where the server heals it ([`heal_on_receipt`]). The content the check expands is handed back,
+/// so no caller decodes or hashes a fetched payload again.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn fetch_remote(
     session: &StorageSession,
     address: Address,
-    priority: bool,
-    mut raw: (Fragment, Bytes),
-) -> Result<Fetched, StorageError> {
-    let mut heal_attempted = false;
-    loop {
-        match verify_receipt(raw.0, raw.1.clone(), address) {
-            Ok(content) => return Ok(Fetched { content, raw }),
-            Err(err) => {
-                if matches!(err, StorageError::NotSupported(_)) {
-                    return Err(err);
+    options: ReadOptions,
+) -> impl Future<Output = Result<Loaded, StorageError>> {
+    async move {
+        lore_base::lore_trace!("Fetch immutable fragment {} from remote", address);
+        let mut heal_attempted = false;
+        loop {
+            let raw = fetch_payload(session, address, options.priority).await?;
+            match check_receipt(&raw, address, options) {
+                Ok(content) => return Ok(Loaded { content, raw }),
+                Err(err) => {
+                    if !heal_on_receipt(session, address, &err, heal_attempted).await {
+                        return Err(err);
+                    }
+                    heal_attempted = true;
                 }
-                if heal_attempted {
-                    lore_base::lore_error!(
-                        "Fragment {} still corrupt after heal: {}",
-                        address.hash,
-                        err
-                    );
-                    return Err(err);
-                }
-
-                lore_base::lore_warn!("Fragment {}: {}. Attempting heal.", address.hash, err);
-
-                let healed = session
-                    .verify(&address, true)
-                    .await
-                    .is_ok_and(|r| r.healed == lore_base::types::HealResult::Healed);
-
-                if !healed {
-                    lore_base::lore_error!("Server did not heal fragment {}", address.hash);
-                    return Err(err);
-                }
-
-                lore_base::lore_debug!("Server healed fragment {}, retrying fetch", address.hash);
-                heal_attempted = true;
-                raw = fetch_payload(session, address, priority).await?;
             }
         }
     }
 }
 
-/// Unified fragment load: local -> decompress/verify -> optional remote fallback -> heal -> cache.
+/// Whether a [`load_fragment`] with `session` and `options` has a remote in reach: it has a
+/// session, `options.remote` is on, and `options.never_wait` is off.
+fn remote_in_reach(session: Option<&Arc<StorageSession>>, options: ReadOptions) -> bool {
+    session.is_some() && options.remote && !options.never_wait
+}
+
+/// Whether a failed local read must come back as its error: [`ReadOptions::strict_local`] asks for
+/// it and the load has no remote in reach ([`remote_in_reach`]) to fetch from instead.
+fn strict_error_asked(session: Option<&Arc<StorageSession>>, options: ReadOptions) -> bool {
+    options.strict_local && !remote_in_reach(session, options)
+}
+
+/// Unified fragment load: local -> decompress -> optional remote fallback -> check -> heal ->
+/// cache.
 ///
-/// When `remote_session` is `Some`, the session is used for remote fetch if the
-/// local load fails (miss or corrupt). If the remote data fails verification,
-/// heal is attempted once via `session.verify()` before retrying.
+/// The local copy is trusted as stored, and only its sizes are checked. With a remote in reach
+/// ([`remote_in_reach`]), the session fetches the content if the local load fails: a miss, a failed
+/// read, or a payload that fails its size check or does not decompress. Unless
+/// [`ReadOptions::no_local_write`] is set, the fetched payload overwrites such a payload rather
+/// than being deduplicated against it. A payload the store answers `NotSupported` for fails the
+/// load. With no remote in reach, a failed read and a payload that does not load are a miss,
+/// `AddressNotFound`, unless [`ReadOptions::strict_local`] asks for their errors.
+/// The remote payload is checked on receipt as `options` asks ([`check_receipt`]), and if it
+/// fails, heal is attempted once via `session.verify()` before retrying.
 ///
 /// For local-only loading, pass `None`.
 ///
 /// Concurrent misses of the same content join a read single-flight
-/// (`read_flight::join_read_flight`), keyed by the content hash, and by the partition where the
-/// store isolates partitions, never by the context: the first caller becomes the leader and runs
-/// `fetch_and_store`, and later callers await its outcome rather than duplicating
-/// the remote fetch. A leader that vanishes without completing (e.g. its task is
-/// cancelled) leaves no result behind; the next follower observing that promotes
-/// itself to leader and retries. A local-only load (no session, or `options.remote`
-/// off) answers its miss with `AddressNotFound` and never joins: following would wait
-/// on a remote fetch it may not make. With `options.never_wait` a miss answers
+/// (`read_flight::join_read_flight`), keyed by the content hash, by the partition where the store
+/// isolates partitions, and by `options.trust_remote` and `options.no_local_write`, never by the
+/// context or the store: the first caller becomes the leader and fetches, and later callers await
+/// its outcome rather than duplicating the remote fetch. The fetch is stored where each read caches
+/// it, replaces its local copy, or the fragment asks for it ([`fetch_is_stored`]), as
+/// [`fetch_single_flight`] describes, and recorded without its payload otherwise
+/// ([`store_fetched`]); nothing is stored for a read with `options.no_local_write`. A leader
+/// that vanishes without completing, such as one whose task is cancelled, leaves no result behind;
+/// the next follower observing that promotes itself to leader and retries. A local-only load (no
+/// session, or `options.remote` off) answers its miss with `AddressNotFound` and never joins:
+/// following would wait on a remote fetch it may not make. With `options.never_wait` a miss answers
 /// `AddressNotFound` at once, waiting neither for a store in flight nor a flight.
-pub async fn load_fragment(
+///
+/// The flight is boxed: only a miss reaching the remote takes it, and inline it would make the
+/// future of every load, and of every future awaiting one, as large as the fetch.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn load_fragment(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<(Fragment, Bytes), StorageError> {
-    if address.hash.is_zero() {
-        return Ok((Fragment::default(), Bytes::default()));
-    }
+) -> impl Future<Output = Result<(Fragment, Bytes), StorageError>> {
+    async move {
+        if address.hash.is_zero() {
+            return Ok((Fragment::default(), Bytes::default()));
+        }
 
-    let landed = landed_before_probe(address, options);
-    let mut probed = probe_local(store.clone(), partition, address, options).await;
-    if matches!(probed, Err(LocalFailure::Corrupt | LocalFailure::Other))
-        && stored_since(partition, address, landed).await
-    {
-        probed = probe_local(store.clone(), partition, address, options).await;
-    }
-    // The failure is consumed here rather than kept, so the future does not carry it across the
-    // fetch. A corrupt or undecodable local entry has to be overwritten, not deduplicated against.
-    let remote = remote_session.filter(|_| options.remote && !options.never_wait);
-    let (session, local_replace) = match (remote, probed) {
-        (_, Ok((fragment, payload))) => return Ok((fragment, payload)),
-        // The payload is held but cannot be decoded, which a miss would misreport.
-        (_, Err(LocalFailure::Fatal(err))) | (None, Err(LocalFailure::DurableMigrated(err))) => {
-            return Err(err);
+        let landed = landed_before_probe(address, options);
+        let mut probed = probe_local(store.clone(), partition, address, options).await;
+        if matches!(
+            probed,
+            Err(LocalFailure::Missing | LocalFailure::Failed(_) | LocalFailure::Corrupt(_))
+        ) && stored_since(store.as_ref(), partition, address, landed).await
+        {
+            probed = probe_local(store.clone(), partition, address, options).await;
         }
-        (Some(session), Err(LocalFailure::Corrupt | LocalFailure::DurableMigrated(_))) => {
-            (session, true)
-        }
-        (Some(session), Err(LocalFailure::Other)) => (session, false),
-        (None, Err(LocalFailure::Corrupt | LocalFailure::Other)) => {
-            return Err(StorageError::from(crate::errors::AddressNotFound::from(
-                address,
-            )));
-        }
-    };
+        let remote = if remote_in_reach(remote_session.as_ref(), options) {
+            remote_session
+        } else {
+            None
+        };
+        // The failure is consumed here rather than kept, so the future does not carry it across the
+        // fetch.
+        let (session, local_replace) = match (remote, probed) {
+            (_, Ok((fragment, payload))) => return Ok((fragment, payload)),
+            (_, Err(LocalFailure::Fatal(err))) => return Err(err),
+            (None, Err(failure)) => {
+                return Err(failure.error_without_remote(address, options.strict_local));
+            }
+            (Some(session), Err(LocalFailure::Corrupt(_) | LocalFailure::DurableMigrated(_))) => {
+                (session, true)
+            }
+            (Some(session), Err(LocalFailure::Missing | LocalFailure::Failed(_))) => {
+                (session, false)
+            }
+        };
 
-    fetch_single_flight(
-        store.clone(),
-        partition,
-        address,
-        options,
-        || {
-            fetch_and_store(
-                store.clone(),
-                partition,
-                address,
-                options,
-                session.clone(),
-                local_replace,
-            )
-        },
-        || {},
-    )
-    .await
-    .map(|flown| flown.take(options.decompress))
+        Box::pin(fetch_single_flight(
+            store.clone(),
+            partition,
+            address,
+            options,
+            Keep::of(options, local_replace),
+            || fetch_remote(session.as_ref(), address, options),
+            || {},
+        ))
+        .await
+        .and_then(|flown| flown.take(options.decompress))
+    }
 }
 
-/// A remote fetch's result ([`fetch_remote`]).
+/// A payload as loaded, from a store ([`read_raw`]) or a remote ([`fetch_remote`]), with the
+/// content it expands to where the load expanded it.
 #[derive(Clone, Debug)]
-pub struct Fetched {
-    /// The content, expanded and verified on receipt, and the fragment describing it.
-    pub content: (Fragment, Bytes),
-    /// The payload as fetched, and its fragment, marked durable: the stored form.
+pub struct Loaded {
+    /// The content the check on receipt expanded, and the fragment describing it: always from an
+    /// untrusted remote, verified, from a trusted one only where the fetch asked to decompress, and
+    /// from a store where it checked the payload ([`StoreGetData::content`]).
+    ///
+    /// [`StoreGetData::content`]: crate::store_types::StoreGetData::content
+    pub content: Option<(Fragment, Bytes)>,
+    /// The payload in its stored form, and its fragment, marked durable where [`fetch_remote`]
+    /// fetched it.
     pub raw: (Fragment, Bytes),
 }
 
-impl Fetched {
-    /// The content when `decompress`, the payload as fetched otherwise.
-    fn take(self, decompress: bool) -> (Fragment, Bytes) {
-        if decompress { self.content } else { self.raw }
+impl Loaded {
+    /// The content when `decompress`, expanded here where the load did not, and the payload as
+    /// stored otherwise.
+    pub fn take(self, decompress: bool) -> Result<(Fragment, Bytes), StorageError> {
+        match (decompress, self.content) {
+            (false, _) => Ok(self.raw),
+            (true, Some(content)) => Ok(content),
+            (true, None) => expand_payload(self.raw.0, self.raw.1),
+        }
     }
 }
 
@@ -532,104 +740,156 @@ impl Fetched {
 #[derive(Debug)]
 pub enum Flown {
     /// A fetch checked on receipt, the caller's own or the one it followed.
-    Fetched(Fetched),
-    /// The payload as fetched and marked durable, unchecked ([`fetch_payload`]): a fetch of the
-    /// caller's own that no follower joined, so nothing asked for it to be checked.
-    Unverified((Fragment, Bytes)),
-    /// The payload as fetched, which failed the check a follower's join asked for: nothing was
-    /// published, so the followers fetch for themselves.
-    Rejected((Fragment, Bytes)),
+    Fetched(Loaded),
+    /// A fetch checked on receipt that the caller, leading its flight, stored in its store.
+    Stored(Loaded),
     /// The local store's copy, in the form `options` asks, found after the leader failed on another
     /// address.
     Local((Fragment, Bytes)),
 }
 
 impl Flown {
-    /// The content when `decompress`, the payload as fetched otherwise, the payload unchecked or
-    /// rejected, or the local copy as found.
-    pub fn take(self, decompress: bool) -> (Fragment, Bytes) {
+    /// The fetch taken as [`Loaded::take`] does, or the local copy as found.
+    pub fn take(self, decompress: bool) -> Result<(Fragment, Bytes), StorageError> {
         match self {
-            Self::Fetched(fetched) => fetched.take(decompress),
-            Self::Unverified(raw) | Self::Rejected(raw) => raw,
-            Self::Local(found) => found,
+            Self::Fetched(fetched) | Self::Stored(fetched) => fetched.take(decompress),
+            Self::Local(found) => Ok(found),
         }
     }
 }
 
-/// Runs `fetch` for concurrent callers missing the content `address` names: the first becomes the
-/// leader and fetches, and the rest follow its outcome, whatever their context, and whatever their
-/// partition where the store does not isolate partitions. A follower takes the leader's error only
-/// where it asked for the leader's own partition and address; one whose leader failed on another
-/// address probes the local store, unless `options.local` is off, and fetches itself when nothing
-/// is there.
+/// Runs `fetch` for concurrent callers missing the content `address` names in `store`: the first
+/// becomes the leader and fetches, and the rest follow its outcome, whatever their context and
+/// store, and whatever their partition where the store does not isolate partitions. A caller
+/// follows only a leader with the same [`ReadOptions::trust_remote`], so no caller takes a payload
+/// checked less than it asks, and the same [`ReadOptions::no_local_write`], so no caller that stores
+/// nothing locally shares a flight with one that does. `keep` is what the caller keeps of the fetch
+/// in `store`. The leader stores its fetch in its store as its own `keep` and those of its
+/// followers reading its partition and address there ask (`ReadFlightGuard::take_keep`), with one
+/// put: before it hands the fetch to them where the put stores the payload, and after where it
+/// writes the fragment without it ([`store_fetched`]). Any other follower stores the fetch itself,
+/// within its own use of its store. A caller with no `keep`, such as a read with `no_local_write`, has nothing
+/// stored for it by the flight. A follower takes the leader's error only where it asked for the
+/// leader's own partition and address; one whose leader failed on another address probes the local
+/// store, unless `options.local` is off, and fetches and stores itself when nothing is there.
 ///
 /// Followers share the leader's fetch rather than copy it, and the leader hands it over only when
-/// a follower is subscribed. A leader whose `fetch` answers a payload unchecked checks it only
-/// then ([`ReadFlightGuard::complete_unverified`](crate::read_flight::ReadFlightGuard::complete_unverified)).
-/// `on_follow` runs when the caller first joins as a follower, before it waits, so a caller holding
-/// what only its own fetch needs gives it back there.
-pub async fn fetch_single_flight<F, Fut, G>(
+/// a follower is subscribed. `on_follow` runs when the caller first joins as a follower, before it
+/// waits, so a caller holding what only its own fetch needs gives it back there.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn fetch_single_flight<F, Fut, G>(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     options: ReadOptions,
+    keep: Option<Keep>,
     fetch: F,
     on_follow: G,
-) -> Result<Flown, StorageError>
+) -> impl Future<Output = Result<Flown, StorageError>>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = Result<Flown, StorageError>>,
+    Fut: std::future::Future<Output = Result<Loaded, StorageError>>,
     G: FnOnce(),
 {
-    let isolate_partitions = store.isolates_partitions();
-    let mut on_follow = Some(on_follow);
-    loop {
-        match crate::read_flight::join_read_flight(partition, address, isolate_partitions) {
-            crate::read_flight::ReadFlight::Leader(guard) => {
-                let result = match fetch().await {
-                    Ok(Flown::Unverified(raw)) => {
-                        return Ok(guard.complete_unverified(address, raw));
-                    }
-                    Ok(Flown::Fetched(fetched)) => Ok(fetched),
-                    Ok(local) => return Ok(local),
-                    Err(err) => Err(err),
-                };
-                guard.complete(&result);
-                return result.map(Flown::Fetched);
-            }
-            crate::read_flight::ReadFlight::Follower(follower) => {
-                if let Some(on_follow) = on_follow.take() {
-                    on_follow();
-                }
-                let own = follower.led_by(partition, address);
-                match crate::read_flight::await_flight(follower).await {
-                    Some(Ok(fetched)) => return Ok(Flown::Fetched(fetched)),
-                    Some(Err(err)) if own => return Err(err),
-                    Some(Err(_)) => {
-                        if let Ok(found) =
-                            probe_local(store.clone(), partition, address, options).await
-                        {
-                            return Ok(Flown::Local(found));
+    async move {
+        let isolate_partitions = store.read_scope() != StoreMatch::MatchHash;
+        let mut on_follow = Some(on_follow);
+        loop {
+            match crate::read_flight::join_read_flight(
+                crate::write::FlightStore::of(store.as_ref()),
+                keep,
+                partition,
+                address,
+                isolate_partitions,
+                options,
+            ) {
+                crate::read_flight::ReadFlight::Leader(guard) => {
+                    let result = fetch().await;
+                    let stored = if let Ok(fetched) = &result {
+                        let kept = guard.take_keep();
+                        let stores = kept.is_some_and(|keep| {
+                            fetch_is_stored(keep >= Keep::Store, &fetched.raw.0)
+                        });
+                        // An entry without its payload only spares a later write a round trip,
+                        // so the followers have the fetch before it is written rather than wait
+                        // for the index write.
+                        let guard = if stores {
+                            Some(guard)
+                        } else {
+                            guard.complete(&result);
+                            None
+                        };
+                        let stored = store_fetched(
+                            &store,
+                            partition,
+                            address,
+                            fetched.raw.0,
+                            Some(&fetched.raw.1),
+                            kept,
+                        )
+                        .await;
+                        if let Some(guard) = guard {
+                            guard.complete(&result);
                         }
-                        return fetch().await;
+                        stored
+                    } else {
+                        guard.complete(&result);
+                        false
+                    };
+                    return result.map(if stored {
+                        Flown::Stored
+                    } else {
+                        Flown::Fetched
+                    });
+                }
+                crate::read_flight::ReadFlight::Follower(follower) => {
+                    if let Some(on_follow) = on_follow.take() {
+                        on_follow();
                     }
-                    None => {}
+                    let own = follower.same_address();
+                    let kept = follower.kept();
+                    match crate::read_flight::await_flight(follower).await {
+                        Some(Ok(fetched)) => {
+                            if !kept {
+                                let _ = store_fetched(
+                                    &store,
+                                    partition,
+                                    address,
+                                    fetched.raw.0,
+                                    Some(&fetched.raw.1),
+                                    keep,
+                                )
+                                .await;
+                            }
+                            return Ok(Flown::Fetched(fetched));
+                        }
+                        Some(Err(err)) if own => return Err(err),
+                        Some(Err(_)) => {
+                            if let Ok(found) =
+                                probe_local(store.clone(), partition, address, options).await
+                            {
+                                return Ok(Flown::Local(found));
+                            }
+                            let fetched = fetch().await?;
+                            let _ = store_fetched(
+                                &store,
+                                partition,
+                                address,
+                                fetched.raw.0,
+                                Some(&fetched.raw.1),
+                                keep,
+                            )
+                            .await;
+                            return Ok(Flown::Fetched(fetched));
+                        }
+                        None => {}
+                    }
                 }
             }
         }
     }
-}
-
-/// Load a single raw fragment from local store, optionally decompressing and verifying.
-/// Does not reassemble fragmented data or fallback to remote.
-/// Thin wrapper around [`load_fragment`] with no remote session.
-pub async fn load_raw_local(
-    store: Arc<dyn ImmutableStore>,
-    partition: Partition,
-    address: Address,
-    options: ReadOptions,
-) -> Result<(Fragment, Bytes), StorageError> {
-    load_fragment(store, partition, address, options, None).await
 }
 
 /// Resolve a caller's content range against the content that actually exists.
@@ -653,92 +913,115 @@ pub fn resolve_content_range(range: Option<Range<usize>>, size_content: u64) -> 
     }
 }
 
+/// Refuses content larger than `max_content_size` allows, `fragment` describing it.
+fn check_max_content_size(
+    fragment: &Fragment,
+    max_content_size: Option<u64>,
+) -> Result<(), StorageError> {
+    match max_content_size {
+        Some(max) if fragment.size_content > max => {
+            Err(StorageError::from(crate::errors::Oversized {
+                context: format!(
+                    "fragment size_content {} exceeds caller-supplied max {max}",
+                    fragment.size_content
+                ),
+            }))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The root fragment `address` names and its payload, loaded expanded ([`load_fragment`]), refusing
+/// content larger than `options.max_content_size` allows.
+///
+/// Returns the load's future mapped through the check, without a future of its own.
+#[inline]
+pub fn load_root(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    options: ReadOptions,
+    remote_session: Option<Arc<StorageSession>>,
+) -> impl Future<Output = Result<(Fragment, Bytes), StorageError>> {
+    let max_content_size = options.max_content_size;
+    futures::FutureExt::map(
+        load_fragment(
+            store,
+            partition,
+            address,
+            options.with_decompress(),
+            remote_session,
+        ),
+        move |loaded| {
+            loaded.and_then(|(fragment, buffer)| {
+                check_max_content_size(&fragment, max_content_size).map(|()| (fragment, buffer))
+            })
+        },
+    )
+}
+
 /// Read content (defragmenting if needed) into a `Bytes` buffer, returning the fragment
 /// describing the whole content alongside the bytes the range asked for.
 ///
 /// The fragment comes back because the bytes alone no longer say how much content there is:
 /// with a range, `size_content` is what exists and the buffer length is what was asked for.
-pub async fn read(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn read(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     range: Option<Range<usize>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<(Fragment, Bytes), StorageError> {
-    let options = options.with_decompress();
-    let (fragment, buffer) = load_fragment(
-        store.clone(),
-        partition,
-        address,
-        options,
-        remote_session.clone(),
-    )
-    .await?;
-
-    if let Some(max) = options.max_content_size
-        && fragment.size_content > max
-    {
-        return Err(StorageError::from(crate::errors::Oversized {
-            context: format!(
-                "fragment size_content {} exceeds caller-supplied max {max}",
-                fragment.size_content
-            ),
-        }));
-    }
-
-    let range = resolve_content_range(range, fragment.size_content);
-    if range.is_empty() {
-        return Ok((fragment, Bytes::default()));
-    }
-
-    if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
-        let mut target_buffer = BytesMut::with_capacity(range.len());
-        unsafe {
-            target_buffer.set_len(range.len());
-        }
-        let target_size = target_buffer.len();
-        let target = target_buffer.split();
-        read_defragment(
+) -> impl Future<Output = Result<(Fragment, Bytes), StorageError>> {
+    async move {
+        let (fragment, buffer) = load_root(
+            store.clone(),
+            partition,
+            address,
+            options,
+            remote_session.clone(),
+        )
+        .await?;
+        let content = read_root_content(
             store,
             partition,
             address,
-            range,
             fragment,
             buffer,
-            target,
-            options,
-            0,
+            range,
+            options.with_decompress(),
             remote_session,
         )
         .await?;
-        if !target_buffer.try_reclaim(target_size) {
-            return Err(StorageError::internal(
-                "failed to reclaim buffer after defragmenting",
-            ));
-        }
-        unsafe {
-            target_buffer.set_len(target_size);
-        }
-        Ok((fragment, target_buffer.freeze()))
-    } else {
-        Ok((fragment, buffer.slice(range)))
+        Ok((fragment, content))
     }
 }
 
-/// Read content into a pre-allocated buffer with offset/length, verifying it when `options.verify`
-/// is set.
+/// Read the `range` of the content stored under `address` into `slice`, which the content the range
+/// selects must fill exactly ([`fills_slice`]); a range selecting none leaves `slice` untouched.
+/// A local root's fragment settles that before the root is decoded, and any root settles it before
+/// the rest of the content is read.
 ///
-/// A whole read of one compressed fragment the local store holds expands into `slice` and is
-/// verified there, allocating nothing of the content's size; any other payload the local store
-/// holds is expanded and verified once before its range is copied in. A payload the local store
-/// cannot read is loaded through [`load_fragment`], which reads it locally where a store of it may
-/// have landed meanwhile ([`stored_since`]) and fetches it from the remote otherwise, and one that
-/// fails to expand or verify is loaded through it again, which replaces the local copy from the
-/// remote. That load is boxed, as only a cache miss or a corrupt payload takes it.
+/// Every write into `slice` happens within this future, so one dropped part-way leaves nothing
+/// writing to it. A local compressed payload whose sizes check ([`check_payload_sizes`]) and whose
+/// whole content the range covers is decompressed into `slice` ([`decompress_whole_into`]), unless
+/// the store expanded it already; any other content is read as [`read`] reads it, into memory of
+/// its own, and copied in once. A payload that expands is read from the local store once. The root
+/// is loaded again ([`load_fragment`]) only for a miss, a failed read or a payload that does not
+/// expand, and that load probes the local store again for a held payload, for a failed read whose
+/// error `options.strict_local` asks for where the load has no remote in reach
+/// ([`remote_in_reach`]), or where a store of it may have landed since ([`stored_since`]). A
+/// payload the store answers `NotSupported` for fails the read, as it fails [`load_fragment`]. The
+/// zero hash names empty content and asks no store.
 ///
 /// The contents of `slice` are unspecified when this fails.
-pub async fn read_into(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn read_into(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -746,172 +1029,123 @@ pub async fn read_into(
     slice: &mut [u8],
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<(), StorageError> {
-    let (fragment, buffer) = {
-        let probes = options.local && !address.hash.is_zero();
+) -> impl Future<Output = Result<(), StorageError>> {
+    async move {
+        if address.hash.is_zero() {
+            return Ok(());
+        }
         let landed = landed_before_probe(address, options);
-        let stored = if probes {
-            read_raw(
+        let (reprobe, expanded) = {
+            let (stored, strict_failure) = if options.local {
+                match read_raw(store.clone(), partition, address).await {
+                    Ok(loaded) => (Some(loaded), false),
+                    Err(err) if err.is_not_supported() => return Err(err),
+                    Err(err) => (
+                        None,
+                        !err.is_address_not_found()
+                            && strict_error_asked(remote_session.as_ref(), options),
+                    ),
+                }
+            } else {
+                (None, false)
+            };
+            if let Some(loaded) = &stored
+                && check_payload_sizes(&loaded.raw.0, loaded.raw.1.len()).is_ok()
+            {
+                let (fragment, payload) = &loaded.raw;
+                check_max_content_size(fragment, options.max_content_size)?;
+                if !fills_slice(
+                    slice,
+                    resolve_content_range(range.clone(), fragment.size_content).len(),
+                )? {
+                    return Ok(());
+                }
+                if loaded.content.is_none()
+                    && decompress_whole_into(*fragment, payload, range.clone(), slice)
+                {
+                    return Ok(());
+                }
+            }
+            (
+                stored.is_some() || strict_failure,
+                stored.and_then(|loaded| loaded.take(true).ok()),
+            )
+        };
+        let (fragment, buffer) = if let Some(content) = expanded {
+            content
+        } else {
+            let local = reprobe || stored_since(store.as_ref(), partition, address, landed).await;
+            load_root(
                 store.clone(),
                 partition,
                 address,
-                options.verify || options.trust_local,
+                if local { options } else { options.no_local() },
+                remote_session.clone(),
             )
-            .await
-            .ok()
-        } else {
-            None
+            .await?
         };
-
-        if let Some((fragment, buffer)) = &stored
-            && slice.len() as u64 == fragment.size_content
-            && resolve_content_range(range.clone(), fragment.size_content).len() == slice.len()
-            && options
-                .max_content_size
-                .is_none_or(|max| fragment.size_content <= max)
-            && (fragment.flags & FragmentFlags::PayloadFragmented)
-                != FragmentFlags::PayloadFragmented
-            && (fragment.flags & FragmentFlags::PayloadCompressed) != 0
-            && compress::decompress_into_slice(*fragment, buffer, slice).is_ok()
-            && (!options.verify || hash::hash_slice(slice) == address.hash)
-        {
+        if !fills_slice(
+            slice,
+            resolve_content_range(range.clone(), fragment.size_content).len(),
+        )? {
             return Ok(());
         }
-
-        match stored.map(|(fragment, buffer)| {
-            decompress_and_verify(fragment, buffer, address, options.with_decompress())
-        }) {
-            Some(Ok(content)) => content,
-            loaded => {
-                let reprobe =
-                    loaded.is_some() || (probes && stored_since(partition, address, landed).await);
-                let options = if reprobe {
-                    options.with_decompress()
-                } else {
-                    options.with_decompress().no_local()
-                };
-                Box::pin(load_fragment(
-                    store.clone(),
-                    partition,
-                    address,
-                    options,
-                    remote_session.clone(),
-                ))
-                .await?
-            }
-        }
-    };
-
-    if let Some(max) = options.max_content_size
-        && fragment.size_content > max
-    {
-        return Err(StorageError::from(crate::errors::Oversized {
-            context: format!(
-                "fragment size_content {} exceeds caller-supplied max {max}",
-                fragment.size_content
-            ),
-        }));
-    }
-
-    let range = resolve_content_range(range, fragment.size_content);
-    if range.is_empty() {
-        return Ok(());
-    }
-    if slice.len() != range.len() {
-        return Err(StorageError::internal(format!(
-            "unexpected size: slice {} vs range {}",
-            slice.len(),
-            range.len()
-        )));
-    }
-
-    if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
-        let content_size = range.len();
-        let mut content = BytesMut::with_capacity(content_size);
-        unsafe {
-            content.set_len(content_size);
-        }
-        let target = content.split();
-        read_defragment(
+        let content = read_root_content(
             store,
             partition,
             address,
-            range,
             fragment,
             buffer,
-            target,
+            range,
             options.with_decompress(),
-            0,
             remote_session,
         )
         .await?;
-        if !content.try_reclaim(content_size) {
-            return Err(StorageError::internal(
-                "failed to reclaim buffer after defragmenting",
-            ));
-        }
-        unsafe {
-            content.set_len(content_size);
-        }
-        if slice.len() != content.len() {
-            return Err(StorageError::internal(format!(
-                "unexpected size: slice {} vs content {}",
-                slice.len(),
-                content.len()
-            )));
-        }
-        slice.copy_from_slice(content.as_ref());
-    } else {
-        let buffer = buffer.slice(range);
-        if slice.len() != buffer.len() {
-            return Err(StorageError::internal(format!(
-                "unexpected size: slice {} vs buffer {}",
-                slice.len(),
-                buffer.len()
-            )));
-        }
-        slice.copy_from_slice(buffer.as_ref());
+        destination(slice, content.len())?.copy_from_slice(&content);
+        Ok(())
     }
-    Ok(())
 }
 
-/// Whether the `size` bytes of content sitting in `dst` hash to the address they were read from.
-///
-/// A `dst` holding fewer than `size` bytes fails rather than being read past: the content it holds
-/// is not the content the address names either way.
-fn content_verifies(size: usize, address: Address, dst: &mut crate::CallerBuffer) -> bool {
-    let Some(content) = dst.as_mut_slice().get_mut(..size) else {
-        lore_base::lore_debug!(
-            "Fragment {} claims {size} bytes of content, more than its destination holds",
-            address.hash
-        );
-        return false;
-    };
-
-    let content_hash = hash::hash_slice(content);
-    if content_hash != address.hash {
-        lore_base::lore_debug!(
-            "Fragment {} failed verification in caller buffer, got {content_hash}",
-            address.hash
-        );
-        return false;
-    }
-    true
+/// Decompresses a compressed payload other than a fragment list into `slice` where `range` covers
+/// its whole content and `slice` holds exactly that, answering whether it did.
+fn decompress_whole_into(
+    fragment: Fragment,
+    payload: &[u8],
+    range: Option<Range<usize>>,
+    slice: &mut [u8],
+) -> bool {
+    let size_content = fragment.size_content as usize;
+    (fragment.flags & FragmentFlags::PayloadCompressed) != 0
+        && (fragment.flags & FragmentFlags::PayloadFragmented) != FragmentFlags::PayloadFragmented
+        && slice.len() == size_content
+        && resolve_content_range(range, fragment.size_content).len() == size_content
+        && compress::decompress_into_slice(fragment, payload, slice).is_ok()
 }
 
-/// Copy `bytes` into the start of `dst`, refusing content the destination has no room for rather
-/// than truncating it.
+/// Whether content of `len` bytes fills `slice` exactly. No content answers `false`, content longer
+/// than `slice` is `Oversized`, as [`destination`] refuses it, and shorter content fails.
+fn fills_slice(slice: &mut [u8], len: usize) -> Result<bool, StorageError> {
+    let capacity = slice.len();
+    match len {
+        0 => Ok(false),
+        len if len < capacity => Err(StorageError::internal(format!(
+            "unexpected size: slice {capacity} vs content {len}"
+        ))),
+        len => destination(slice, len).map(|_| true),
+    }
+}
+
+/// The first `len` bytes of `dst`, refusing content the destination has no room for rather than
+/// truncating it ([`crate::validate_buffer_capacity`]).
+fn destination(dst: &mut [u8], len: usize) -> Result<&mut [u8], StorageError> {
+    crate::validate_buffer_capacity(len, dst.len())
+        .forward::<StorageError>("writing content into the caller's memory")?;
+    Ok(&mut dst[..len])
+}
+
+/// Copy `bytes` into the start of `dst`, as [`destination`] bounds it.
 fn copy_into_buffer(bytes: &[u8], dst: &mut crate::CallerBuffer) -> Result<usize, StorageError> {
-    let capacity = dst.len();
-    let Some(target) = dst.as_mut_slice().get_mut(..bytes.len()) else {
-        return Err(StorageError::from(crate::errors::Oversized {
-            context: format!(
-                "content of {} bytes exceeds the {capacity} byte destination buffer",
-                bytes.len()
-            ),
-        }));
-    };
-    target.copy_from_slice(bytes);
+    destination(dst.as_mut_slice(), bytes.len())?.copy_from_slice(bytes);
     Ok(bytes.len())
 }
 
@@ -920,7 +1154,7 @@ fn copy_into_buffer(bytes: &[u8], dst: &mut crate::CallerBuffer) -> Result<usize
 /// An address the caller named is authoritative, so the remote may serve it. A hash a local mutable
 /// mapping resolved to is not: the mapping is trusted as it stands and may name content the key has
 /// since moved off, so reading that hash from the remote would answer with content the key no
-/// longer names. [`read_resolved`] re-resolves against the remote instead, which costs the same
+/// longer names. [`resolve_root`] re-resolves against the remote instead, which costs the same
 /// round trip and answers against the authoritative mapping.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum RootSource {
@@ -932,20 +1166,32 @@ pub(crate) enum RootSource {
 enum BufferPayload {
     /// `dst` holds the content.
     Placed,
-    /// The payload as the local store holds it, still to be turned into content.
+    /// The bytes the store returned, as stored or as it expanded them on receipt, still to be
+    /// turned into content.
     Stored(Bytes),
-    /// Content [`load_fragment`] expanded: read locally once a store in flight landed, or fetched
-    /// and verified on receipt.
+    /// Content [`load_fragment`] expanded: read locally again ([`content_payload_for_buffer`]), or
+    /// fetched and checked on receipt.
     Fetched(Bytes),
 }
 
-/// The payload stored under `address`, put in `dst` when the local store could place it there,
-/// and handed back otherwise: as the local store holds it, or as content [`load_fragment`]
-/// expanded. With a remote in reach, a local miss waits for a store of the address in flight, as
-/// [`stored_since`] describes, and probes the local store again through [`load_fragment`] only
-/// where one may have landed. `None` when the local store does not hold it and no remote is in
-/// reach; a remote fetch that fails is an error, since it already verified and healed.
-async fn content_payload_for_buffer(
+/// The payload stored under `address`, put in `dst` when the local store could place it there, and
+/// handed back otherwise: as the store returned it, or as content [`load_fragment`] expanded.
+/// `None` for a root only the local store may supply ([`RootSource::LocalOnly`]) that it did not
+/// place or return, with no wait and no second probe.
+///
+/// For any other root, a local miss waits for a store of the address in flight, as [`stored_since`]
+/// describes, and probes the local store again through [`load_fragment`] only where one may have
+/// landed, fetching from the remote otherwise where one is in reach. A placement the store answers
+/// `SlowDown` is probed again through it as well, which retries, as is one that fails other than as
+/// a miss ([`StoreError::is_absent`]) where `options.strict_local` asks for its error and no remote
+/// is in reach ([`remote_in_reach`]); one it answers `Oversized` or `NotSupported` fails the read,
+/// and one that fails for any other reason is a miss. That load is boxed, as only a miss or a
+/// failed placement takes it. A miss with no remote in reach is `AddressNotFound`, and a remote
+/// fetch that fails is an error, since it already checked and healed.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn content_payload_for_buffer(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -953,44 +1199,50 @@ async fn content_payload_for_buffer(
     options: ReadOptions,
     root: RootSource,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<Option<(Fragment, BufferPayload)>, StorageError> {
-    let landed = landed_before_probe(address, options);
-    if options.local {
-        match store.clone().get_into(partition, address, dst).await {
-            Ok((fragment, PayloadRead::IntoBuffer)) => {
-                return Ok(Some((fragment, BufferPayload::Placed)));
-            }
-            Ok((fragment, PayloadRead::Returned(payload))) => {
-                return Ok(Some((fragment, BufferPayload::Stored(payload))));
-            }
-            // Forwarded rather than rebuilt: rebuilding put the old error's whole `Display` in
-            // the new one's context, so the caller read "Oversized: Oversized: ...".
-            Err(err) if err.is_oversized() => {
-                return Err(err).forward("reading the content into the caller's buffer");
-            }
-            Err(err) => {
-                lore_base::lore_trace!(
-                    "Fragment {} failed loading into caller buffer: {err:?}",
-                    address.hash
-                );
+) -> impl Future<Output = Result<Option<(Fragment, BufferPayload)>, StorageError>> {
+    async move {
+        let landed = landed_before_probe(address, options);
+        let mut reprobe = false;
+        if options.local {
+            match store.clone().get_into(partition, address, dst).await {
+                Ok((fragment, PayloadRead::IntoBuffer)) => {
+                    return Ok(Some((fragment, BufferPayload::Placed)));
+                }
+                Ok((fragment, PayloadRead::Returned(payload))) => {
+                    return Ok(Some((fragment, BufferPayload::Stored(payload))));
+                }
+                // Forwarded, not rebuilt, so the error's text appears once rather than nested in a
+                // context of its own.
+                Err(err) if err.is_oversized() || err.is_not_supported() => {
+                    return Err(err).forward("reading the content into the caller's buffer");
+                }
+                Err(err) => {
+                    lore_base::lore_trace!(
+                        "Fragment {} failed loading into caller buffer: {err:?}",
+                        address.hash
+                    );
+                    reprobe = err.is_slow_down()
+                        || (!err.is_absent()
+                            && strict_error_asked(remote_session.as_ref(), options));
+                }
             }
         }
-    }
 
-    // No remote in reach: the caller's fallback loads the root through `load_fragment`, which
-    // waits for a store in flight and probes again.
-    if root == RootSource::LocalOnly || !options.remote || remote_session.is_none() {
-        return Ok(None);
-    }
+        if root == RootSource::LocalOnly {
+            return Ok(None);
+        }
 
-    let options = if stored_since(partition, address, landed).await {
-        options.with_decompress()
-    } else {
-        options.with_decompress().no_local()
-    };
-    let (fragment, content) =
-        load_fragment(store, partition, address, options, remote_session).await?;
-    Ok(Some((fragment, BufferPayload::Fetched(content))))
+        let local = reprobe || stored_since(store.as_ref(), partition, address, landed).await;
+        let (fragment, content) = Box::pin(load_fragment(
+            store,
+            partition,
+            address,
+            if local { options } else { options.no_local() },
+            remote_session,
+        ))
+        .await?;
+        Ok(Some((fragment, BufferPayload::Fetched(content))))
+    }
 }
 
 /// Read the whole content stored under `address` into `dst`, reporting the fragment describing it
@@ -998,17 +1250,18 @@ async fn content_payload_for_buffer(
 ///
 /// A local payload lands where it belongs: one that is the content is read into `dst`, a
 /// compressed one expands into `dst`, and a fragment list is the root the walk starts from, its
-/// leaves written into `dst` in place. Remote content arrives expanded and verified on receipt and
-/// is copied into `dst` once. No payload is read twice.
+/// leaves written into `dst` in place. Remote content arrives expanded and checked on receipt and
+/// is copied into `dst` once. No payload placed or expanded here is read again.
 ///
-/// `None` leaves the read to the assembling path, which loads the root itself and so verifies and
-/// heals: the local store did not hold the content and no remote is in reach, what the local store
-/// held did not survive expansion or verification, or what it held is larger than
-/// `options.max_content_size` allows, which that path reports. A remote fetch that fails, fetched
-/// content larger than `options.max_content_size` allows, and a destination too small for the
-/// content, fail the read.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn read_content_into_buffer(
+/// `None` leaves the read to the assembling path, which loads the root itself and so refetches and
+/// heals: the local store did not place or return a root only it may supply, or what it held fails
+/// its size check or did not survive expansion. A miss with no remote in reach, a remote fetch that
+/// fails, a payload the store answers `NotSupported` for, content larger than
+/// `options.max_content_size` allows, and a destination too small for the content, fail the read.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+pub(crate) fn read_content_into_buffer(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -1017,130 +1270,99 @@ pub(crate) async fn read_content_into_buffer(
     root: RootSource,
     depth: usize,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<Option<(Fragment, usize)>, StorageError> {
-    let options = options.with_decompress();
-    let Some((fragment, payload)) = content_payload_for_buffer(
-        store.clone(),
-        partition,
-        address,
-        dst,
-        options,
-        root,
-        remote_session.clone(),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-
-    if let Some(max) = options.max_content_size
-        && fragment.size_content > max
-    {
-        if matches!(payload, BufferPayload::Fetched(_)) {
-            return Err(StorageError::from(crate::errors::Oversized {
-                context: format!(
-                    "fragment size_content {} exceeds caller-supplied max {max}",
-                    fragment.size_content
-                ),
-            }));
+) -> impl Future<Output = Result<Option<(Fragment, usize)>, StorageError>> {
+    async move {
+        let Some((fragment, payload)) = content_payload_for_buffer(
+            store.clone(),
+            partition,
+            address,
+            dst,
+            options.with_decompress(),
+            root,
+            remote_session.clone(),
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        if let BufferPayload::Stored(stored) = &payload
+            && check_payload_sizes(&fragment, stored.len()).is_err()
+        {
+            return Ok(None);
         }
-        return Ok(None);
-    }
 
-    let size_content = fragment.size_content as usize;
-    let payload = match payload {
-        BufferPayload::Placed => {
-            if options.verify && !content_verifies(size_content, address, dst) {
-                return Ok(None);
+        check_max_content_size(&fragment, options.max_content_size)?;
+
+        let size_content = fragment.size_content as usize;
+        let payload = match payload {
+            BufferPayload::Placed => return Ok(Some((fragment, size_content))),
+            BufferPayload::Fetched(content) => {
+                let written = deliver_root_into_buffer(
+                    store,
+                    partition,
+                    address,
+                    None,
+                    fragment,
+                    content,
+                    dst,
+                    options.with_decompress(),
+                    depth,
+                    remote_session,
+                )
+                .await?;
+                return Ok(Some((fragment, written)));
             }
-            return Ok(Some((fragment, size_content)));
+            BufferPayload::Stored(payload) => payload,
+        };
+
+        if (fragment.flags & FragmentFlags::PayloadCompressed) != 0 {
+            // Sized to the content rather than to the whole destination: the expansion is bounded
+            // by the slice it is given, and that bound reaches the decompressor as a `c_int`.
+            let target = destination(dst.as_mut_slice(), size_content)?;
+            let expanded = match compress::decompress_into_slice(fragment, &payload, target) {
+                Ok(expanded) => expanded,
+                Err(err) => {
+                    lore_base::lore_debug!(
+                        "Fragment {} failed decompression into caller buffer: {err:?}",
+                        address.hash
+                    );
+                    return Ok(None);
+                }
+            };
+            return Ok(Some((expanded, expanded.size_content as usize)));
         }
-        BufferPayload::Fetched(content) => {
-            let written = deliver_root_into_buffer(
-                store,
-                partition,
-                address,
-                None,
-                fragment,
-                content,
-                dst,
-                options,
-                depth,
-                remote_session,
-            )
-            .await?;
+
+        if (fragment.flags & FragmentFlags::PayloadFragmented) != FragmentFlags::PayloadFragmented {
+            let written = copy_into_buffer(&payload, dst)?;
             return Ok(Some((fragment, written)));
         }
-        BufferPayload::Stored(payload) => payload,
-    };
 
-    if (fragment.flags & FragmentFlags::PayloadCompressed) != 0 {
-        let capacity = dst.len();
-        // Sized to the content rather than to the whole destination: the expansion is bounded by
-        // the slice it is given, and that bound reaches the decompressor as a `c_int`.
-        let Some(target) = dst.as_mut_slice().get_mut(..size_content) else {
-            return Err(StorageError::from(crate::errors::Oversized {
-                context: format!(
-                    "content of {size_content} bytes exceeds the {capacity} byte destination buffer"
-                ),
-            }));
-        };
-        let expanded = match compress::decompress_into_slice(fragment, &payload, target) {
-            Ok(expanded) => expanded,
+        let (root, list) = match expand_payload(fragment, payload) {
+            Ok(result) => result,
             Err(err) => {
                 lore_base::lore_debug!(
-                    "Fragment {} failed decompression into caller buffer: {err:?}",
+                    "Fragment {} failed to open as a list: {err:?}",
                     address.hash
                 );
                 return Ok(None);
             }
         };
-        if options.verify && !content_verifies(expanded.size_content as usize, address, dst) {
-            return Ok(None);
-        }
-        return Ok(Some((expanded, expanded.size_content as usize)));
+
+        let written = deliver_root_into_buffer(
+            store,
+            partition,
+            address,
+            None,
+            root,
+            list,
+            dst,
+            options.with_decompress(),
+            depth,
+            remote_session,
+        )
+        .await?;
+        Ok(Some((root, written)))
     }
-
-    if (fragment.flags & FragmentFlags::PayloadFragmented) != FragmentFlags::PayloadFragmented {
-        // Sizes that disagree describe no payload that is the content, which the assembling path
-        // reports against the fragment that claimed them.
-        if !crate::payload_is_content(&fragment) {
-            return Ok(None);
-        }
-        let written = copy_into_buffer(&payload, dst)?;
-        if options.verify && !content_verifies(written, address, dst) {
-            return Ok(None);
-        }
-        return Ok(Some((fragment, written)));
-    }
-
-    // Verified and expanded, the list is the root the walk starts from, so the walk never reads it
-    // again.
-    let (root, list) = match decompress_and_verify(fragment, payload, address, options) {
-        Ok(result) => result,
-        Err(err) => {
-            lore_base::lore_debug!(
-                "Fragment {} failed to open as a list: {err:?}",
-                address.hash
-            );
-            return Ok(None);
-        }
-    };
-
-    let written = deliver_root_into_buffer(
-        store,
-        partition,
-        address,
-        None,
-        root,
-        list,
-        dst,
-        options,
-        depth,
-        remote_session,
-    )
-    .await?;
-    Ok(Some((root, written)))
 }
 
 /// Deliver `range` of the content rooted at `fragment` and `buffer` into `dst`, reporting the bytes
@@ -1149,8 +1371,10 @@ pub(crate) async fn read_content_into_buffer(
 /// Content spread across fragments is walked into `dst` in place, each leaf writing where it
 /// belongs, so it is assembled nowhere else first. Content one fragment holds is already in
 /// `buffer`, so the range is cut from it and copied in once.
-#[allow(clippy::too_many_arguments)]
-async fn deliver_root_into_buffer(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn deliver_root_into_buffer(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -1161,56 +1385,45 @@ async fn deliver_root_into_buffer(
     options: ReadOptions,
     depth: usize,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<usize, StorageError> {
-    let content = resolve_content_range(range, fragment.size_content);
-    if content.is_empty() {
-        return Ok(0);
+) -> impl Future<Output = Result<usize, StorageError>> {
+    async move {
+        let content = resolve_content_range(range, fragment.size_content);
+        if content.is_empty() {
+            return Ok(0);
+        }
+
+        if (fragment.flags & FragmentFlags::PayloadFragmented) != FragmentFlags::PayloadFragmented {
+            return copy_into_buffer(&cut_content(&buffer, content)?, dst);
+        }
+
+        crate::validate_buffer_capacity(content.len(), dst.len())
+            .forward::<StorageError>("writing content into the caller's memory")?;
+        read_defragment(
+            store,
+            partition,
+            address,
+            content.clone(),
+            fragment,
+            buffer,
+            // SAFETY: `content.len()` is within `dst`, as checked above, and the holder of `dst`
+            // writes nothing through it while the prefix lives, as `CallerBuffer` requires.
+            unsafe { dst.prefix(content.len()) },
+            options,
+            depth,
+            remote_session,
+        )
+        .await?;
+
+        Ok(content.len())
     }
-
-    if (fragment.flags & FragmentFlags::PayloadFragmented) != FragmentFlags::PayloadFragmented {
-        let Some(bytes) = buffer.get(content.clone()) else {
-            return Err(StorageError::internal(format!(
-                "content range {content:?} reaches past the {} byte root",
-                buffer.len()
-            )));
-        };
-        return copy_into_buffer(bytes, dst);
-    }
-
-    let capacity = dst.len();
-    let Some(assembled) = dst.as_mut_slice().get_mut(..content.len()) else {
-        return Err(StorageError::from(crate::errors::Oversized {
-            context: format!(
-                "content of {} bytes exceeds the {capacity} byte destination buffer",
-                content.len()
-            ),
-        }));
-    };
-
-    // SAFETY: `dst` is borrowed for this whole call, so the memory the walk divides among the
-    // leaves stays valid and reaches nobody else, and the slice it is taken from bounds it.
-    let target = unsafe { crate::CallerBuffer::new(assembled.as_mut_ptr(), assembled.len()) };
-    read_defragment(
-        store,
-        partition,
-        address,
-        content.clone(),
-        fragment,
-        buffer,
-        target,
-        options,
-        depth,
-        remote_session,
-    )
-    .await?;
-
-    Ok(content.len())
 }
 
 /// [`read`] delivering into a caller-owned buffer: the root is loaded once and the content taken
 /// from it, so content spanning fragments is assembled nowhere but in `dst`.
-#[allow(clippy::too_many_arguments)]
-async fn read_range_into_buffer(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn read_range_into_buffer(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -1219,42 +1432,32 @@ async fn read_range_into_buffer(
     options: ReadOptions,
     depth: usize,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<(Fragment, usize), StorageError> {
-    let options = options.with_decompress();
-    let (fragment, buffer) = load_fragment(
-        store.clone(),
-        partition,
-        address,
-        options,
-        remote_session.clone(),
-    )
-    .await?;
+) -> impl Future<Output = Result<(Fragment, usize), StorageError>> {
+    async move {
+        let (fragment, buffer) = load_root(
+            store.clone(),
+            partition,
+            address,
+            options,
+            remote_session.clone(),
+        )
+        .await?;
 
-    if let Some(max) = options.max_content_size
-        && fragment.size_content > max
-    {
-        return Err(StorageError::from(crate::errors::Oversized {
-            context: format!(
-                "fragment size_content {} exceeds caller-supplied max {max}",
-                fragment.size_content
-            ),
-        }));
+        let written = deliver_root_into_buffer(
+            store,
+            partition,
+            address,
+            range,
+            fragment,
+            buffer,
+            dst,
+            options.with_decompress(),
+            depth,
+            remote_session,
+        )
+        .await?;
+        Ok((fragment, written))
     }
-
-    let written = deliver_root_into_buffer(
-        store,
-        partition,
-        address,
-        range,
-        fragment,
-        buffer,
-        dst,
-        options,
-        depth,
-        remote_session,
-    )
-    .await?;
-    Ok((fragment, written))
 }
 
 /// [`read`] delivering the content into a caller-owned buffer.
@@ -1266,11 +1469,15 @@ async fn read_range_into_buffer(
 /// A whole read of content one local fragment holds goes straight into `dst`, allocating nothing
 /// beyond the compressed payload where there is one; remote content arrives expanded on receipt
 /// and is copied in once. Content spanning fragments is walked into `dst` leaf by leaf. A range of
-/// content one fragment holds is cut from that fragment and copied in once. Every path verifies
-/// against the address when `options.verify` is set.
+/// content one fragment holds is cut from that fragment and copied in once. The zero hash names
+/// empty content, which writes nothing and asks no store.
 ///
-/// The contents of `dst` are unspecified when this fails.
-pub async fn read_into_buffer(
+/// The contents of `dst` are unspecified when this fails. A read dropped part-way may still write
+/// `dst` until the loan on it ([`CallerBuffer::loan`](crate::CallerBuffer::loan)) is returned.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn read_into_buffer(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -1278,53 +1485,50 @@ pub async fn read_into_buffer(
     dst: &mut crate::CallerBuffer,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<(Fragment, usize), StorageError> {
-    // A range is cut from assembled content, so only a whole read is served by the payload as the
-    // store holds it.
-    if range.is_none()
-        && let Some(read) = read_content_into_buffer(
-            store.clone(),
+) -> impl Future<Output = Result<(Fragment, usize), StorageError>> {
+    async move {
+        if address.hash.is_zero() {
+            return Ok((Fragment::default(), 0));
+        }
+        // A range is cut from assembled content, so only a whole read is served by the payload as
+        // the store holds it.
+        if range.is_none()
+            && let Some(read) = read_content_into_buffer(
+                store.clone(),
+                partition,
+                address,
+                dst,
+                options,
+                RootSource::LocalOrRemote,
+                0,
+                remote_session.clone(),
+            )
+            .await?
+        {
+            return Ok(read);
+        }
+
+        read_range_into_buffer(
+            store,
             partition,
             address,
+            range,
             dst,
             options,
-            RootSource::LocalOrRemote,
             0,
-            remote_session.clone(),
+            remote_session,
         )
-        .await?
-    {
-        return Ok(read);
+        .await
     }
-
-    read_range_into_buffer(
-        store,
-        partition,
-        address,
-        range,
-        dst,
-        options,
-        0,
-        remote_session,
-    )
-    .await
 }
 
 /// Read content into a streaming channel, returning the fragment describing the whole content
-/// and the content range that will arrive on the channel.
+/// and the content range that will arrive on the channel: [`load_root`], then [`stream_root`].
 ///
-/// The returned range is the caller's, clamped to what exists, so a caller can emit a header
-/// and account for what it receives before the first chunk lands. Chunks arrive in content
-/// order and the caller positions them at `range.start` and upwards; the range is `0..0` when
-/// nothing was asked for, and nothing is sent.
-///
-/// Ranged reads of a fragmented payload fetch only the leaves the range touches, so the work
-/// is proportional to the range rather than to the content.
-///
-/// The range returns before the leaves flow, so a failure part-way through the tree arrives on
-/// the channel as an `Err`: it is the only route by which the caller learns its content is short.
+/// Returns the two futures chained, without a future of its own.
+#[inline]
 #[allow(clippy::too_many_arguments)]
-pub async fn read_stream(
+pub fn read_stream(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -1332,54 +1536,106 @@ pub async fn read_stream(
     options: ReadOptions,
     sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<(Fragment, Range<u64>), StorageError> {
-    let options = options.with_decompress();
-    let (fragment, buffer) = load_fragment(
-        store.clone(),
-        partition,
-        address,
-        options,
-        remote_session.clone(),
-    )
-    .await?;
-
-    let range = resolve_content_range(range, fragment.size_content);
-    let streamed = range.start as u64..range.end as u64;
-    if range.is_empty() {
-        return Ok((fragment, streamed));
-    }
-
-    if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
-        let store = store.clone();
-        let pipeline_range = streamed.clone();
-        let report = sender.clone();
-        lore_base::lore_spawn!(async move {
-            let result = defragment_pipeline(
-                store,
-                partition,
-                address,
-                fragment,
-                buffer,
-                pipeline_range,
-                DefragmentSink::Stream { sender },
-                options,
-                remote_session,
+) -> impl Future<Output = Result<(Fragment, Range<u64>), StorageError>> {
+    futures::TryFutureExt::and_then(
+        load_root(
+            store.clone(),
+            partition,
+            address,
+            options,
+            remote_session.clone(),
+        ),
+        move |(fragment, buffer)| {
+            futures::TryFutureExt::map_ok(
+                stream_root(
+                    store,
+                    partition,
+                    address,
+                    fragment,
+                    buffer,
+                    range,
+                    options,
+                    sender,
+                    remote_session,
+                ),
+                move |streamed| (fragment, streamed),
             )
-            .await;
+        },
+    )
+}
 
-            if let Err(err) = result {
-                lore_base::lore_warn!("error while defragmenting during read_stream: {0}", err);
-                let _ = report.send(Err(err)).await;
-            }
-        });
+/// Stream the `range` of the content under `address` into `sender`, from its root fragment
+/// `fragment` and the expanded payload `buffer` that [`load_root`] loaded, returning the content
+/// range that will arrive on the channel.
+///
+/// The returned range is the caller's, clamped to what exists, so a caller can emit a header
+/// and account for what it receives before the first chunk lands. Chunks arrive in content
+/// order and the caller positions them at `range.start` and upwards; when the returned range is
+/// empty, nothing is sent.
+///
+/// Ranged reads of a fragmented payload fetch only the leaves the range touches, so the work
+/// is proportional to the range rather than to the content.
+///
+/// The range returns before the leaves flow, so a failure part-way through the tree arrives on
+/// the channel as an `Err`: it is the only route by which the caller learns its content is short.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+pub fn stream_root(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
+    range: Option<Range<usize>>,
+    options: ReadOptions,
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
+    remote_session: Option<Arc<StorageSession>>,
+) -> impl Future<Output = Result<Range<u64>, StorageError>> {
+    async move {
+        let range = resolve_content_range(range, fragment.size_content);
+        let streamed = range.start as u64..range.end as u64;
+        if range.is_empty() {
+            return Ok(streamed);
+        }
 
-        Ok((fragment, streamed))
-    } else {
-        sender
-            .send(Ok(buffer.slice(range)))
-            .await
-            .map_err(|_err| StorageError::internal("read stream closed"))?;
-        Ok((fragment, streamed))
+        if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
+            let store = store.clone();
+            let pipeline_range = streamed.clone();
+            let report = sender.clone();
+            let joined = store.try_join_claim();
+            lore_base::lore_spawn!(async move {
+                let claim = claim_for_task(&store, joined).await.map(Arc::new);
+                let result = defragment_pipeline(
+                    store,
+                    partition,
+                    address,
+                    fragment,
+                    buffer,
+                    pipeline_range,
+                    DefragmentSink::Stream { sender },
+                    options.with_decompress(),
+                    remote_session,
+                    claim,
+                )
+                .await;
+
+                if let Err(err) = result {
+                    lore_base::lore_warn!("error while defragmenting during stream_root: {0}", err);
+                    let _ = report.send(Err(err)).await;
+                }
+            });
+
+            Ok(streamed)
+        } else {
+            let content = cut_content(&buffer, range)?;
+            let permit = sender
+                .reserve()
+                .await
+                .map_err(|_closed| StorageError::internal("read stream closed"))?;
+            permit.send(Ok(content));
+            Ok(streamed)
+        }
     }
 }
 
@@ -1391,7 +1647,11 @@ pub async fn read_stream(
 ///
 /// Armed before the open, because a failure part-way through it can leave the file created.
 /// Disarmed after the rename because the path is derived from the destination: a guard outliving
-/// its own rename would delete the next reader's file.
+/// its own rename would delete the next reader's file. Never armed for a read that resumes
+/// ([`ReadOptions::resume_write`]): its temporary file is kept for the next read to resume from,
+/// and until the read holds the file's lock, the file is another read's. A read that falls back
+/// from resuming, its file system refusing the lock, arms it then. It removes the resume record as
+/// well, which a read that resumed may have left.
 struct TemporaryFile {
     path: Option<PathBuf>,
 }
@@ -1401,19 +1661,19 @@ impl TemporaryFile {
         Self { path: Some(path) }
     }
 
-    fn renamed(&mut self) {
+    fn disarm(&mut self) {
         self.path = None;
     }
 }
 
 impl Drop for TemporaryFile {
     fn drop(&mut self) {
-        if let Some(path) = self.path.take()
-            && let Err(err) = std::fs::remove_file(&path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            lore_base::lore_warn!("failed to remove temporary file {}: {err}", path.display());
-        }
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        let record = crate::resume::record_path(&path);
+        crate::resume::report_removal(&path, std::fs::remove_file(&path));
+        crate::resume::report_removal(&record, std::fs::remove_file(&record));
     }
 }
 
@@ -1428,8 +1688,10 @@ impl Drop for TemporaryFile {
 /// that need a stat regardless of path can fall back to a separate metadata
 /// query when `None` is returned (the multi-fragment defragment path doesn't
 /// surface metadata yet — the file handle moves through the pipeline).
-#[allow(clippy::too_many_arguments)]
-pub async fn read_into_file(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+pub fn read_into_file(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -1438,37 +1700,37 @@ pub async fn read_into_file(
     range: Option<Range<usize>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<(Fragment, Option<std::fs::Metadata>), StorageError> {
-    let _count_permit = file_count_limit_acquire()
-        .await
-        .forward::<StorageError>("permit failed")?;
+) -> impl Future<Output = Result<(Fragment, Option<std::fs::Metadata>), StorageError>> {
+    async move {
+        let _count_permit = file_count_limit_acquire()
+            .await
+            .forward::<StorageError>("permit failed")?;
 
-    // Read the initial fragment
-    let options = options.with_decompress();
-    let (fragment, buffer) = load_fragment(
-        store.clone(),
-        partition,
-        address,
-        options,
-        remote_session.clone(),
-    )
-    .await?;
+        let (fragment, buffer) = load_root(
+            store.clone(),
+            partition,
+            address,
+            options,
+            remote_session.clone(),
+        )
+        .await?;
 
-    let metadata = write_root_to_file(
-        store,
-        partition,
-        address,
-        fragment,
-        buffer,
-        path,
-        temp_file_extension,
-        range,
-        options,
-        remote_session,
-    )
-    .await?;
+        let metadata = write_root_to_file(
+            store,
+            partition,
+            address,
+            fragment,
+            buffer,
+            path,
+            temp_file_extension,
+            range,
+            options.with_decompress(),
+            remote_session,
+        )
+        .await?;
 
-    Ok((fragment, metadata))
+        Ok((fragment, metadata))
+    }
 }
 
 /// Write the content a loaded root fragment stands for into `path`: the half of
@@ -1477,11 +1739,20 @@ pub async fn read_into_file(
 ///
 /// A single fragment's payload is already in `buffer` and goes out in one whole-file write, whose
 /// open handle answers the metadata the caller gets back. A fragment list streams through the
-/// defragment pipeline into a file sized to the range up front, so each leaf lands at its own
-/// offset and peak memory follows the leaf rather than the content — and no metadata comes back,
-/// because the handle moves into the pipeline. That path stages through
-/// `<path><temp_file_extension>` and renames, unless `options.direct_write` asks for the target to
-/// be written in place.
+/// defragment pipeline into a file emptied and sized to the range up front, so each leaf lands at
+/// its own offset and peak memory follows the leaf rather than the content — and no metadata comes
+/// back, because the handle moves into the pipeline. A hole is left unwritten, and every leaf is
+/// written, one of zeros included. That path writes through `<path><temp_file_extension>` and
+/// renames, unless `options.direct_write` asks for the target to be written in place. With
+/// `options.resume_write`, for a range of at least
+/// [`RESUME_WRITE_MIN_LEN`](crate::options::RESUME_WRITE_MIN_LEN), the temporary file is kept when
+/// the write fails or stops, and a later write of the same content and range resumes from it, as
+/// [`crate::resume`] describes: the file it resumes is sized, and is emptied and written again as a
+/// fresh one where a hole of the content holds data there or its holes cannot be checked.
+///
+/// Where `options.create_parent` asks for it, a write that finds the directory `path` goes in
+/// missing creates that directory, with its missing ancestors, and opens again at once. A
+/// directory that cannot be created fails the write. A directory that is there costs nothing.
 ///
 /// A range starting past the end of the content selects nothing that exists, and `path` is left
 /// alone: the file is not opened, so a destination that was already there survives a request the
@@ -1490,8 +1761,10 @@ pub async fn read_into_file(
 /// empty read and does produce an empty file.
 ///
 /// `options` must already carry `with_decompress`; both entry points load their root with it.
-#[allow(clippy::too_many_arguments)]
-async fn write_root_to_file(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn write_root_to_file(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -1502,109 +1775,297 @@ async fn write_root_to_file(
     range: Option<Range<usize>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<Option<std::fs::Metadata>, StorageError> {
-    if range
-        .as_ref()
-        .is_some_and(|range| range.start as u64 > fragment.size_content)
-    {
-        return Ok(None);
-    }
+) -> impl Future<Output = Result<Option<std::fs::Metadata>, StorageError>> {
+    async move {
+        if range
+            .as_ref()
+            .is_some_and(|range| range.start as u64 > fragment.size_content)
+        {
+            return Ok(None);
+        }
 
-    let range = resolve_content_range(range, fragment.size_content);
+        let range = resolve_content_range(range, fragment.size_content);
 
-    if fragment.flags & FragmentFlags::PayloadFragmented == FragmentFlags::PayloadFragmented {
-        let mut retry = crate::retry(10, 10_000, 10);
+        if fragment.flags & FragmentFlags::PayloadFragmented == FragmentFlags::PayloadFragmented {
+            let mut retry = crate::retry(10, 10_000, 10);
 
-        let file_path = if options.direct_write {
-            path.to_path_buf()
-        } else {
-            let mut temporary_ext = path.extension().unwrap_or_default().to_os_string();
-            temporary_ext.push(temp_file_extension);
+            let mut file_path = if options.direct_write {
+                path.to_path_buf()
+            } else {
+                let mut temporary_path = path.as_os_str().to_os_string();
+                temporary_path.push(temp_file_extension);
+                PathBuf::from(temporary_path)
+            };
 
-            let mut temporary_path = path.to_path_buf();
-            temporary_path.set_extension(temporary_ext);
+            let mut resuming = options.resume_write
+                && !options.direct_write
+                && range.len() >= crate::options::RESUME_WRITE_MIN_LEN;
+            let mut temporary = (!options.direct_write && !resuming)
+                .then(|| TemporaryFile::guard(file_path.clone()));
 
-            temporary_path
-        };
-
-        let mut temporary =
-            (!options.direct_write).then(|| TemporaryFile::guard(file_path.clone()));
-
-        let file = loop {
-            match crate::defragment::open_file_write(file_path.as_path(), range.len()).await {
-                Ok(file) => break file,
-                Err(err) => {
-                    if !retry.wait().await {
+            let mut create_parent = options.create_parent;
+            let (file, held) = loop {
+                let directory_missing = {
+                    // `opened` ends with this block, so that it is not held across the wait below.
+                    let err = {
+                        let opened = if resuming {
+                            crate::resume::open(file_path.as_path(), &address.hash, &range).await
+                        } else {
+                            crate::defragment::open_file_write(
+                                file_path.as_path(),
+                                range.len(),
+                                options.sparse_write,
+                            )
+                            .await
+                            .map(|file| Opened::File(file, false))
+                        };
+                        match opened {
+                            Ok(Opened::File(file, held)) => break (file, held),
+                            Ok(Opened::Refused) => {
+                                resuming = false;
+                                temporary = Some(TemporaryFile::guard(file_path.clone()));
+                                continue;
+                            }
+                            Ok(Opened::Moving) => return Err(StorageError::from(SlowDown)),
+                            Err(err) => err,
+                        }
+                    };
+                    if create_parent && names_a_missing_directory(&err) {
+                        true
+                    } else if retry.wait().await {
+                        false
+                    } else {
                         return Err(StorageError::internal_with_context(
                             err,
                             &format!("failed to open file: {}", path.display()),
                         ));
                     }
+                };
+                if directory_missing {
+                    create_parent = false;
+                    create_parent_directory(path).await?;
+                }
+            };
+            if held {
+                lore_base::lore_debug!("Resuming {} from its temporary file", path.display());
+            }
+            lore_base::lore_trace!(
+                "Opened file for immutable data write: {} size {}",
+                path.display(),
+                range.len()
+            );
+
+            if held {
+                Box::pin(pipe_resumed(
+                    store,
+                    partition,
+                    address,
+                    fragment,
+                    buffer,
+                    range.start as u64..range.end as u64,
+                    &file,
+                    options,
+                    remote_session,
+                    &file_path,
+                ))
+                .await?;
+            } else {
+                let claim = claim_for_task(&store, store.try_join_claim())
+                    .await
+                    .map(Arc::new);
+                defragment_pipeline(
+                    store,
+                    partition,
+                    address,
+                    fragment,
+                    buffer,
+                    range.start as u64..range.end as u64,
+                    DefragmentSink::File {
+                        file: file.clone(),
+                        size: range.len(),
+                    },
+                    ReadOptions {
+                        resume_write: resuming,
+                        resume_held: false,
+                        ..options
+                    },
+                    remote_session,
+                    claim,
+                )
+                .await?;
+            }
+
+            // A task of its own finishes a resuming read's file, holding its lock until the rename
+            // ends even where the read is dropped. `file_path` is taken rather than moved, which
+            // would add a drop flag to this future.
+            if resuming {
+                return crate::resume::finish(
+                    file,
+                    std::mem::take(&mut file_path),
+                    path,
+                    options.sync_data,
+                )
+                .await
+                .map_err(|e| StorageError::internal_with_context(e, "task failure"))?
+                .map(|()| None);
+            }
+
+            if options.sync_data {
+                file.sync_data()
+                    .await
+                    .map_err(|e| StorageError::internal_with_context(e, "flush file"))?;
+            }
+            // The handle holds no userspace buffer, so there is nothing to flush.
+            drop(file);
+
+            if !options.direct_write {
+                lore_io::IoDriver::global()
+                    .rename(file_path.as_path(), path)
+                    .await
+                    .map_err(|e| {
+                        StorageError::internal_with_context(
+                            e,
+                            &format!("rename {} -> {}", file_path.display(), path.display()),
+                        )
+                    })?;
+
+                if let Some(temporary) = temporary.as_mut() {
+                    temporary.disarm();
                 }
             }
-        };
-        let defrag_target = DefragmentSink::File {
-            file: file.clone(),
-            size: range.len(),
-        };
 
-        lore_base::lore_trace!(
-            "Opened file for immutable data write: {} size {}",
-            path.display(),
-            range.len()
-        );
-
-        defragment_pipeline(
-            store,
-            partition,
-            address,
-            fragment,
-            buffer,
-            range.start as u64..range.end as u64,
-            defrag_target,
-            options,
-            remote_session,
-        )
-        .await?;
-
-        if options.sync_data {
-            file.sync_data()
-                .await
-                .map_err(|e| StorageError::internal_with_context(e, "flush file"))?;
-        }
-        // The handle holds no userspace buffer, so there is nothing to flush.
-        drop(file);
-
-        if !options.direct_write {
-            let rename_err_msg = format!("rename {} -> {}", file_path.display(), path.display());
-            lore_io::IoDriver::global()
-                .rename(file_path.as_path(), path)
-                .await
-                .map_err(|e| StorageError::internal_with_context(e, &rename_err_msg))?;
-
-            if let Some(temporary) = temporary.as_mut() {
-                temporary.renamed();
-            }
-        }
-
-        Ok(None)
-    } else {
-        let mut retry = crate::retry(10, 10_000, 10);
-        let buffer = buffer.slice(range);
-        let metadata = loop {
-            match write_all_to_file(path, buffer.clone(), options.sync_data).await {
-                Ok(meta) => break meta,
-                Err(err) => {
-                    if !retry.wait().await {
+            Ok(None)
+        } else {
+            let mut retry = crate::retry(10, 10_000, 10);
+            let buffer = cut_content(&buffer, range)?;
+            let mut create_parent = options.create_parent;
+            let metadata = loop {
+                let directory_missing = {
+                    let err = match write_all_to_file(
+                        path,
+                        buffer.clone(),
+                        options.sync_data,
+                        options.writes_unbuffered(),
+                    )
+                    .await
+                    {
+                        Ok(meta) => break meta,
+                        Err(err) => err,
+                    };
+                    if create_parent && names_a_missing_directory(&err) {
+                        true
+                    } else if retry.wait().await {
+                        false
+                    } else {
                         return Err(StorageError::internal_with_context(
                             err,
                             &format!("write to file: {}", path.display()),
                         ));
                     }
+                };
+                if directory_missing {
+                    create_parent = false;
+                    create_parent_directory(path).await?;
                 }
+            };
+            Ok(Some(metadata))
+        }
+    }
+}
+
+/// The defragment pipeline of a read resuming from `file`, a temporary file that holds part of the
+/// content: written again as a fresh one, emptied and sized ([`lore_io::IoFile::empty`]), where a
+/// hole of the content holds data there or its holes cannot be checked
+/// ([`crate::defragment::Unresumable`]). It takes the store's claim once, for every pass. Boxed by
+/// its caller, being a cold path, so that the restart it may take stays out of every other read's
+/// future.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn pipe_resumed<'a>(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
+    range: Range<u64>,
+    file: &'a lore_io::IoFile,
+    options: ReadOptions,
+    remote_session: Option<Arc<StorageSession>>,
+    temporary: &'a Path,
+) -> impl Future<Output = Result<(), StorageError>> + 'a {
+    async move {
+        let claim = claim_for_task(&store, store.try_join_claim())
+            .await
+            .map(Arc::new);
+        let size = (range.end - range.start) as usize;
+        let mut held = true;
+        loop {
+            let pipelined = defragment_pipeline(
+                store.clone(),
+                partition,
+                address,
+                fragment,
+                buffer.clone(),
+                range.clone(),
+                DefragmentSink::File {
+                    file: file.clone(),
+                    size,
+                },
+                ReadOptions {
+                    resume_write: true,
+                    resume_held: held,
+                    ..options
+                },
+                remote_session.clone(),
+                claim.clone(),
+            )
+            .await;
+            match pipelined {
+                Err(err) if held && crate::defragment::cannot_resume(&err) => {
+                    lore_base::lore_warn!(
+                        "{} cannot be resumed, writing it again: {err}",
+                        temporary.display()
+                    );
+                    held = false;
+                    file.empty(size as u64)
+                        .await
+                        .map_err(|e| StorageError::internal_with_context(e, "empty a file"))?;
+                }
+                pipelined => return pipelined,
             }
+        }
+    }
+}
+
+/// Whether a failed open of a file names a directory on its path that is missing, or that is
+/// not a directory. Creating the directory the file goes in mends the first and reports the
+/// second.
+fn names_a_missing_directory(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Creates the directory `path` goes in, with its missing ancestors.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn create_parent_directory(path: &Path) -> impl Future<Output = Result<(), StorageError>> + '_ {
+    async move {
+        let Some(parent) = path.parent() else {
+            return Ok(());
         };
-        Ok(Some(metadata))
+        lore_io::IoDriver::global()
+            .create_dir_all(parent)
+            .await
+            .map_err(|err| {
+                StorageError::internal_with_context(
+                    err,
+                    &format!("creating the directory of {}", path.display()),
+                )
+            })
     }
 }
 
@@ -1614,11 +2075,13 @@ async fn write_root_to_file(
 /// separate stat round-trip and the metadata comes off the open handle rather than from a second
 /// path resolve. The whole-file operation refuses anything above `lore_io::WHOLE_FILE_LIMIT`,
 /// which the content written here cannot reach: an unfragmented fragment's content is bounded by
-/// `FRAGMENT_SIZE_THRESHOLD`.
+/// `FRAGMENT_SIZE_THRESHOLD`. With `unbuffered` the file is written past the file cache
+/// ([`lore_io::IoDriver::write_file_bytes_unbuffered`]).
 pub async fn write_all_to_file(
     path: impl AsRef<Path>,
     buffer: Bytes,
     sync_data: bool,
+    unbuffered: bool,
 ) -> Result<std::fs::Metadata, std::io::Error> {
     let path = path.as_ref().to_path_buf();
     let buffer_len = buffer.len();
@@ -1626,20 +2089,66 @@ pub async fn write_all_to_file(
     // Reissued while the open fails transiently: a reader of this path grants no write access
     // for as long as it is open, so on Windows a write landing on a file being hashed or
     // fragmented waits for that scan rather than failing the materialization.
-    let metadata = crate::fs_util::retry_transient(|| {
+    let (metadata, written_unbuffered) = crate::fs_util::retry_transient(|| {
         let path = path.clone();
         let buffer = buffer.clone();
         async move {
-            lore_io::IoDriver::global()
-                .write_file_bytes(path, buffer, sync_data)
-                .await
+            let driver = lore_io::IoDriver::global();
+            if unbuffered {
+                driver
+                    .write_file_bytes_unbuffered(path, buffer, sync_data)
+                    .await
+            } else {
+                driver
+                    .write_file_bytes(path, buffer, sync_data)
+                    .await
+                    .map(|metadata| (metadata, false))
+            }
         }
     })
     .await?;
+    if unbuffered && !written_unbuffered {
+        log_unbuffered_fallback(&path, &"the volume refused it");
+    }
 
     lore_base::lore_trace!("Wrote {} bytes to {}", buffer_len, path.display());
 
     Ok(metadata)
+}
+
+/// Logs that `path`, refused an unbuffered write for `reason`, is written through the file cache,
+/// once per command: for the first such file of each `LORE_CONTEXT`, and once in a process that
+/// runs without one. Only the last context to warn is remembered, so commands that run at the same
+/// time in one process warn again each time they alternate. [`lore_io::unbuffered_fallbacks`]
+/// counts them all.
+fn log_unbuffered_fallback(path: &Path, reason: &dyn std::fmt::Display) {
+    type Context = std::sync::Weak<dyn std::any::Any + Send + Sync>;
+    static LOGGED: std::sync::Mutex<Option<Context>> = std::sync::Mutex::new(None);
+    static LOGGED_WITHOUT_CONTEXT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    let first = match lore_base::runtime::try_lore_context() {
+        Some(context) => {
+            let mut logged = LOGGED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current = Arc::downgrade(&context);
+            let first = !logged
+                .as_ref()
+                .is_some_and(|logged| std::sync::Weak::ptr_eq(logged, &current));
+            *logged = Some(current);
+            first
+        }
+        None => !LOGGED_WITHOUT_CONTEXT.swap(true, Ordering::Relaxed),
+    };
+    if first {
+        lore_base::lore_warn!(
+            "Writing {} through the file cache: {reason}. Further files of this command refused \
+             an unbuffered write are written so with no further warning, unless another command \
+             in this process warns in between.",
+            path.display()
+        );
+    }
 }
 
 /// The root a key resolved to, plus the session the tail should use for anything the root refers
@@ -1657,8 +2166,10 @@ struct ResolvedRoot {
 /// Local half of [`read_resolved`]: resolve `key` in the local mutable store and load the root it
 /// names from the local store only.
 ///
-/// `None` means the caller should ask the remote instead — the mapping is absent, it is a
-/// tombstone, or its root is not cached locally.
+/// A failure means the caller should ask the remote instead: the mapping is absent, it is a
+/// tombstone, it fails to load, or its root is not cached locally or does not load. The root is
+/// loaded as [`load_fragment`] loads it locally, so the failure tells a root held broken, failing
+/// its size check or not decompressing, from one the store lacks or fails to read.
 ///
 /// A mapping that *is* present is trusted as-is and not revalidated. Because the key is mutable,
 /// that is a weaker guarantee than the immutable [`load_fragment`] path gives: a cached mapping
@@ -1668,35 +2179,52 @@ struct ResolvedRoot {
 /// On the fall-through it deliberately does not remote-read the locally cached hash. A remote
 /// `get_resolved` answers the mapping and the root in one round trip, so re-resolving costs
 /// nothing extra and answers against the authoritative mapping.
-async fn load_resolved_local(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn load_resolved_local(
     store: Arc<dyn ImmutableStore>,
     mutable: Arc<dyn MutableStore>,
     partition: Partition,
     key: Hash,
     context: Context,
     options: ReadOptions,
-) -> Option<(Hash, Fragment, Bytes)> {
-    let resolved = match mutable.load(partition, key, KeyType::Resolve).await {
-        Ok(resolved) if !resolved.is_zero() => resolved,
-        Ok(_) => return None,
-        Err(err) => {
-            lore_base::lore_trace!("Key {key} failed to resolve from local mutable store: {err:?}");
-            return None;
-        }
-    };
+) -> impl Future<Output = Result<(Hash, Fragment, Bytes), LocalFailure>> {
+    async move {
+        let resolved = match mutable.load(partition, key, KeyType::Resolve).await {
+            Ok(resolved) if !resolved.is_zero() => resolved,
+            Ok(_) => return Err(LocalFailure::Missing),
+            Err(err) => {
+                lore_base::lore_trace!(
+                    "Key {key} failed to resolve from local mutable store: {err:?}"
+                );
+                return Err(if err.is_address_not_found() {
+                    LocalFailure::Missing
+                } else {
+                    LocalFailure::Failed(err.forward("resolving the key in the local store"))
+                });
+            }
+        };
 
-    let address = Address {
-        hash: resolved,
-        context,
-    };
-    match load_fragment(store, partition, address, options.no_remote(), None).await {
-        Ok((fragment, buffer)) => Some((resolved, fragment, buffer)),
-        Err(err) => {
-            lore_base::lore_trace!(
-                "Key {key} resolved locally to {resolved}, whose root is not cached: {err:?}"
-            );
-            None
+        let address = Address {
+            hash: resolved,
+            context,
+        };
+        let landed = landed_before_probe(address, options);
+        let mut loaded = probe_local(store.clone(), partition, address, options).await;
+        if matches!(
+            loaded,
+            Err(LocalFailure::Missing | LocalFailure::Failed(_) | LocalFailure::Corrupt(_))
+        ) && stored_since(store.as_ref(), partition, address, landed).await
+        {
+            loaded = probe_local(store, partition, address, options).await;
         }
+        if loaded.is_err() {
+            lore_base::lore_trace!(
+                "Key {key} resolved locally to {resolved}, whose root does not load"
+            );
+        }
+        loaded.map(|(fragment, buffer)| (resolved, fragment, buffer))
     }
 }
 
@@ -1706,28 +2234,41 @@ async fn load_resolved_local(
 /// The key is always read as [`KeyType::Resolve`], locally and remotely alike.
 ///
 /// Local-first like [`read`]: [`load_resolved_local`] tries the local mutable store and the local
-/// copy of the root it names, and only a miss there reaches the remote. A fragment list's leaves
-/// go through [`load_fragment`] either way, so they keep their own local-then-remote fallback and
-/// local caching.
+/// copy of the root it names, and only a miss there reaches the remote. A local root this build
+/// cannot decode fails the resolve as it fails [`load_fragment`]: at once, unless it is durably
+/// stored and a remote can supply it. Where `options.remote` is off or there is no session, any
+/// other local failure is answered as [`LocalFailure::error_without_remote`] gives it at the key's
+/// address, the address the resolve answers for: a `strict_local` error for a corrupt root names
+/// the key, not the root. `options.never_wait` keeps [`load_fragment`] from the remote but not a
+/// resolve. A fragment list's leaves go through [`load_fragment`] either way, so they keep their
+/// own local-then-remote fallback and local caching.
 ///
-/// On a remote resolve the key->hash mapping is written back to the local mutable store once the
-/// payload write-back succeeds, under the same gate — so a later call can be served entirely
-/// locally, and the mapping is never left pointing at a root this store does not hold.
+/// On a remote resolve the root is stored as [`store_fetched`] stores a fetch, and the key->hash
+/// mapping is written back to the local mutable store once the root's payload is stored — so a
+/// later call can be served entirely locally, and the mapping is never left pointing at a root this
+/// store does not hold. A root whose payload is not stored is recorded without it, unless
+/// `options.no_local_write` is set, and its key is not mapped. Where the local root is held broken,
+/// the root the remote resolves to is stored replacing any copy unless `options.no_local_write` is
+/// set, whether or not the read caches, as [`load_fragment`] stores a refetched payload: over the
+/// broken one where the key still names it.
 ///
 /// A local root travels with the caller's session anyway: a fragment list's leaves may still
 /// exist only remotely.
 ///
-/// Verifies every remote root, whatever `options.verify` says. A verification failure gets one
-/// heal attempt then a re-resolve, as [`load_fragment`] does. The retry re-resolves rather than
-/// re-reads, since the heal targets the resolved address and a fresh resolve costs the same
-/// single round trip.
+/// Checks every remote root on receipt as `options` asks ([`check_receipt`]). A failed check gets
+/// one heal attempt ([`heal_on_receipt`]) then a re-resolve, as [`load_fragment`] does. The retry
+/// re-resolves rather than re-reads, since the heal targets the resolved address and a fresh
+/// resolve costs the same single round trip.
 ///
-/// The root is expanded when `options.decompress` is set, and left as stored otherwise.
+/// The root is expanded when `options.decompress` is set, and left as stored otherwise. Content
+/// larger than `options.max_content_size` allows fails.
 ///
 /// `flags` is a reserved bitmask forwarded to the server; 0 for default behaviour.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
 #[lore_macro::test_pub]
-#[allow(clippy::too_many_arguments)]
-async fn resolve_root(
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn resolve_root(
     store: Arc<dyn ImmutableStore>,
     mutable: Arc<dyn MutableStore>,
     partition: Partition,
@@ -1736,120 +2277,117 @@ async fn resolve_root(
     flags: u32,
     options: ReadOptions,
     session: Option<Arc<StorageSession>>,
-) -> Result<ResolvedRoot, StorageError> {
-    let key_address = Address { hash: key, context };
+) -> impl Future<Output = Result<ResolvedRoot, StorageError>> {
+    async move {
+        let key_address = Address { hash: key, context };
 
-    if options.local
-        && let Some((resolved, fragment, buffer)) = load_resolved_local(
-            store.clone(),
-            mutable.clone(),
-            partition,
-            key,
-            context,
-            options,
-        )
-        .await
-    {
-        return Ok(ResolvedRoot {
-            resolved,
-            address: Address {
-                hash: resolved,
+        let replace = if options.local {
+            match load_resolved_local(
+                store.clone(),
+                mutable.clone(),
+                partition,
+                key,
                 context,
-            },
-            fragment,
-            buffer,
-            session,
-        });
-    }
+                options,
+            )
+            .await
+            {
+                Ok((resolved, fragment, buffer)) => {
+                    check_max_content_size(&fragment, options.max_content_size)?;
+                    return Ok(ResolvedRoot {
+                        resolved,
+                        address: Address {
+                            hash: resolved,
+                            context,
+                        },
+                        fragment,
+                        buffer,
+                        session,
+                    });
+                }
+                Err(LocalFailure::Fatal(err)) => return Err(err),
+                Err(failure) if !options.remote || session.is_none() => {
+                    return Err(failure.error_without_remote(key_address, options.strict_local));
+                }
+                Err(failure) => matches!(
+                    failure,
+                    LocalFailure::Corrupt(_) | LocalFailure::DurableMigrated(_)
+                ),
+            }
+        } else {
+            false
+        };
 
-    if !options.remote {
-        return Err(StorageError::from(crate::errors::AddressNotFound::from(
-            key_address,
-        )));
-    }
-    let Some(session) = session else {
-        return Err(StorageError::from(crate::errors::AddressNotFound::from(
-            key_address,
-        )));
-    };
-
-    lore_base::lore_trace!("Resolve key {} from remote", key_address);
-
-    let mut heal_attempted = false;
-    let (resolved, address, fragment, buffer) = loop {
-        let (resolved, mut fragment, buffer) =
-            remote_get_resolved_retry(session.as_ref(), key, context, flags).await?;
-        REMOTE_FETCH_BYTES.fetch_add(buffer.len() as u64, Ordering::Relaxed);
-
-        if resolved.is_zero() {
+        if !options.remote {
             return Err(StorageError::from(crate::errors::AddressNotFound::from(
                 key_address,
             )));
         }
-
-        let address = Address {
-            hash: resolved,
-            context,
+        let Some(session) = session else {
+            return Err(StorageError::from(crate::errors::AddressNotFound::from(
+                key_address,
+            )));
         };
 
-        fragment.flags |= FragmentFlags::PayloadStoredDurable;
+        lore_base::lore_trace!("Resolve key {} from remote", key_address);
 
-        match verify_receipt(fragment, buffer.clone(), address) {
-            Ok(content) => {
-                let should_store = options.cache
-                    || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
-                if should_store
-                    && store
-                        .clone()
-                        .put(partition, address, fragment, Some(buffer.clone()), false)
-                        .await
-                        .is_ok()
-                {
-                    let _ = mutable
-                        .store(partition, key, resolved, KeyType::Resolve)
-                        .await;
-                }
-                let (fragment, buffer) = Fetched {
-                    content,
-                    raw: (fragment, buffer),
-                }
-                .take(options.decompress);
-                break (resolved, address, fragment, buffer);
+        let mut heal_attempted = false;
+        let (resolved, address, fragment, buffer) = loop {
+            let (resolved, mut fragment, buffer) =
+                remote_get_resolved_retry(session.as_ref(), key, context, flags).await?;
+            REMOTE_FETCH_BYTES.fetch_add(buffer.len() as u64, Ordering::Relaxed);
+
+            if resolved.is_zero() {
+                return Err(StorageError::from(crate::errors::AddressNotFound::from(
+                    key_address,
+                )));
             }
-            Err(err) => {
-                if matches!(err, StorageError::NotSupported(_)) {
-                    return Err(err);
-                }
-                if heal_attempted {
-                    lore_base::lore_error!(
-                        "Key {key} resolved to {resolved}, still corrupt after heal: {err}"
-                    );
-                    return Err(err);
-                }
 
-                lore_base::lore_warn!("Key {key} resolved to {resolved}: {err}. Attempting heal.");
-                let healed = session
-                    .verify(&address, true)
+            let address = Address {
+                hash: resolved,
+                context,
+            };
+
+            fragment.flags |= FragmentFlags::PayloadStoredDurable;
+
+            check_max_content_size(&fragment, options.max_content_size)?;
+            let raw = (fragment, buffer);
+            match check_receipt(&raw, address, options) {
+                Ok(content) => {
+                    if store_fetched(
+                        &store,
+                        partition,
+                        address,
+                        raw.0,
+                        Some(&raw.1),
+                        Keep::of(options, replace),
+                    )
                     .await
-                    .is_ok_and(|r| r.healed == lore_base::types::HealResult::Healed);
-                if !healed {
-                    lore_base::lore_error!("Server did not heal fragment {resolved}");
-                    return Err(err);
+                    {
+                        let _ = mutable
+                            .store(partition, key, resolved, KeyType::Resolve)
+                            .await;
+                    }
+                    let (fragment, buffer) = Loaded { content, raw }.take(options.decompress)?;
+                    break (resolved, address, fragment, buffer);
                 }
-
-                lore_base::lore_debug!("Server healed fragment {resolved}, resolving again");
-                heal_attempted = true;
+                Err(err) => {
+                    if !heal_on_receipt(session.as_ref(), address, &err, heal_attempted).await {
+                        return Err(err);
+                    }
+                    heal_attempted = true;
+                }
             }
-        }
-    };
+        };
 
-    Ok(ResolvedRoot {
-        resolved,
-        address,
-        fragment,
-        buffer,
-        session: Some(session),
-    })
+        Ok(ResolvedRoot {
+            resolved,
+            address,
+            fragment,
+            buffer,
+            session: Some(session),
+        })
+    }
 }
 
 /// `mutable_load(key)` + [`read`] of the resulting address, resolved in one round trip when the
@@ -1857,8 +2395,10 @@ async fn resolve_root(
 ///
 /// See [`resolve_root`] for how the key is resolved; this reassembles the whole content into one
 /// buffer. [`read_resolved_stream`] delivers it fragment by fragment instead.
-#[allow(clippy::too_many_arguments)]
-pub async fn read_resolved(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+pub fn read_resolved(
     store: Arc<dyn ImmutableStore>,
     mutable: Arc<dyn MutableStore>,
     partition: Partition,
@@ -1868,31 +2408,33 @@ pub async fn read_resolved(
     range: Option<Range<usize>>,
     options: ReadOptions,
     session: Option<Arc<StorageSession>>,
-) -> Result<(Hash, Bytes), StorageError> {
-    let root = resolve_root(
-        store.clone(),
-        mutable,
-        partition,
-        key,
-        context,
-        flags,
-        options.with_decompress(),
-        session,
-    )
-    .await?;
+) -> impl Future<Output = Result<(Hash, Bytes), StorageError>> {
+    async move {
+        let root = resolve_root(
+            store.clone(),
+            mutable,
+            partition,
+            key,
+            context,
+            flags,
+            options.with_decompress(),
+            session,
+        )
+        .await?;
 
-    let bytes = read_resolved_content(
-        store,
-        partition,
-        root.address,
-        root.fragment,
-        root.buffer,
-        range,
-        options.with_decompress(),
-        root.session,
-    )
-    .await?;
-    Ok((root.resolved, bytes))
+        let bytes = read_root_content(
+            store,
+            partition,
+            root.address,
+            root.fragment,
+            root.buffer,
+            range,
+            options.with_decompress(),
+            root.session,
+        )
+        .await?;
+        Ok((root.resolved, bytes))
+    }
 }
 
 /// [`read_resolved`] delivering the content through `sender` one leaf at a time instead of
@@ -1902,8 +2444,10 @@ pub async fn read_resolved(
 /// Returns the resolved hash and the content's total size; the leaves follow on the channel. Peak
 /// memory is bounded by the channel depth rather than by the content, which is what makes this
 /// usable for a key naming something large.
-#[allow(clippy::too_many_arguments)]
-pub async fn read_resolved_stream(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+pub fn read_resolved_stream(
     store: Arc<dyn ImmutableStore>,
     mutable: Arc<dyn MutableStore>,
     partition: Partition,
@@ -1913,66 +2457,61 @@ pub async fn read_resolved_stream(
     options: ReadOptions,
     sender: tokio::sync::mpsc::Sender<Result<(Fragment, Bytes), StorageError>>,
     session: Option<Arc<StorageSession>>,
-) -> Result<(Hash, u64), StorageError> {
-    let root = resolve_root(
-        store.clone(),
-        mutable,
-        partition,
-        key,
-        context,
-        flags,
-        options,
-        session,
-    )
-    .await?;
+) -> impl Future<Output = Result<(Hash, u64), StorageError>> {
+    async move {
+        let root = resolve_root(
+            store.clone(),
+            mutable,
+            partition,
+            key,
+            context,
+            flags,
+            options,
+            session,
+        )
+        .await?;
 
-    if let Some(max) = options.max_content_size
-        && root.fragment.size_content > max
-    {
-        return Err(StorageError::from(crate::errors::Oversized {
-            context: format!(
-                "fragment size_content {} exceeds caller-supplied max {max}",
-                root.fragment.size_content
-            ),
-        }));
+        if (root.fragment.flags & FragmentFlags::PayloadFragmented)
+            == FragmentFlags::PayloadFragmented
+        {
+            let address = root.address;
+            let fragment = root.fragment;
+            let buffer = root.buffer;
+            let remote_session = root.session;
+            let report = sender.clone();
+            let joined = store.try_join_claim();
+            lore_base::lore_spawn!(async move {
+                let claim = claim_for_task(&store, joined).await.map(Arc::new);
+                let result = defragment_pipeline_leaves(
+                    store,
+                    partition,
+                    address,
+                    fragment,
+                    buffer,
+                    sender,
+                    options,
+                    remote_session,
+                    claim,
+                )
+                .await;
+
+                if let Err(err) = result {
+                    lore_base::lore_warn!(
+                        "error while defragmenting during read_resolved_stream: {0}",
+                        err
+                    );
+                    let _ = report.send(Err(err)).await;
+                }
+            });
+        } else {
+            sender
+                .send(Ok((root.fragment, root.buffer)))
+                .await
+                .map_err(|_err| StorageError::internal("read stream closed"))?;
+        }
+
+        Ok((root.resolved, root.fragment.size_content))
     }
-
-    if (root.fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented
-    {
-        let address = root.address;
-        let fragment = root.fragment;
-        let buffer = root.buffer;
-        let remote_session = root.session;
-        let report = sender.clone();
-        lore_base::lore_spawn!(async move {
-            let result = defragment_pipeline_leaves(
-                store,
-                partition,
-                address,
-                fragment,
-                buffer,
-                sender,
-                options,
-                remote_session,
-            )
-            .await;
-
-            if let Err(err) = result {
-                lore_base::lore_warn!(
-                    "error while defragmenting during read_resolved_stream: {0}",
-                    err
-                );
-                let _ = report.send(Err(err)).await;
-            }
-        });
-    } else {
-        sender
-            .send(Ok((root.fragment, root.buffer)))
-            .await
-            .map_err(|_err| StorageError::internal("read stream closed"))?;
-    }
-
-    Ok((root.resolved, root.fragment.size_content))
 }
 
 /// [`read_into_buffer`] reached by key rather than by address.
@@ -1980,12 +2519,16 @@ pub async fn read_resolved_stream(
 /// `dst.len()` states the capacity and bounds the read: content exceeding it fails with `Oversized`
 /// rather than truncating. Returns the resolved hash and the number of bytes written.
 ///
-/// A key resolving locally to content one fragment holds reads straight into `dst`. Anything else
-/// falls back to [`read_resolved`], which assembles no more than `dst` can hold.
+/// A key resolving locally to a root the local store holds reads into `dst` as [`read_into_buffer`]
+/// does. Anything else is resolved through [`resolve_root`] and delivered into `dst` by
+/// [`deliver_root_into_buffer`], assembled nowhere else.
 ///
-/// The contents of `dst` are unspecified when this fails.
-#[allow(clippy::too_many_arguments)]
-pub async fn read_resolved_into_buffer(
+/// The contents of `dst` are unspecified when this fails. A read dropped part-way may still write
+/// `dst` until the loan on it ([`CallerBuffer::loan`](crate::CallerBuffer::loan)) is returned.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+pub fn read_resolved_into_buffer(
     store: Arc<dyn ImmutableStore>,
     mutable: Arc<dyn MutableStore>,
     partition: Partition,
@@ -1995,75 +2538,59 @@ pub async fn read_resolved_into_buffer(
     dst: &mut crate::CallerBuffer,
     options: ReadOptions,
     session: Option<Arc<StorageSession>>,
-) -> Result<(Hash, usize), StorageError> {
-    // [`read_resolved`] resolves the key again, so resolve here only while the direct read is open.
-    // The root has to be local: the mapping just read is trusted as it stands, and reading the hash
-    // it names from the remote would answer with content the key may have moved off. A local root's
-    // leaves may still be remote, as [`resolve_root`] allows.
-    if options.local
-        && let Ok(resolved) = mutable.clone().load(partition, key, KeyType::Resolve).await
-        && !resolved.is_zero()
-    {
-        let address = Address {
-            hash: resolved,
-            context,
-        };
-        if let Some((_fragment, written)) = read_content_into_buffer(
-            store.clone(),
-            partition,
-            address,
-            dst,
-            options,
-            RootSource::LocalOnly,
-            0,
-            session.clone(),
-        )
-        .await?
+) -> impl Future<Output = Result<(Hash, usize), StorageError>> {
+    async move {
+        if options.local
+            && let Ok(resolved) = mutable.clone().load(partition, key, KeyType::Resolve).await
+            && !resolved.is_zero()
         {
-            return Ok((resolved, written));
+            let address = Address {
+                hash: resolved,
+                context,
+            };
+            if let Some((_fragment, written)) = read_content_into_buffer(
+                store.clone(),
+                partition,
+                address,
+                dst,
+                options,
+                RootSource::LocalOnly,
+                0,
+                session.clone(),
+            )
+            .await?
+            {
+                return Ok((resolved, written));
+            }
         }
+
+        let root = resolve_root(
+            store.clone(),
+            mutable,
+            partition,
+            key,
+            context,
+            flags,
+            options.with_decompress(),
+            session,
+        )
+        .await?;
+
+        let written = deliver_root_into_buffer(
+            store,
+            partition,
+            root.address,
+            None,
+            root.fragment,
+            root.buffer,
+            dst,
+            options.with_decompress(),
+            0,
+            root.session,
+        )
+        .await?;
+        Ok((root.resolved, written))
     }
-
-    // The resolve here is authoritative, so the address it answers with is read the way any other
-    // named address is.
-    let root = resolve_root(
-        store.clone(),
-        mutable,
-        partition,
-        key,
-        context,
-        flags,
-        options.with_decompress(),
-        session,
-    )
-    .await?;
-
-    let options = options.with_decompress();
-    if let Some(max) = options.max_content_size
-        && root.fragment.size_content > max
-    {
-        return Err(StorageError::from(crate::errors::Oversized {
-            context: format!(
-                "fragment size_content {} exceeds caller-supplied max {max}",
-                root.fragment.size_content
-            ),
-        }));
-    }
-
-    let written = deliver_root_into_buffer(
-        store,
-        partition,
-        root.address,
-        None,
-        root.fragment,
-        root.buffer,
-        dst,
-        options,
-        0,
-        root.session,
-    )
-    .await?;
-    Ok((root.resolved, written))
 }
 
 /// [`read_resolved`] writing the content into a file instead of reassembling it in memory —
@@ -2086,8 +2613,10 @@ pub async fn read_resolved_into_buffer(
 /// A key with no mapping, or one naming content that cannot be read, fails without touching
 /// `path` — there is no zero-hash truncation here, because a resolve that finds nothing is a miss
 /// rather than an address for empty content.
-#[allow(clippy::too_many_arguments)]
-pub async fn read_resolved_into_file(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+pub fn read_resolved_into_file(
     store: Arc<dyn ImmutableStore>,
     mutable: Arc<dyn MutableStore>,
     partition: Partition,
@@ -2099,43 +2628,45 @@ pub async fn read_resolved_into_file(
     range: Option<Range<usize>>,
     options: ReadOptions,
     session: Option<Arc<StorageSession>>,
-) -> Result<(Hash, Fragment), StorageError> {
-    let _count_permit = file_count_limit_acquire()
-        .await
-        .forward::<StorageError>("permit failed")?;
+) -> impl Future<Output = Result<(Hash, Fragment), StorageError>> {
+    async move {
+        let _count_permit = file_count_limit_acquire()
+            .await
+            .forward::<StorageError>("permit failed")?;
 
-    let options = options.with_decompress();
-    let root = resolve_root(
-        store.clone(),
-        mutable,
-        partition,
-        key,
-        context,
-        flags,
-        options,
-        session,
-    )
-    .await?;
+        let root = resolve_root(
+            store.clone(),
+            mutable,
+            partition,
+            key,
+            context,
+            flags,
+            options.with_decompress(),
+            session,
+        )
+        .await?;
 
-    write_root_to_file(
-        store,
-        partition,
-        root.address,
-        root.fragment,
-        root.buffer,
-        path,
-        temp_file_extension,
-        range,
-        options,
-        root.session,
-    )
-    .await?;
+        write_root_to_file(
+            store,
+            partition,
+            root.address,
+            root.fragment,
+            root.buffer,
+            path,
+            temp_file_extension,
+            range,
+            options.with_decompress(),
+            root.session,
+        )
+        .await?;
 
-    Ok((root.resolved, root.fragment))
+        Ok((root.resolved, root.fragment))
+    }
 }
 
-/// [`remote_get_retry`] for `get_resolved`: back off on `SlowDown`, recover from a stale
-/// session id by invalidating and retrying. `key` supplies error context only.
+/// [`remote_get_retry`] for `get_resolved`: back off on `SlowDown`, and retry a stale session id
+/// or a refusal on a fresh session as [`SessionRetries::retry`] bounds and paces them. `key`
+/// supplies error context only.
 async fn remote_get_resolved_retry(
     session: &StorageSession,
     key: Hash,
@@ -2148,7 +2679,7 @@ async fn remote_get_resolved_retry(
         return Ok(served);
     }
     let mut retry = crate::store_retry();
-    let mut stale_session_retries: u32 = 0;
+    let mut session_retries = SessionRetries::default();
     let key_address = Address { hash: key, context };
     loop {
         debug_assert!(!key.is_zero(), "Cannot resolve zero key from store");
@@ -2161,26 +2692,27 @@ async fn remote_get_resolved_retry(
             }
             Err(err) => {
                 let storage_err = crate::error::protocol_error_to_storage(err, key_address);
-                if matches!(storage_err, StorageError::NotConnected(_))
-                    && stale_session_retries < MAX_STALE_SESSION_RETRIES
+                if !session_retries
+                    .retry(&storage_err, session, &mut retry)
+                    .await
                 {
-                    stale_session_retries += 1;
-                    session.invalidate().await;
-                    if !retry.wait().await {
-                        return Err(storage_err);
-                    }
-                    continue;
+                    return Err(storage_err);
                 }
-                return Err(storage_err);
             }
         }
     }
 }
 
-/// Shared tail of [`read_resolved`]: enforce `max_content_size`, clamp `range` to the content, and
-/// reassemble a fragment list's leaves through [`load_fragment`], which may fetch them remotely.
-#[allow(clippy::too_many_arguments)]
-async fn read_resolved_content(
+/// The `range` of the content rooted at `fragment` and `buffer`, a root loaded expanded and within
+/// `options.max_content_size`.
+///
+/// The range is cut from `buffer` where one fragment holds the content ([`cut_content`]), and
+/// otherwise reassembled from the list's leaves through [`load_fragment`], which may fetch them
+/// remotely.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn read_root_content(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -2189,54 +2721,56 @@ async fn read_resolved_content(
     range: Option<Range<usize>>,
     options: ReadOptions,
     session: Option<Arc<StorageSession>>,
-) -> Result<Bytes, StorageError> {
-    if let Some(max) = options.max_content_size
-        && fragment.size_content > max
-    {
-        return Err(StorageError::from(crate::errors::Oversized {
-            context: format!(
-                "fragment size_content {} exceeds caller-supplied max {max}",
-                fragment.size_content
-            ),
-        }));
-    }
+) -> impl Future<Output = Result<Bytes, StorageError>> {
+    async move {
+        let range = resolve_content_range(range, fragment.size_content);
+        if range.is_empty() {
+            return Ok(Bytes::default());
+        }
 
-    let range = match range {
-        Some(range) => {
-            min(range.start, fragment.size_content as usize)
-                ..min(range.end, fragment.size_content as usize)
+        if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
+            let size = range.len();
+            let mut content = crate::CallerBuffer::allocate(size);
+            read_defragment(
+                store,
+                partition,
+                address,
+                range,
+                fragment,
+                buffer,
+                // SAFETY: `size` is the length of `content`, which nothing writes through: the
+                // walk returns once every handle it gave out is gone, and `content` drops with
+                // this future.
+                unsafe { content.prefix(size) },
+                options,
+                0,
+                session,
+            )
+            .await?;
+            assembled(content)
+        } else {
+            cut_content(&buffer, range)
         }
-        None => 0..fragment.size_content as usize,
-    };
-    if range.is_empty() {
-        return Ok(Bytes::default());
     }
+}
 
-    if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
-        let mut target_buffer = BytesMut::with_capacity(range.len());
-        // Safety: the capacity was just reserved, and read_defragment fully writes the range
-        // before the buffer is read back.
-        unsafe {
-            target_buffer.set_len(range.len());
-        }
-        let target_size = target_buffer.len();
-        let target = target_buffer.split();
-        read_defragment(
-            store, partition, address, range, fragment, buffer, target, options, 0, session,
-        )
-        .await?;
-        if !target_buffer.try_reclaim(target_size) {
-            return Err(StorageError::internal(
-                "failed to reclaim buffer after defragmenting",
-            ));
-        }
-        // Safety: try_reclaim just confirmed the split-off target bytes are back in this
-        // buffer's capacity, and read_defragment initialized all of them.
-        unsafe {
-            target_buffer.set_len(target_size);
-        }
-        Ok(target_buffer.freeze())
-    } else {
-        Ok(buffer.slice(range))
+/// The content a walk assembled into `content`, which a walk that succeeds writes whole, handed
+/// back without a copy.
+fn assembled(content: crate::CallerBuffer) -> Result<Bytes, StorageError> {
+    // SAFETY: the walk succeeded, so it wrote every byte of its range.
+    unsafe { content.into_bytes() }
+        .ok_or_else(|| StorageError::internal("failed to reclaim buffer after defragmenting"))
+}
+
+/// The `range` of `buffer`, content one fragment holds, failing rather than panicking where the
+/// range reaches past it. The size checks and the decoder give a root exactly `size_content` bytes,
+/// so every range [`resolve_content_range`] answers for it lies within.
+fn cut_content(buffer: &Bytes, range: Range<usize>) -> Result<Bytes, StorageError> {
+    if range.end > buffer.len() {
+        return Err(StorageError::internal(format!(
+            "content range {range:?} reaches past the {} byte root",
+            buffer.len()
+        )));
     }
+    Ok(buffer.slice(range))
 }

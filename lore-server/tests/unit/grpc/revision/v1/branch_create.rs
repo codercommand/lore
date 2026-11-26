@@ -53,21 +53,31 @@ use std::sync::Arc;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_proto::lore::revision::v1::BranchCreateRequest;
 use lore_proto::lore::revision::v1::BranchCreateResponse;
+use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
+use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::util;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::grpc::revision::v1::branch_create::*;
 use lore_server::hooks::HookDispatcher;
+use lore_server::hooks::HookPoint;
+use lore_storage::StoreError;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
+use mockall::predicate::eq;
 use opentelemetry::KeyValue;
 use rand::random;
 use tonic::Request;
 
 use crate::notification::testing::MockNotificationSender;
+use crate::store::test_support::FailingLoadStore;
 use crate::store::test_support::test_store_create;
+use crate::util::hook_recorder::Seen;
+use crate::util::hook_recorder::recording_dispatcher;
 
+#[derive(Clone)]
 struct TestInstrumentProvider {}
 
 impl InstrumentProvider for TestInstrumentProvider {
@@ -109,9 +119,10 @@ mod direct_handling {
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let response = handler(
                 request,
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -164,10 +175,11 @@ mod direct_handling {
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let before = util::time::timestamp();
             let response = handler(
                 request,
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -215,9 +227,10 @@ mod direct_handling {
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let err = handler(
                 request,
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -263,9 +276,10 @@ mod direct_handling {
                 ..AuthorizationToken::default()
             });
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let response = handler(
                 request,
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -315,9 +329,10 @@ mod direct_handling {
                 request
             };
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             handler(
                 make_request(),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -330,6 +345,7 @@ mod direct_handling {
 
             let err = handler(
                 make_request(),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -340,6 +356,334 @@ mod direct_handling {
             .await
             .expect_err("duplicate id should fail");
             assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        }))
+        .await;
+    }
+
+    /// A create that restores an archived branch, dropped while the restore reads the branch's
+    /// metadata, as one whose deadline passes or whose client leaves is, still restores it,
+    /// notifies of it and spawns its post hooks: the restore runs on in a task of its own, which
+    /// notifies after the name maps to the branch.
+    #[tokio::test]
+    async fn a_dropped_create_restores_the_branch() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let (notify, mut notified) = tokio::sync::mpsc::unbounded_channel();
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_created()
+            .with(eq(repository), eq(branch_id))
+            .times(1)
+            .returning(move |_, _| {
+                notify
+                    .send(())
+                    .expect("the test waits for the notification");
+            });
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            crate::util::test_support::create_test_branch(repository_context.clone(), branch_id)
+                .await;
+            branch::delete(repository_context.clone(), branch_id)
+                .await
+                .expect("the branch is archived");
+            let gated = crate::util::test_support::gate_metadata_loads(
+                mutable_store.clone(),
+                repository,
+                branch_id,
+                0,
+            );
+            let mut request = Request::new(BranchCreateRequest {
+                id: branch_id.into(),
+                name: "test-name".into(),
+                creator: Some("alice".into()),
+                category: "default".into(),
+                stack: vec![],
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+
+            let (hook_dispatcher, mut post_hooks) =
+                crate::util::hook_recorder::post_recording_dispatcher(&[HookPoint::BranchCreate]);
+            let authorizer = crate::util::test_support::allow_all_authorizer();
+            crate::util::test_support::drop_at_gated_load(
+                handler(
+                    request,
+                    &authorizer,
+                    immutable_store.clone(),
+                    gated.clone(),
+                    notification_sender.clone(),
+                    &None, /* no forwarded requests */
+                    &hook_dispatcher,
+                    &instrument_provider,
+                ),
+                &gated,
+            )
+            .await;
+
+            crate::util::test_support::wait_for_message(
+                &mut notified,
+                (),
+                "the dropped create notifies of the restored branch",
+            )
+            .await;
+            crate::util::test_support::wait_for_message(
+                &mut post_hooks,
+                HookPoint::BranchCreate,
+                "the dropped create spawns its post hooks",
+            )
+            .await;
+            assert_eq!(
+                branch::load_name_to_id_local(repository_context, "test-name")
+                    .await
+                    .ok(),
+                Some(branch_id),
+                "the dropped create restores the branch"
+            );
+        }))
+        .await;
+    }
+
+    /// A create whose read of the branch's metadata fails in the store fails as `INTERNAL`, a
+    /// server fault, rather than as the caller's invalid argument.
+    #[tokio::test]
+    async fn a_store_failure_fails_the_create_as_internal() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let (metadata_key, _key_type) = branch::mutable_key(
+                lore_revision::repository::SALT_LORE,
+                branch::METADATA,
+                repository,
+                branch_id,
+            );
+            let failing = FailingLoadStore::for_key(
+                mutable_store.clone(),
+                metadata_key,
+                StoreError::internal("injected metadata failure"),
+            );
+            let mut request = Request::new(BranchCreateRequest {
+                id: branch_id.into(),
+                name: "test-name".into(),
+                creator: Some("alice".into()),
+                category: "default".into(),
+                stack: vec![],
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
+            let err = handler(
+                request,
+                &crate::util::test_support::allow_all_authorizer(),
+                immutable_store.clone(),
+                failing,
+                notification_sender.clone(),
+                &None, /* no forwarded requests */
+                &hook_dispatcher,
+                &instrument_provider,
+            )
+            .await
+            .expect_err("the metadata read fails");
+
+            assert_eq!(err.code(), tonic::Code::Internal, "got {err:?}");
+        }))
+        .await;
+    }
+
+    fn create_request(repository: RepositoryId, name: &str) -> Request<BranchCreateRequest> {
+        let mut request = Request::new(BranchCreateRequest {
+            id: BranchId::from(uuid::Uuid::now_v7()).into(),
+            name: name.into(),
+            creator: Some("alice".into()),
+            category: "default".into(),
+            stack: vec![],
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+        request
+    }
+
+    #[tokio::test]
+    async fn pre_hook_sees_branch_name_and_service_account() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_created()
+            .return_once(|_, _| ());
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let mut request = create_request(repository, "release/1.0");
+            request.extensions_mut().insert(AuthorizationToken {
+                user_id: "ci-bot".into(),
+                is_service_account: Some(true),
+                ..AuthorizationToken::default()
+            });
+
+            let (hook_dispatcher, seen) = recording_dispatcher(false);
+            handler(
+                request,
+                &crate::util::test_support::allow_all_authorizer(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &None, /* no forwarded requests */
+                &hook_dispatcher,
+                &instrument_provider,
+            )
+            .await
+            .expect("create should succeed");
+
+            assert_eq!(
+                *seen.lock(),
+                vec![Seen {
+                    branch_name: Some("release/1.0".into()),
+                    is_service_account: Some("true".into()),
+                }]
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejected_create_creates_nothing() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let (hook_dispatcher, _seen) = recording_dispatcher(true);
+            let err = handler(
+                create_request(repository, "main"),
+                &crate::util::test_support::allow_all_authorizer(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &None, /* no forwarded requests */
+                &hook_dispatcher,
+                &instrument_provider,
+            )
+            .await
+            .expect_err("a rejected create should fail");
+
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            assert!(
+                branch::load_name_to_id_local(repository_context, "main")
+                    .await
+                    .is_err(),
+                "a rejected create must not map the name",
+            );
+        }))
+        .await;
+    }
+
+    /// A cancelled create answers CANCELLED before it writes the branch or notifies of it.
+    #[tokio::test]
+    async fn a_cancelled_create_writes_no_branch() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        // No expectation is set, so a notification fails the test.
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let cancellation = lore_revision::runtime::Cancellation::new();
+            cancellation.cancel();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
+            let err = lore_server::util::core_hop::with_request_cancellation(
+                cancellation,
+                handler(
+                    create_request(repository, "main"),
+                    &crate::util::test_support::allow_all_authorizer(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    notification_sender.clone(),
+                    &None, /* no forwarded requests */
+                    &hook_dispatcher,
+                    &instrument_provider,
+                ),
+            )
+            .await
+            .expect_err("a cancelled create stops before it writes the branch");
+            assert_eq!(err.code(), tonic::Code::Cancelled, "{err:?}");
+
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+                allow_all_repositories(),
+            ));
+            let err = branch::load_name_to_id_local(repository_context, "main")
+                .await
+                .expect_err("a cancelled create maps no name");
+            assert!(err.is_branch_not_found(), "unexpected error: {err:?}");
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oversized_name_is_rejected_before_pre_hooks() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let (hook_dispatcher, seen) = recording_dispatcher(false);
+            let name = "x".repeat(branch::MAX_NAME_LEN + 1);
+            let err = handler(
+                create_request(repository, &name),
+                &crate::util::test_support::allow_all_authorizer(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &None, /* no forwarded requests */
+                &hook_dispatcher,
+                &instrument_provider,
+            )
+            .await
+            .expect_err("an oversized name should fail");
+
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(seen.lock().is_empty());
         }))
         .await;
     }
@@ -446,6 +790,13 @@ mod forwarded_request {
 {
             unreachable!("forwarded_repository_service should not be called in branch_create tests")
         }
+
+        fn forwarded_lock_service(
+            &self,
+        ) -> Box<dyn lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient>
+        {
+            unreachable!("forwarded_lock_service should not be called in branch_create tests")
+        }
     }
 
     fn make_request(repository: RepositoryId, branch_id: BranchId) -> Request<BranchCreateRequest> {
@@ -486,10 +837,11 @@ mod forwarded_request {
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
             let response = handler(
                 make_request(repository, branch_id),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store,
                 mutable_store,
                 notification_sender,
@@ -525,10 +877,11 @@ mod forwarded_request {
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
             let err = handler(
                 make_request(repository, branch_id),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store,
                 mutable_store,
                 notification_sender,
@@ -559,10 +912,11 @@ mod forwarded_request {
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
             let err = handler(
                 make_request(repository, branch_id),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store,
                 mutable_store,
                 notification_sender,
@@ -599,10 +953,11 @@ mod forwarded_request {
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
             let response = handler(
                 make_request(repository, branch_id),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store,
                 mutable_store,
                 notification_sender,

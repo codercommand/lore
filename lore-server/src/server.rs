@@ -25,34 +25,39 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::LoreTaskLifecycleEvent;
 use lore_base::runtime::LoreTaskSpawn;
 use lore_base::runtime::TaskLifecycleObserver;
+use lore_base::runtime::report_serving_runtime;
 use lore_base::runtime::runtime;
-use lore_base::runtime::runtime_with_settings;
+use lore_base::runtime::serving_runtime;
 use lore_base::runtime::set_task_lifecycle_observer;
 use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_revision::cluster::topology::Topology;
 use lore_revision::environment::EnvironmentConfig;
 use lore_revision::lock::LockStore;
+use lore_revision::lock::util::store_lock_batch_size;
 use lore_revision::notification::NotificationSender;
 use lore_revision::runtime::execution_context;
+use lore_revision::store::composite::CompositeStore;
 use lore_revision::store::composite::CompositeStoreBuilder;
 use lore_revision::store::remote::RemoteImmutableStore;
 use lore_revision::store::remote::RemoteMutableStore;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::assume_server_policies;
 use lore_storage::compress::COMPRESSION_MODE;
+use lore_storage::flush_stores;
 use lore_storage::hash::StringHash;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
+use lore_storage::local::store_lock::StoreHold;
 use lore_telemetry::execution_state::ServerExecutionState;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
-use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
 use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
 use lore_transport::set_fallback_user_agent_product;
-use lore_transport::user_agent_product;
+use lore_transport::user_agent_with_component;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::UpDownCounter;
@@ -68,8 +73,8 @@ use tracing::info_span;
 use tracing::trace;
 use tracing::warn;
 
-use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
 use crate::auth::oidc::advertised_oidc;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
@@ -127,6 +132,7 @@ use crate::store::resolve_plugin_config_with_fallback;
 use crate::telemetry::OtelTokioRuntimeMetrics;
 use crate::telemetry::ResourceDetectorProvider;
 use crate::telemetry::TelemetryInitializer;
+use crate::telemetry::register_io_pool_metrics;
 use crate::tls::load_client_tls;
 use crate::topology::configure_topology_with_registry;
 use crate::util::setup_execution;
@@ -186,6 +192,14 @@ pub struct Cli {
 /// // Base server with no plugins
 /// lore_server::server::server_main(ServerConfig::default()).unwrap();
 /// ```
+/// The runtime the server runs on, sized for serving as `settings.tokio` configures it (see
+/// [`serving_runtime`]). Runs before anything else in the server builds a runtime, since each is
+/// sized once.
+#[lore_macro::test_pub]
+fn server_runtime(settings: &Settings) -> tokio::runtime::Handle {
+    serving_runtime(settings.tokio.clone())
+}
+
 pub fn server_main(config: ServerConfig) -> Result<()> {
     set_fallback_user_agent_product("lore-server".to_string());
     assume_server_policies();
@@ -196,17 +210,7 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
 
     lore_base::log::set_log_callback(Some(server_log_dispatch));
 
-    // Server default: one net-runtime thread per processor — serving
-    // thousands of concurrent client connections is its normal case. An
-    // explicit `tokio.net_threads` config (seeded first inside
-    // runtime_with_settings) wins over this default.
-    let runtime_handle = match settings.tokio.as_ref() {
-        Some(tokio) => runtime_with_settings(Some(tokio.clone())),
-        None => runtime(),
-    };
-    let _ = lore_base::runtime::set_net_threads_default(
-        std::thread::available_parallelism().map_or(2, |count| count.get()),
-    );
+    let runtime_handle = server_runtime(&settings);
     let result = runtime_handle.block_on({
         let execution = setup_execution(module_path!(), String::default(), String::default());
         #[allow(clippy::large_futures)]
@@ -220,7 +224,9 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
         runtime_shutdown_timeout as u64,
     ));
 
-    result
+    // Released only now that the runtime has dropped every request task and what it spawned:
+    // until then one could still be using the store files.
+    result.map(drop)
 }
 
 /// Waits for a shutdown signal, then drains all endpoints within the given timeout.
@@ -330,7 +336,15 @@ async fn listen_for_termination(shutdown_tx: tokio::sync::watch::Sender<bool>) -
 
 impl From<QuicSettings> for QuinnConfigBuilder {
     fn from(settings: QuicSettings) -> Self {
-        let mut builder = QuinnConfigBuilder::default().num_listeners(settings.num_listeners);
+        let mut builder = QuinnConfigBuilder::default();
+
+        if let Some(v) = settings.num_listeners {
+            builder = builder.num_listeners(v);
+        };
+
+        if let Some(v) = settings.num_sockets {
+            builder = builder.num_sockets(v);
+        };
 
         if let Some(v) = settings.idle_timeout {
             builder = builder.idle_timeout(Duration::from_millis(v));
@@ -350,6 +364,14 @@ impl From<QuicSettings> for QuinnConfigBuilder {
 
         if let Some(v) = settings.transport_rtt {
             builder = builder.transport_rtt(v);
+        }
+
+        if let Some(v) = settings.initial_cwnd_bytes {
+            builder = builder.initial_cwnd(v);
+        }
+
+        if let Some(v) = settings.congestion_algorithm {
+            builder = builder.congestion_algorithm(v);
         }
 
         builder
@@ -441,13 +463,55 @@ pub fn compiled_features() -> Vec<String> {
     features
 }
 
+/// Narrow a configured batch limit to what the store behind it will actually take.
+///
+/// Whatever configuration asked for, a store that applies a request atomically only up to some size
+/// cannot be handed more than that. `0` is what the wire uses for "unset", so it reads as no
+/// configured limit rather than as a limit of nothing.
+fn narrow_to_store_limit(configured: &mut Option<usize>, limit: usize) {
+    let previous = configured.unwrap_or_default();
+
+    *configured = Some(if previous == 0 {
+        limit
+    } else {
+        limit.min(previous)
+    });
+}
+
+/// Narrow the batch limits `environment` advertises to what its stores take.
+///
+/// `query_limit`, when given, narrows the query limit. A lock store narrows the lock limit to
+/// [`store_lock_batch_size`] for it, including when the store names no limit of its own.
+#[lore_macro::test_pub]
+fn narrow_environment_to_stores(
+    environment: &mut EnvironmentConfig,
+    query_limit: Option<usize>,
+    lock_store: Option<&dyn LockStore>,
+) {
+    let lock_limit = lock_store.map(store_lock_batch_size);
+
+    if query_limit.is_none() && lock_limit.is_none() {
+        return;
+    }
+
+    let config = environment.config.get_or_insert_default();
+
+    if let Some(limit) = query_limit {
+        narrow_to_store_limit(&mut config.max_query_batch, limit);
+    }
+    if let Some(limit) = lock_limit {
+        narrow_to_store_limit(&mut config.max_lock_batch, limit);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn launch_grpc_server(
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
-    jwt_verifier: Option<JwtVerifier>,
+    token_verification: TokenVerification,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     repository_catalog: Arc<dyn RepositoryCatalog>,
     settings: Settings,
@@ -473,7 +537,7 @@ async fn launch_grpc_server(
     info!(
         "Starting Lore GRPC Server: {}, Auth: {} Locks: {}",
         &addr,
-        jwt_verifier.as_ref().map_or("disabled", |_| "enabled"),
+        token_verification.describe(),
         if locks { "enabled" } else { "disabled" },
     );
 
@@ -497,22 +561,16 @@ async fn launch_grpc_server(
     let mut environment = settings.environment.clone().unwrap_or_default();
     let feature = settings.feature.clone().unwrap_or_default();
 
-    // Enforce store limits
-    if let Some(limit) = immutable_store.max_query_batch() {
-        let mut config = environment.config.unwrap_or_default();
-        let previous_limit = config.max_query_batch.unwrap_or_default();
-        config.max_query_batch = Some(if previous_limit == 0 || limit < previous_limit {
-            limit
-        } else {
-            previous_limit
-        });
-        environment.config = Some(config);
-    }
+    narrow_environment_to_stores(
+        &mut environment,
+        immutable_store.max_query_batch(),
+        lock_store.as_deref(),
+    );
 
     GrpcServerBuilder::new()
         .with_environment(environment)
         .with_feature(feature)
-        .with_immutable_store(immutable_store, local_store)
+        .with_immutable_store(immutable_store, local_store, local_tier)
         .with_mutable_store(mutable_store)
         .with_lock_store(lock_store)
         .with_notification(notification_sender, notification_service)
@@ -534,7 +592,11 @@ async fn launch_grpc_server(
             user_agent_filter,
             forwarded_requests,
         )
-        .with_jwt_verifier(jwt_verifier, repository_authorizer, repository_catalog)?
+        .with_token_verification(
+            token_verification,
+            repository_authorizer,
+            repository_catalog,
+        )?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         })
@@ -599,6 +661,7 @@ async fn launch_grpc_internal_server(
     user_agent_filter: Arc<UserAgentFilter>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     jwt_verifier: Option<JwtVerifier>,
@@ -635,11 +698,16 @@ async fn launch_grpc_internal_server(
             ))?,
             immutable_store,
             mutable_store,
+            lock_store,
             notification_sender,
             hook_dispatcher,
             settings.environment.clone().unwrap_or_default(),
             jwt_verifier,
             repository_authorizer,
+            settings.feature.as_ref().map_or(
+                crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY,
+                crate::grpc::server::FeatureSettings::branch_list_concurrency,
+            ),
         )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
@@ -691,7 +759,7 @@ async fn launch_http_server(
     settings: LoreHttpServerSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
-    jwt_verifier: Option<JwtVerifier>,
+    token_verification: TokenVerification,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
@@ -699,7 +767,7 @@ async fn launch_http_server(
         settings,
         immutable_store,
         mutable_store,
-        jwt_verifier,
+        token_verification,
         repository_authorizer,
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
@@ -763,7 +831,7 @@ impl QuicPublicStreamHandler {
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
-        jwt_verifier: Option<JwtVerifier>,
+        token_verification: TokenVerification,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         limits: AdmissionLimits,
         user_agent_filter: Arc<UserAgentFilter>,
@@ -774,11 +842,11 @@ impl QuicPublicStreamHandler {
             |immutable_store: Arc<dyn ImmutableStore>,
              local_store: Arc<dyn ImmutableStore>,
              mutable_store: Arc<dyn MutableStore>,
-             jwt_verifier: Option<JwtVerifier>,
+             token_verification: TokenVerification,
              repository_authorizer: Arc<dyn RepositoryAuthorizer>| {
                 Box::new(move |context: Arc<AttributeMap>| {
                     let storage_protocol = StorageService::new(
-                        Arc::new(jwt_verifier.clone()),
+                        Arc::new(token_verification.clone()),
                         repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
@@ -798,7 +866,7 @@ impl QuicPublicStreamHandler {
                 immutable_store.clone(),
                 local_store.clone(),
                 mutable_store.clone(),
-                jwt_verifier.clone(),
+                token_verification.clone(),
                 repository_authorizer.clone(),
             ),
         );
@@ -806,19 +874,20 @@ impl QuicPublicStreamHandler {
             let immutable_store = immutable_store.clone();
             let local_store = local_store.clone();
             let mutable_store = mutable_store.clone();
-            let jwt_verifier = jwt_verifier.clone();
+            let token_verification = token_verification.clone();
             let repository_authorizer = repository_authorizer.clone();
             let user_agent_filter = user_agent_filter.clone();
             service_store.add_service(
                 StorageClient::ALPN,
                 Box::new(move |context: Arc<AttributeMap>| {
                     let v4_service = crate::quic::storage_service_v4::StorageServiceV4::new(
-                        Arc::new(jwt_verifier.clone()),
+                        Arc::new(token_verification.clone()),
                         repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
                         mutable_store.clone(),
                         user_agent_filter.clone(),
+                        crate::protocol::storage::session::SessionMap::default(),
                     );
                     Box::new(StreamHandler::new(Arc::new(v4_service), context, limits))
                         as Box<dyn StreamDataHandler>
@@ -892,14 +961,44 @@ impl StreamHandlerFactory for QuicInternalStreamHandler {
     }
 }
 
+struct ConfiguredImmutableStore {
+    /// The store the server reads through.
+    store: Arc<dyn ImmutableStore>,
+    /// The store that reads through `store` fill with what they read. `None` where they fill none.
+    local_tier: Option<Arc<dyn ImmutableStore>>,
+}
+
+impl ConfiguredImmutableStore {
+    fn without_local_tier(store: Arc<dyn ImmutableStore>) -> Self {
+        Self {
+            store,
+            local_tier: None,
+        }
+    }
+}
+
 async fn configure_immutable_store_via_plugin(
     registry: &PluginRegistry,
     settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
-) -> Result<Arc<dyn ImmutableStore>> {
+) -> Result<ConfiguredImmutableStore> {
     let mode = &settings.immutable_store.mode;
 
-    match mode.as_str() {
+    if mode == store_mode::COMPOSITE {
+        let composite_settings = settings
+            .immutable_store
+            .composite
+            .as_ref()
+            .ok_or(anyhow!("Missing composite store settings"))?;
+        let composite =
+            configure_composite_store(registry, composite_settings, settings, topology).await?;
+        return Ok(ConfiguredImmutableStore {
+            local_tier: Some(composite.local()),
+            store: composite,
+        });
+    }
+
+    let store = match mode.as_str() {
         store_mode::LOCAL => {
             let local_settings = settings
                 .immutable_store
@@ -908,15 +1007,6 @@ async fn configure_immutable_store_via_plugin(
                 .ok_or(anyhow!("Missing local immutable store settings"))?;
 
             configure_local_immutable_store(local_settings).await
-        }
-        store_mode::COMPOSITE => {
-            let composite_settings = settings
-                .immutable_store
-                .composite
-                .as_ref()
-                .ok_or(anyhow!("Missing composite store settings"))?;
-
-            configure_composite_store(registry, composite_settings, settings, topology).await
         }
         store_mode::REPLICATED => {
             let replicated_settings = settings
@@ -934,7 +1024,7 @@ async fn configure_immutable_store_via_plugin(
                 .as_ref()
                 .ok_or(anyhow!("Missing remote immutable store settings"))?;
 
-            configure_remote_immutable_store(remote_settings)
+            configure_remote_immutable_store(remote_settings, settings.server.upstream_connections)
         }
         _ => {
             // All other modes use the plugin system
@@ -948,7 +1038,8 @@ async fn configure_immutable_store_via_plugin(
                 .create_immutable_store(mode, &plugin_config)
                 .map_err(|e| anyhow!("Failed to create immutable store plugin '{mode}': {e}"))
         }
-    }
+    }?;
+    Ok(ConfiguredImmutableStore::without_local_tier(store))
 }
 
 async fn configure_mutable_store_via_plugin(
@@ -975,7 +1066,7 @@ async fn configure_mutable_store_via_plugin(
                 .as_ref()
                 .ok_or(anyhow!("Missing remote mutable store settings"))?;
 
-            configure_remote_mutable_store(remote_settings)
+            configure_remote_mutable_store(remote_settings, settings.server.upstream_connections)
         }
         store_mode::REPLICATED => Err(anyhow!("replicated mutable store is not implemented")),
         store_mode::COMPOSITE => Err(anyhow!(
@@ -1308,6 +1399,11 @@ fn generate_ephemeral_certificate(endpoint: &str) -> Result<crate::tls::Certific
     })
 }
 
+/// Whether the server runs in maintenance mode, serving no store.
+fn maintenance_mode() -> bool {
+    std::env::var("LORE_SERVER_MAINTENANCE").is_ok_and(|v| v == "1")
+}
+
 async fn create_local_store(
     settings: &LocalImmutableStoreSettings,
     flush_background: bool,
@@ -1336,6 +1432,7 @@ async fn create_local_store(
             isolate_partitions: true, /* Server mode, one process holds content for every tenant */
             flush_background,
             flush_delay_seconds: settings.flush_delay_seconds as u64,
+            defer_eviction_flush: !maintenance_mode(), /* Server mode, no other process uses the server's stores, so unwritten buckets holding a store's flock block nobody; in maintenance mode the stores are left free for the maintenance */
             target_capacity_percentage: settings.target_capacity_percentage.unwrap_or(default_settings.target_capacity_percentage),
             target_size_percentage: settings.target_size_percentage.unwrap_or(default_settings.target_size_percentage),
             compaction_parallel_groups: settings.compaction_parallel_groups.unwrap_or(default_settings.compaction_parallel_groups),
@@ -1343,6 +1440,7 @@ async fn create_local_store(
             atime: true,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
+            reuse_state_across_holds: true, /* Server mode, claimed for its life once configured: keeps what it loaded before the claim */
         },
     )
     .await
@@ -1387,34 +1485,37 @@ async fn configure_local_mutable_store(
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
             authoritative: true, /* Server local store is the source of truth, not a cache */
+            reuse_state_across_holds: true, /* Server mode, claimed for its life once configured: keeps what it loaded before the claim */
         },
         immutable_store,
     )
     .await?)
 }
 
+#[lore_macro::test_pub]
 fn configure_remote_immutable_store(
     settings: &RemoteStoreSettings,
+    upstream_connections: u32,
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!(
         "Wiring up remote immutable store to {}",
         settings.remote_url
     );
 
-    Ok(Arc::new(RemoteImmutableStore::new(
-        settings.remote_url.as_str(),
-        settings.auth_url.as_deref(),
-    )))
+    Ok(Arc::new(
+        RemoteImmutableStore::new(settings.remote_url.as_str(), settings.auth_url.as_deref())
+            .verifying(settings.verify)
+            .connecting_over(upstream_connections as usize)
+            .congestion_algorithm(settings.congestion_algorithm),
+    ))
 }
 
-async fn configure_replicated_immutable_store(
+/// The factory of a replicated store's clients, each connecting to the remote as `settings`
+/// configure it.
+#[lore_macro::test_pub]
+fn replicated_client_factory(
     settings: &ReplicatedStoreSettings,
-) -> Result<Arc<dyn ImmutableStore>> {
-    info!(
-        "Wiring up replicated immutable store to {}",
-        settings.remote_url
-    );
-
+) -> client_container::QuicClientFactory {
     let certs = if let Some(setting_certs) = &settings.certs {
         let setting_certs = setting_certs.clone();
         client::CertificateSettings {
@@ -1446,10 +1547,22 @@ async fn configure_replicated_immutable_store(
     if let Some(expected_rtt_ms) = settings.expected_rtt_ms {
         factory.transport_config.expected_rtt_ms = expected_rtt_ms;
     }
-    factory.user_agent = Some(make_user_agent_with_component(
-        user_agent_product(),
-        "replicated-immutable-store",
-    ));
+    factory.transport_config.initial_cwnd = Some(settings.initial_cwnd_bytes.get());
+    factory.transport_config.congestion_algorithm = settings.congestion_algorithm;
+    factory.user_agent = Some(user_agent_with_component("replicated-immutable-store"));
+    factory
+}
+
+async fn configure_replicated_immutable_store(
+    settings: &ReplicatedStoreSettings,
+) -> Result<Arc<dyn ImmutableStore>> {
+    info!(
+        remote_url = %settings.remote_url,
+        num_clients = settings.num_clients,
+        "Wiring up replicated immutable store"
+    );
+
+    let factory = replicated_client_factory(settings);
 
     let container_config = ClientContainerConfig {
         regenerate_retry_policy: (&settings.regenerate_retry).into(),
@@ -1459,23 +1572,28 @@ async fn configure_replicated_immutable_store(
     let store = ReplicatedStore::new(
         Arc::new(factory),
         container_config,
-        Duration::from_secs(settings.periodic_client_refresh_secs),
+        settings.num_clients,
+        Duration::from_secs(settings.periodic_client_refresh_secs.get()),
         Duration::from_secs(settings.client_metrics_interval_seconds),
     )
     .await?;
     Ok(store)
 }
 
-fn configure_remote_mutable_store(settings: &RemoteStoreSettings) -> Result<Arc<dyn MutableStore>> {
+fn configure_remote_mutable_store(
+    settings: &RemoteStoreSettings,
+    upstream_connections: u32,
+) -> Result<Arc<dyn MutableStore>> {
     info!("Wiring up remote mutable store to {}", settings.remote_url);
 
     // TODO(mjansson): Identity handling
     let identity = None::<&str>;
 
-    Ok(Arc::new(RemoteMutableStore::new(
-        settings.remote_url.as_str(),
-        identity,
-    )))
+    Ok(Arc::new(
+        RemoteMutableStore::new(settings.remote_url.as_str(), identity)
+            .connecting_over(upstream_connections as usize)
+            .congestion_algorithm(settings.congestion_algorithm),
+    ))
 }
 
 async fn configure_composite_store(
@@ -1483,7 +1601,7 @@ async fn configure_composite_store(
     settings: &CompositeStoreSettings,
     global_settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
-) -> Result<Arc<dyn ImmutableStore>> {
+) -> Result<Arc<CompositeStore>> {
     info!("Wiring up Composite store");
 
     let mut composite_store_builder = CompositeStoreBuilder::default()
@@ -1491,7 +1609,14 @@ async fn configure_composite_store(
             settings.cache_metadata.unwrap_or_default(),
             settings.cache_metadata_semaphore_size,
         )
-        .with_record_copy_out_of_band(settings.record_copy_out_of_band);
+        .with_record_copy_out_of_band(settings.record_copy_out_of_band)
+        .with_read_replica_selection(settings.read_replica_selection.unwrap_or_default())
+        .with_round_robin_tries(
+            settings.round_robin_max_tries,
+            settings
+                .round_robin_try_limit_ms
+                .map(|limit| Duration::from_millis(limit.get())),
+        );
 
     // dragon: start — restore a missing bucket index before the local store opens.
     // Opening the local store creates empty index directories. Prepare would
@@ -1622,11 +1747,21 @@ async fn configure_composite_store(
         factory.quic_monitor_interval =
             Duration::from_secs(factory_settings.quic_client_monitor_interval_seconds);
         factory.enable_same_region_write = factory_settings.enable_same_region_write;
+        factory.initial_cwnd_bytes = factory_settings.initial_cwnd_bytes;
+        factory.slow_response_threshold = factory_settings
+            .slow_response_threshold_ms
+            .map(Duration::from_millis);
 
         composite_store_builder = composite_store_builder.with_replica_builder(Arc::new(factory));
     }
 
     let store = Arc::new(composite_store_builder.build()?);
+    info!(
+        read_replica_selection = ?store.read_replica_selection(),
+        round_robin_max_tries = store.round_robin_max_tries(),
+        round_robin_try_limit = ?store.round_robin_try_limit(),
+        "Composite store read replicas"
+    );
 
     if let Some(topology) = &topology {
         store
@@ -1682,7 +1817,10 @@ async fn configure_composite_substore(
                 .as_ref()
                 .ok_or(anyhow!("Missing composite remote store settings"))?;
 
-            configure_remote_immutable_store(remote_settings)
+            configure_remote_immutable_store(
+                remote_settings,
+                global_settings.server.upstream_connections,
+            )
         }
         store_mode::COMPOSITE => Err(anyhow!(
             "Composite store not supported as a composite substore"
@@ -1851,8 +1989,7 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
                 .expect("Could not downcast store");
 
             let margin = std::env::var("LORE_SEEDING_MARGIN")
-                .map(|v| v.parse::<usize>().unwrap_or_default())
-                .unwrap_or_default();
+                .map_or_default(|v| v.parse::<usize>().unwrap_or_default());
 
             let buffer = std::env::var("LORE_SEEDING_BUFFER").map_or(DEFAULT_BUFFER_SIZE, |v| {
                 v.parse::<usize>().unwrap_or(DEFAULT_BUFFER_SIZE)
@@ -1870,7 +2007,10 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
             info!("Done seeding local store, flushing store to disk.");
             // Since we effectively disabled background flushing, we force a flush once seeding is
             // complete
-            store.flush(true).await.map_err(anyhow::Error::from)?;
+            store
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .map_err(anyhow::Error::from)?;
             info!("Done flushing store to disk.");
 
             result
@@ -1953,14 +2093,16 @@ impl ResourceDetectorProvider for PluginResourceDetectorProvider<'_> {
     fn detectors(&self, runtime_handle: Handle) -> Vec<Box<dyn ResourceDetector>> {
         let mut detectors = self
             .inner
-            .map(|provider| provider.detectors(runtime_handle.clone()))
-            .unwrap_or_default();
+            .map_or_default(|provider| provider.detectors(runtime_handle.clone()));
         detectors.extend(self.registry.resource_detectors(runtime_handle));
         detectors
     }
 }
 
-async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> Result<()> {
+/// Serves until shutdown, and returns the hold on the stores it served, for the caller to release
+/// once the runtime has shut down. Request work runs in tasks of its own that closing the
+/// endpoints does not stop, so the stores stay claimed until the runtime has dropped them.
+async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> Result<StoreHold> {
     // Initialize metrics and tracing telemetry, returns a guard that will cleanup when it falls out
     // of scope
     let (mut settings, settings_hash) = settings;
@@ -1974,6 +2116,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             .and_then(|composite| composite.durable.as_ref())
             .is_some_and(|durable| durable.mode == "bucket");
     // dragon: end
+    crate::uds::refuse_socket_route(lore_transport::uds::route())?;
     let runtime = runtime();
     let telemetry = settings.telemetry.clone().unwrap_or_default();
     let metrics_config = telemetry.metrics.clone().unwrap_or_default();
@@ -2005,7 +2148,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         .init()?
     };
 
+    report_serving_runtime();
     observe_task_lifecycles();
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    crate::telemetry::observe_file_descriptors(&lore_telemetry::meter("lore.server"));
 
     let up_gauge = lore_telemetry::meter("urc.server")
         .u64_gauge("urc.server.up")
@@ -2043,6 +2190,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             }
         }));
     }
+
+    register_io_pool_metrics(&lore_telemetry::meter("lore.io.pool"));
 
     if let Some(mode) = settings
         .environment
@@ -2118,8 +2267,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         info!("Running in single-node mode (no topology configured)");
     }
 
-    let immutable_store =
-        configure_immutable_store_via_plugin(&plugin_registry, &settings, topology.clone()).await?;
+    let ConfiguredImmutableStore {
+        store: immutable_store,
+        local_tier,
+    } = configure_immutable_store_via_plugin(&plugin_registry, &settings, topology.clone()).await?;
 
     let mutable_store =
         configure_mutable_store_via_plugin(&plugin_registry, &settings, immutable_store.clone())
@@ -2135,7 +2286,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let connection_close_timeout =
         Duration::from_secs(settings.server.connection_close_timeout_seconds as u64);
 
-    let is_maintenance = if std::env::var("LORE_SERVER_MAINTENANCE").is_ok_and(|v| v == "1") {
+    let is_maintenance = if maintenance_mode() {
         info!(
             "Server is running in maintenance mode - only environment and health endpoints will be served"
         );
@@ -2144,23 +2295,37 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         false
     };
 
+    // **Claimed for as long as the server serves them.** The claim says which process is
+    // using a store, and a server uses its stores for its whole life; without one, every
+    // request that finds no other in flight would take and release the flock and read
+    // the epoch file on its own. Taken before anything serves, and released once the
+    // runtime has shut down, see `server_main`. A server in maintenance mode serves no
+    // store, so it claims none, and leaves the stores free for the maintenance it is
+    // running for.
+    let hold = if is_maintenance {
+        StoreHold::default()
+    } else {
+        let immutable_span = immutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .map_err(anyhow::Error::from)?;
+        let mutable_span = mutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .map_err(anyhow::Error::from)?;
+        StoreHold::new(immutable_span.into_iter().chain(mutable_span).collect())
+    };
+
     let jwt_verifier = match settings.server.auth.as_ref() {
-        Some(auth) => {
-            let jwk = auth.jwk.clone().unwrap_or_default();
-            let jwk_service = JwkServiceImpl::with_issuers(jwk, Some(&auth.jwt_issuer))?;
-            jwk_service
-                .fetch_new_keys(None /* fetch all keys */)
-                .await?;
-            Some(JwtVerifier {
-                jwk_service: Arc::new(jwk_service),
-                jwt_issuer: Some(auth.jwt_issuer.clone()),
-                jwt_audience: Some(auth.jwt_audience.clone()),
-                jwt_typ: auth.jwt_typ.clone(),
-                identity_claim: auth.identity_claim.clone(),
-            })
-        }
+        Some(auth) => Some(JwtVerifier::from_settings(auth).await?),
         None => None,
     };
+    let token_verification = TokenVerification::new(
+        jwt_verifier.clone(),
+        settings.server.trust_unsigned_identity,
+    )?;
 
     if let Some(auth) = settings.server.auth.as_ref() {
         let auth_url = settings
@@ -2183,12 +2348,25 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         settings.server.auth.as_ref(),
         auth_url.clone(),
     )?;
+    let user_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.user_url.as_deref());
     let repository_catalog = crate::authnz::repository_catalog::repository_catalog(
         settings.server.auth.as_ref(),
         auth_url.as_deref(),
+        user_url,
         immutable_store.clone(),
         mutable_store.clone(),
     )?;
+    info!(
+        "Repository registry: {}",
+        crate::authnz::repository_registry::RepositoryRegistry::select(
+            auth_url.as_deref(),
+            user_url
+        )
+    );
 
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
         if let Some(forwarded_requests_settings) =
@@ -2199,6 +2377,27 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         } else {
             None
         };
+
+    // The machine server's container sockets, claimed and bound before any endpoint serves. A
+    // socket serves cached content to whoever holds a token for it, so it verifies every token
+    // and runs only under an authorizer that tells partitions apart.
+    let uds_sockets = match settings.server.uds.clone() {
+        Some(uds_settings) if uds_settings.enabled && !is_maintenance => {
+            let Some(jwt_verifier) = jwt_verifier.clone() else {
+                anyhow::bail!(
+                    "[server.uds] requires [server.auth]: the sockets verify every token"
+                );
+            };
+            crate::uds::check_settings(
+                &uds_settings,
+                settings.server.auth.as_ref(),
+                auth_url.as_deref(),
+            )?;
+            let bound = crate::uds::bind_sockets(&uds_settings).await?;
+            Some((uds_settings, bound, jwt_verifier))
+        }
+        _ => None,
+    };
 
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let mut endpoints = JoinSet::new();
@@ -2258,7 +2457,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let lock_store = lock_store.clone();
-            let jwt_verifier = jwt_verifier.clone();
+            let token_verification = token_verification.clone();
             let repository_authorizer = repository_authorizer.clone();
             let repository_catalog = repository_catalog.clone();
             let settings = settings.clone();
@@ -2275,9 +2474,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             launch_grpc_server(
                 immutable_store,
                 local_immutable_store,
+                local_tier,
                 mutable_store,
                 lock_store,
-                jwt_verifier,
+                token_verification,
                 repository_authorizer,
                 repository_catalog,
                 settings,
@@ -2310,6 +2510,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 let user_agent_filter = user_agent_filter.clone();
                 let immutable_store = immutable_store.clone();
                 let mutable_store = mutable_store.clone();
+                let lock_store = lock_store.clone();
                 let notification_sender = notification.clone();
                 let hook_dispatcher = hook_dispatcher.clone();
                 let jwt_verifier = jwt_verifier.clone();
@@ -2320,6 +2521,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     user_agent_filter,
                     immutable_store,
                     mutable_store,
+                    lock_store,
                     notification_sender,
                     hook_dispatcher,
                     jwt_verifier,
@@ -2363,7 +2565,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let settings = settings.clone();
-            let jwt_verifier = jwt_verifier.clone();
+            let token_verification = token_verification.clone();
             let repository_authorizer = repository_authorizer.clone();
             let user_agent_filter = user_agent_filter.clone();
             let shutdown_rx = _shutdown_rx.clone();
@@ -2387,6 +2589,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
                 handler_timeout: request_handler_timeout,
                 permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+                slow_send_threshold: quic_settings
+                    .slow_send_threshold_ms
+                    .map(Duration::from_millis),
             };
 
             let local_immutable_store = local_store().unwrap_or_else(|| {
@@ -2396,7 +2601,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
             info!(
                 "Lore Public QUIC Server: Auth: {}",
-                jwt_verifier.as_ref().map_or("no", |_| "yes")
+                token_verification.describe()
             );
 
             launch_quinn_server(
@@ -2405,7 +2610,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     immutable_store,
                     local_immutable_store,
                     mutable_store,
-                    jwt_verifier,
+                    token_verification,
                     repository_authorizer,
                     limits,
                     user_agent_filter,
@@ -2418,6 +2623,29 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 shutdown_rx,
             )
         });
+    }
+
+    if let Some((uds_settings, bound, jwt_verifier)) = uds_sockets {
+        let immutable_store = immutable_store.clone();
+        let local_immutable_store = local_store().unwrap_or_else(|| immutable_store.clone());
+        let mutable_store = mutable_store.clone();
+        let repository_authorizer = repository_authorizer.clone();
+        let user_agent_filter = user_agent_filter.clone();
+        let shutdown_rx = _shutdown_rx.clone();
+        lore_spawn!(
+            endpoints,
+            crate::uds::launch_uds_server(
+                uds_settings,
+                bound,
+                immutable_store,
+                local_immutable_store,
+                mutable_store,
+                jwt_verifier,
+                repository_authorizer,
+                user_agent_filter,
+                shutdown_rx,
+            )
+        );
     }
 
     // the internal-only QUIC server. Hosts the ReplicationStoreService —
@@ -2474,6 +2702,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 inflight_limit: connection_inflight_limit(&quic_settings, process_limit),
                 handler_timeout: request_handler_timeout,
                 permit_timeout: quic_settings.permit_timeout_ms.map(Duration::from_millis),
+                slow_send_threshold: quic_settings
+                    .slow_send_threshold_ms
+                    .map(Duration::from_millis),
             };
 
             launch_quinn_server(
@@ -2508,7 +2739,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     lore_http_settings,
                     immutable_store,
                     mutable_store,
-                    jwt_verifier,
+                    token_verification,
                     repository_authorizer,
                     shutdown_rx,
                 )
@@ -2537,17 +2768,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         });
     }
 
-    lore_spawn!(async move {
-        if let Some(store) = local_store() {
-            crate::store::memory_stats_reporter(
-                Arc::downgrade(&store),
-                telemetry
-                    .metrics
-                    .map(|m| Duration::from_millis(m.sample_interval_millis)),
-            )
-            .await;
-        }
-    });
+    // Not in maintenance mode, which claims no store: each count would claim it, and reload
+    // what the maintenance changed.
+    if !is_maintenance {
+        lore_spawn!(async move {
+            if let Some(store) = local_store() {
+                crate::store::memory_stats_reporter(
+                    Arc::downgrade(&store),
+                    telemetry
+                        .metrics
+                        .map(|m| Duration::from_millis(m.sample_interval_millis)),
+                )
+                .await;
+            }
+        });
+    }
 
     up_gauge.record(1, &up_attributes);
     wait_for_shutdown(endpoints, shutdown_tx, connection_close_timeout).await?;
@@ -2557,8 +2792,15 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // dragon: start — keep a handle for the second flush below.
     let immutable_store_for_snapshot = settings_uses_bucket.then(|| Arc::clone(&immutable_store));
     // dragon: end
-    let _ = immutable_store.flush(true).await;
-    let _ = mutable_store.flush(true).await;
+    if let Err(error) = flush_stores(
+        Arc::clone(&immutable_store),
+        Some(mutable_store),
+        FlushOptions::SYNC_DATA,
+    )
+    .await
+    {
+        warn!(%error, "Failed to flush the stores at shutdown");
+    }
     // dragon: start — snapshot again after the mutable flush.
     // The immutable flush above runs the bucket snapshot, and it runs before
     // the mutable store writes its last branch tips. Without this second
@@ -2566,7 +2808,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // guild started from that bucket on another machine loses those pushes.
     // The local tier has nothing dirty by now, so this is only the snapshot.
     if let Some(store) = immutable_store_for_snapshot
-        && let Err(err) = store.flush(true).await
+        && let Err(err) = store.flush(FlushOptions::SYNC_DATA).await
     {
         // A failed final snapshot leaves the bucket with older branch tips.
         // Say so: a guild moved or restored from this bucket would lose them.
@@ -2574,13 +2816,12 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     }
     // dragon: end
 
-    Ok(())
+    Ok(hold)
 }
 
 fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, message: &str) {
     let correlation_id = lore_revision::lore::try_execution_context()
-        .map(|e| e.dispatcher.correlation_id.clone())
-        .unwrap_or_default();
+        .map_or_default(|e| e.dispatcher.correlation_id.clone());
 
     match level {
         lore_base::log::LoreLogLevel::None | lore_base::log::LoreLogLevel::Trace => {

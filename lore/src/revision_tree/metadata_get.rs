@@ -35,7 +35,16 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 
 /// One metadata key to read.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreRevisionTreeMetadataGetEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `METADATA_GET_COMPLETE`
     pub entry_id: u64,
@@ -45,7 +54,16 @@ pub struct LoreRevisionTreeMetadataGetEntry {
 
 /// Arguments for `lore_revision_tree_metadata_get`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(metadata_get_impl)]
 pub struct LoreRevisionTreeMetadataGetArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
@@ -315,12 +333,12 @@ fn emit_resolved(entries: &[LoreRevisionTreeMetadataGetEntry], resolved: &[Resol
 /// deserialized once for the whole batch — that, rather than any fan-out, is
 /// what batching buys here; the work per key is a buffer lookup. A fragment that
 /// cannot be read fails the call. Keys are reported in entry order.
-pub async fn metadata_get(
+pub fn metadata_get(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeMetadataGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_get_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_get_impl)
 }
 
 /// Resolve one batch. Split out of the dispatcher closure so the batch terminal

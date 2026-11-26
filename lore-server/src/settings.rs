@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::env;
+use std::num::NonZeroU8;
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use config::Config;
 use lore_base::runtime::TokioSettings;
@@ -11,14 +16,17 @@ use lore_revision::branch::CachedRevisionItem;
 use lore_revision::branch::CachedRevisionListHeader;
 use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
 use lore_revision::environment::EnvironmentConfig;
+use lore_revision::store::composite::ReadReplicaSelection;
 use lore_revision::util::time::RetrySettings;
 use lore_storage::hash;
 use lore_storage::hash::StringHash;
 use lore_telemetry::TelemetryConfig;
 use lore_telemetry::TraceConfigError;
+use lore_transport::quic::client::CongestionAlgorithm;
 use serde::Deserialize;
 
 use crate::auth::jwk::JWKServiceSettings;
+use crate::auth::jwk::is_issuer_url;
 use crate::authnz::repository_authorizer::AuthorizerSelection;
 use crate::authnz::repository_authorizer::select_repository_authorizer;
 use crate::authnz::repository_catalog::select_repository_catalog;
@@ -26,6 +34,9 @@ use crate::grpc::server::FeatureSettings;
 use crate::grpc::server::GrpcPublicServicesSettings;
 use crate::hooks::HookSettings;
 use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
+use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+use crate::quic::initial_cwnd::InitialCwndBytes;
+use crate::quic::initial_cwnd::default_peer_initial_cwnd_bytes;
 use crate::store::replica_factory::ReplicaFactorySettings;
 use crate::tls::CertificateSettings;
 use crate::topology::TopologySettings;
@@ -187,15 +198,26 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
         .as_ref()
         .and_then(|environment| environment.endpoint.as_ref())
         .and_then(|endpoint| endpoint.auth_url.as_deref());
+    let user_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.user_url.as_deref());
     // Run the authorizer and catalog selection at load, so a refused pairing
     // bails here, before any initialization, instead of at server startup.
     let authorizer = select_repository_authorizer(auth, auth_url)
         .map_err(|err| config::ConfigError::Message(err.to_string()))?;
-    select_repository_catalog(auth, auth_url)
+    select_repository_catalog(auth, auth_url, user_url)
         .map_err(|err| config::ConfigError::Message(err.to_string()))?;
     let Some(auth) = auth else {
         return Ok(());
     };
+    if settings.server.trust_unsigned_identity {
+        return Err(config::ConfigError::Message(
+            "server.trust_unsigned_identity applies only to a server without [server.auth]"
+                .to_string(),
+        ));
+    }
     if auth.jwt_issuer.is_empty() {
         return Err(config::ConfigError::Message(
             "server.auth.jwt_issuer must not be empty".to_string(),
@@ -223,8 +245,17 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
             ));
         }
     }
+    if !auth.resource_id_template.contains(PARTITION_PLACEHOLDER) {
+        return Err(config::ConfigError::Message(format!(
+            "server.auth.resource_id_template must contain {PARTITION_PLACEHOLDER}, which stands \
+             for the partition ID"
+        )));
+    }
     validate_oidc_config(auth, authorizer)
 }
+
+/// Where a partition template puts the partition ID.
+const PARTITION_PLACEHOLDER: &str = "{id}";
 
 /// Tier 1 and Tier 2 have no login path besides OIDC, so they require
 /// `[server.auth.oidc]`. If grpc auth service is configured, it is optional.
@@ -242,10 +273,11 @@ fn validate_oidc_config(
             AuthorizerSelection::AllowAll | AuthorizerSelection::AuthClient => Ok(()),
         };
     };
-    let is_issuer_url = auth.jwt_issuer.first().is_some_and(|issuer| {
-        reqwest::Url::parse(issuer).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
-    });
-    if !is_issuer_url {
+    if !auth
+        .jwt_issuer
+        .first()
+        .is_some_and(|issuer| is_issuer_url(issuer))
+    {
         return error(
             "server.auth.oidc requires the first server.auth.jwt_issuer entry to be the \
              provider's issuer URL",
@@ -267,6 +299,31 @@ fn validate_oidc_config(
         }
         (resource, scope) => resource || scope,
     };
+    for (setting, template) in [
+        (
+            "server.auth.oidc.resource_template",
+            &oidc.resource_template,
+        ),
+        ("server.auth.oidc.scope_template", &oidc.scope_template),
+    ] {
+        if is_set(template)
+            && !template
+                .as_deref()
+                .is_some_and(|template| template.contains(PARTITION_PLACEHOLDER))
+        {
+            return error(&format!(
+                "{setting} must contain {PARTITION_PLACEHOLDER}, which stands for the partition ID"
+            ));
+        }
+    }
+    if oidc
+        .token_exchange_issuer
+        .as_deref()
+        .filter(|issuer| !issuer.is_empty())
+        .is_some_and(|issuer| !is_issuer_url(issuer))
+    {
+        return error("server.auth.oidc.token_exchange_issuer must be an http or https issuer URL");
+    }
     if is_set(&oidc.token_exchange_issuer) && !has_template {
         return error(
             "server.auth.oidc.token_exchange_issuer is set without \
@@ -361,6 +418,12 @@ pub struct AuthSettings {
     pub jwt_typ: Option<Vec<String>>,
     /// Dotted path of the JWT claim carrying the caller's allowed actions.
     pub permission_claim: Option<String>,
+    /// Tier 1 only: the actions every token holder gets, added to whatever
+    /// `permission_claim` carries and to `read`, which any token implies.
+    /// Absent means `["write"]`. Read
+    /// through [`AuthSettings::implicit_actions`]; `None` is kept distinct so
+    /// startup can refuse an explicit value that would do nothing.
+    pub implicit_actions: Option<Vec<crate::authnz::repository_authorizer::Action>>,
     /// Dotted path of the claim carrying per-repository resource grants.
     /// If this is set, enables the granular `ResourceGrantsAuthorizer`.
     pub resource_claim: Option<String>,
@@ -376,16 +439,14 @@ pub struct AuthSettings {
     /// The resource name that matches every repository.
     #[serde(default = "AuthSettings::default_resource_wildcard")]
     pub resource_wildcard: String,
-    /// The claim recorded and compared as the caller's identity.
-    #[serde(default = "AuthSettings::default_identity_claim")]
-    pub identity_claim: String,
     /// What the repository listing answers for an authenticated caller with
     /// no explicit grant. Gates listing of the IDs only, never grants
     /// access to the contents. Consulted by the `baseline` catalog only.
     #[serde(default)]
     pub baseline_access: BaselineAccess,
-    /// Which catalog answers the repository listing. Absent: `auth_service`
-    /// when `[environment.endpoint] auth_url` is set, `baseline` otherwise.
+    /// Which catalog answers the repository listing. Absent: `user_service`
+    /// when `[environment.endpoint] user_url` is set, else `auth_service`
+    /// when `auth_url` is set, `baseline` otherwise.
     pub repository_catalog: Option<RepositoryCatalogMode>,
     /// The `UrcAuthApi` endpoint the `auth_service` catalog asks. Absent:
     /// `[environment.endpoint] auth_url`.
@@ -401,9 +462,13 @@ pub struct AuthSettings {
 pub struct OidcSettings {
     /// The public client ID clients present to the provider.
     pub client_id: String,
-    /// Default scopes clients request at login.
+    /// Default scopes clients request at an interactive (device) login.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Scopes clients request with the client credentials grant, for a provider that adds
+    /// the claims Lore reads only for a requested scope. Empty requests none.
+    #[serde(default)]
+    pub client_credentials_scopes: Vec<String>,
     /// Whether a client should default to OIDC login or use gRPC auth at
     /// at `[environment.endpoint] auth_url`.
     #[serde(default)]
@@ -420,6 +485,24 @@ pub struct OidcSettings {
 }
 
 impl AuthSettings {
+    /// The `[server.auth.oidc]` `token_exchange_issuer` when it names an issuer `jwt_issuer`
+    /// doesn't: a separate token service, whose tokens are verified against its own keys.
+    pub fn separate_exchange_issuer(&self) -> Option<&str> {
+        let issuer = self
+            .oidc
+            .as_ref()?
+            .token_exchange_issuer
+            .as_deref()
+            .filter(|issuer| !issuer.is_empty())?;
+        (!self.jwt_issuer.iter().any(|accepted| accepted == issuer)).then_some(issuer)
+    }
+
+    pub fn implicit_actions(&self) -> Vec<crate::authnz::repository_authorizer::Action> {
+        self.implicit_actions
+            .clone()
+            .unwrap_or_else(|| vec![crate::authnz::repository_authorizer::Action::Write])
+    }
+
     fn default_resource_id_template() -> String {
         crate::auth::jwt::DEFAULT_RESOURCE_ID_TEMPLATE.to_string()
     }
@@ -430,10 +513,6 @@ impl AuthSettings {
 
     fn default_resource_wildcard() -> String {
         crate::auth::jwt::DEFAULT_RESOURCE_WILDCARD.to_string()
-    }
-
-    fn default_identity_claim() -> String {
-        "sub".to_string()
     }
 }
 
@@ -460,6 +539,9 @@ pub enum RepositoryCatalogMode {
     /// Ask a `UrcAuthApi` service's `LookupUserPermissions`, forwarding the
     /// caller's token.
     AuthService,
+    /// Ask `RepositoryList` on the `lore.user.v1.RepositoryRegistryService`
+    /// at `[environment.endpoint] user_url`, forwarding the caller's token.
+    UserService,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -558,10 +640,23 @@ pub struct QuicSettings {
     pub idle_timeout: Option<u64>,
     pub keep_alive: Option<u64>,
     pub max_bidi_streams: Option<u64>,
-    pub num_listeners: u8,
+    /// Accept tasks per socket; see
+    /// [`QuinnConfigBuilder::num_listeners`](crate::quic::quinn::QuinnConfigBuilder::num_listeners).
+    pub num_listeners: Option<NonZeroU8>,
+    /// UDP sockets bound to `port`, used on Linux and Android only; see
+    /// [`QuinnConfigBuilder::num_sockets`](crate::quic::quinn::QuinnConfigBuilder::num_sockets).
+    pub num_sockets: Option<NonZeroUsize>,
     pub port: i32,
     pub transport_bits_per_second: Option<usize>,
     pub transport_rtt: Option<usize>,
+    /// Congestion window each accepted connection starts with: how much the server sends before
+    /// the peer's first acknowledgements arrive. When unset, the internal endpoint uses 1 MiB and
+    /// the public endpoint its congestion controller's own default.
+    pub initial_cwnd_bytes: Option<InitialCwndBytes>,
+    /// Congestion controller a connection runs when the endpoint accepts it, which paces what the
+    /// server sends on it: `bbr` or `cubic`. When unset, the public endpoint uses BBR and the
+    /// internal endpoint Cubic.
+    pub congestion_algorithm: Option<CongestionAlgorithm>,
     /// Keep below a threshold for whatever Load Balancer sits infront of the server
     /// or is expecting responses. If request handlers exceed this reasonable threshold
     /// then assume something has gone wrong and return a timeout response so we can get metrics
@@ -578,12 +673,43 @@ pub struct QuicSettings {
     /// How long a request may wait for one of the `stream_message_limit` permits before the
     /// server answers `SlowDown`. Defaults to roughly one round trip, 100ms.
     pub permit_timeout_ms: Option<u64>,
+    /// How long a response may wait for its stream's writer, or take to write, before the server
+    /// logs it as slow. Unset, no response is logged. The log is rate limited; the response metrics
+    /// record every response either way.
+    pub slow_send_threshold_ms: Option<u64>,
+}
+
+/// Only Lore servers connect to the internal endpoint, so its connections start with the window
+/// known to suit the path between peers rather than the controller's default. Unless configured,
+/// they run Cubic, which shrinks the window only on packet loss, so a peer that goes quiet between
+/// replication bursts doesn't come back to a window BBR has drained and stall the next large get.
+/// What a peer sends here, such as the content it replicates, follows the controller its
+/// replicated store's `congestion_algorithm` names.
+fn deserialize_quic_internal<'de, D>(deserializer: D) -> Result<Option<QuicSettings>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut settings = Option::<QuicSettings>::deserialize(deserializer)?;
+    if let Some(settings) = settings.as_mut() {
+        settings
+            .initial_cwnd_bytes
+            .get_or_insert(DEFAULT_PEER_INITIAL_CWND_BYTES);
+        settings
+            .congestion_algorithm
+            .get_or_insert(CongestionAlgorithm::Cubic);
+    }
+    Ok(settings)
 }
 
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct ServerSettings {
     pub auth: Option<AuthSettings>,
+    /// Without `[server.auth]`, take the caller's identity from an unsigned
+    /// bearer token. Anyone can claim any identity, so this only names
+    /// callers; it grants nothing. Refused at load beside `[server.auth]`.
+    #[serde(default)]
+    pub trust_unsigned_identity: bool,
     pub grpc: Option<GrpcSettings>,
     /// One block per public gRPC service; an absent table enables every
     /// service.
@@ -594,7 +720,14 @@ pub struct ServerSettings {
     // the public facing QUIC server settings
     pub quic: Option<QuicSettings>,
     // the internal-only QUIC server settings
+    #[serde(default, deserialize_with = "deserialize_quic_internal")]
     pub quic_internal: Option<QuicSettings>,
+    /// Unix sockets for containers on this machine.
+    pub uds: Option<UdsSettings>,
+    /// Storage connections a `remote` store opens to its upstream, shared by every repository the
+    /// store reaches there.
+    #[serde(default = "default_upstream_connections")]
+    pub upstream_connections: u32,
     /// Seconds to wait for existing connections to close gracefully after shutdown signal.
     #[serde(default = "default_connection_close_timeout")]
     pub connection_close_timeout_seconds: u16,
@@ -609,6 +742,104 @@ pub struct ServerSettings {
     /// Disk space monitoring for the local store paths.
     #[serde(default)]
     pub local_store_monitor: LocalStoreMonitorSettings,
+}
+
+/// The machine server's Unix sockets, one per container, each carrying the storage protocol and
+/// forwarded gRPC.
+#[derive(Clone, Debug, Deserialize)]
+pub struct UdsSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Socket paths, one per container, each in a directory bind mounted into its container: the
+    /// server binds a new socket file at each start. Each is claimed with a lock file beside it,
+    /// `<socket>.lock`. On Windows the server refuses a socket directory another account could
+    /// change, and creates a missing one that only the system, the administrators and its owner
+    /// may change.
+    #[serde(default)]
+    pub sockets: Vec<PathBuf>,
+    /// Permission bits of each socket file on Unix. On Windows a mode that lets others write a
+    /// socket lets the machine's users connect to it, and the socket otherwise keeps what its
+    /// directory grants.
+    #[serde(default = "UdsSettings::default_socket_mode")]
+    pub socket_mode: u32,
+    /// Requests a storage connection may have in handling.
+    #[serde(default = "UdsSettings::default_credits")]
+    pub credits: u32,
+    /// Request bodies in handling and unwritten responses a storage connection may hold. A read in
+    /// handling holds the largest response.
+    #[serde(default = "UdsSettings::default_credit_bytes")]
+    pub credit_bytes: u32,
+    /// Connections a socket holds at once, storage and forwarded gRPC connections alike; one
+    /// container's processes share them. A closed connection counts until its requests in
+    /// handling finish.
+    #[serde(default = "UdsSettings::default_max_connections_per_socket")]
+    pub max_connections_per_socket: usize,
+    /// Request bodies of 4096 bytes or more in handling and unwritten responses all of a socket's
+    /// storage connections may hold together. A read in handling holds the largest response.
+    /// Smaller bodies count against their connection's limits only. The buffers of forwarded gRPC
+    /// connections are not counted.
+    #[serde(default = "UdsSettings::default_socket_bytes")]
+    pub socket_bytes: usize,
+    /// Ceiling on handling one request, as on QUIC: 1 to 65535. A request without one could hold
+    /// its connection, and the reader waiting for its credit, for good. Clients learn it, so their
+    /// deadline for a lost response stays past it.
+    #[serde(default = "UdsSettings::default_handler_timeout_seconds")]
+    pub handler_timeout_seconds: u64,
+    /// Hosts gRPC is forwarded to, keyed by the host a client names, valued by the URL reached.
+    #[serde(default)]
+    pub forward: HashMap<String, String>,
+    /// Bounds the storage hello and the HTTP/2 client preface, so a connection that stops partway
+    /// through either does not hold its place. Not configurable.
+    #[serde(skip, default = "UdsSettings::default_handshake_timeout")]
+    pub(crate) handshake_timeout: Duration,
+    /// How long a connection's peer may take none of its responses before it is dropped: QUIC's
+    /// default idle timeout. A client reads whatever arrives, so only one that stopped running
+    /// stalls this long. Not configurable.
+    #[serde(skip, default = "UdsSettings::default_stall_timeout")]
+    pub(crate) stall_timeout: Duration,
+}
+
+impl UdsSettings {
+    /// These settings with a connection's handshake bounded by `handshake` and a peer that takes
+    /// no responses dropped after `stall`.
+    #[cfg(feature = "test-util")]
+    pub fn timing_out(mut self, handshake: Duration, stall: Duration) -> Self {
+        self.handshake_timeout = handshake;
+        self.stall_timeout = stall;
+        self
+    }
+
+    fn default_handshake_timeout() -> Duration {
+        Duration::from_secs(5)
+    }
+
+    fn default_stall_timeout() -> Duration {
+        Duration::from_millis(crate::quic::quinn::DEFAULT_IDLE_TIMEOUT_MILLIS)
+    }
+
+    fn default_socket_mode() -> u32 {
+        0o666
+    }
+
+    fn default_credits() -> u32 {
+        4000
+    }
+
+    fn default_credit_bytes() -> u32 {
+        256 * 1024 * 1024
+    }
+
+    fn default_max_connections_per_socket() -> usize {
+        64
+    }
+
+    fn default_socket_bytes() -> usize {
+        1024 * 1024 * 1024
+    }
+
+    fn default_handler_timeout_seconds() -> u64 {
+        50
+    }
 }
 
 /// Periodic monitoring of the disk space available to the local store.
@@ -688,6 +919,10 @@ fn default_connection_close_timeout() -> u16 {
     5
 }
 
+fn default_upstream_connections() -> u32 {
+    4
+}
+
 fn default_runtime_shutdown_timeout() -> u16 {
     25
 }
@@ -710,6 +945,15 @@ pub struct CompositeStoreSettings {
     /// durable store. Absent enables it.
     pub record_copy_out_of_band: Option<bool>,
     pub durable_store_delay_ms: Option<u64>,
+    /// Which read replicas a read that misses locally is sent to. Absent fans out to every one.
+    pub read_replica_selection: Option<ReadReplicaSelection>,
+    /// How many read replicas a round robin read tries, capped at the number of read replicas.
+    /// Absent uses [`DEFAULT_ROUND_ROBIN_MAX_TRIES`](lore_revision::store::composite::DEFAULT_ROUND_ROBIN_MAX_TRIES).
+    pub round_robin_max_tries: Option<NonZeroUsize>,
+    /// How long a round robin read waits on one read replica before trying the next, in
+    /// milliseconds, at least 1. Absent uses
+    /// [`DEFAULT_ROUND_ROBIN_TRY_LIMIT`](lore_revision::store::composite::DEFAULT_ROUND_ROBIN_TRY_LIMIT).
+    pub round_robin_try_limit_ms: Option<NonZeroU64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -777,6 +1021,17 @@ pub struct MutableStoreSettings {
 pub struct RemoteStoreSettings {
     pub auth_url: Option<String>,
     pub remote_url: String,
+    /// Whether the immutable store checks each payload the upstream serves against its address.
+    /// Off, it trusts the upstream and checks only a payload's sizes: clients check what they
+    /// read, and a heal they ask for reaches the upstream.
+    #[serde(default)]
+    pub verify: bool,
+    /// Congestion controller of the storage connections the store establishes to the upstream,
+    /// which paces what the server sends there, such as the content it writes through: `bbr` or
+    /// `cubic`. A connection to the upstream already established is reused as it is. Defaults to
+    /// BBR.
+    #[serde(default)]
+    pub congestion_algorithm: CongestionAlgorithm,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -784,7 +1039,11 @@ pub struct ReplicatedStoreSettings {
     pub remote_url: String,
     pub certs: Option<CertificateSettings>,
     pub regenerate_retry: RetrySettings,
-    pub periodic_client_refresh_secs: u64,
+    /// The number of clients, each with its own connection to the remote. Every limit and
+    /// transport setting below applies to each client separately.
+    #[serde(default = "default_replicated_store_num_clients")]
+    pub num_clients: NonZeroUsize,
+    pub periodic_client_refresh_secs: NonZeroU64,
     #[serde(default = "default_quic_client_monitor_interval_secs")]
     pub client_metrics_interval_seconds: u64,
     /// how many inflight messages are allowed before we self-throttle
@@ -792,6 +1051,26 @@ pub struct ReplicatedStoreSettings {
     pub client_max_reconnects: Option<u32>,
     pub max_bandwidth_bytes_per_second: Option<u64>,
     pub expected_rtt_ms: Option<u64>,
+    /// Initial congestion window, in bytes, for a new connection to the remote's internal QUIC
+    /// endpoint. This is also the minimum window carried over when a connection is periodically
+    /// refreshed.
+    #[serde(default = "default_peer_initial_cwnd_bytes")]
+    pub initial_cwnd_bytes: InitialCwndBytes,
+    /// Congestion controller of each connection a client establishes to the remote's internal QUIC
+    /// endpoint, which paces what this server sends there, such as the content it replicates:
+    /// `bbr` or `cubic`. Defaults to Cubic, which shrinks the window only on packet loss, so a
+    /// connection that sits quiet between replication bursts keeps its window rather than having
+    /// it drained.
+    #[serde(default = "default_replicated_store_congestion_algorithm")]
+    pub congestion_algorithm: CongestionAlgorithm,
+}
+
+fn default_replicated_store_congestion_algorithm() -> CongestionAlgorithm {
+    CongestionAlgorithm::Cubic
+}
+
+fn default_replicated_store_num_clients() -> NonZeroUsize {
+    NonZeroUsize::new(2).expect("2 is not zero")
 }
 
 #[derive(Copy, Clone, Default, Debug, Deserialize, PartialEq)]

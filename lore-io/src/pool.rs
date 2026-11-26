@@ -12,9 +12,11 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
+use std::time::Instant;
 
 use parking_lot::Condvar;
 use parking_lot::Mutex;
+use parking_lot::MutexGuard;
 
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
 
@@ -104,8 +106,29 @@ pub fn set_max_threads(count: usize) -> bool {
     BUDGETED_MAX_THREADS.set(count.max(1)).is_ok()
 }
 
+/// Functions a pool thread runs around its waits for work, without the pool's lock held, so either
+/// may wait.
+#[derive(Clone, Copy)]
+pub struct IdleHooks {
+    /// Runs as the thread finds no work and begins waiting for it.
+    pub begin: fn(),
+    /// Runs once the thread has work after a wait, before it runs the work. A thread taking work
+    /// queued as it ends a job runs neither, and a thread can end after `begin` without `end`.
+    pub end: fn(),
+}
+
+static IDLE_HOOKS: OnceLock<IdleHooks> = OnceLock::new();
+
+/// Sets the functions the pool threads run around their waits for work. Applies to the threads
+/// started after the call, so like [`set_max_threads`] it must run before the first file operation.
+/// Returns false if hooks were already set.
+pub fn set_idle_hooks(hooks: IdleHooks) -> bool {
+    IDLE_HOOKS.set(hooks).is_ok()
+}
+
 /// The cap the process-wide pool is built with: its budgeted share when one has been set, else
 /// what the crate asks for on its own.
+#[lore_macro::test_pub]
 fn configured_max_threads() -> usize {
     BUDGETED_MAX_THREADS
         .get()
@@ -138,6 +161,17 @@ enum TaskState<T, F> {
     Taken,
 }
 
+/// The jobs every pool of the process has run, on its threads or on the threads that submitted
+/// them, which only a test build counts.
+#[cfg(feature = "test-util")]
+static JOBS_RUN: AtomicUsize = AtomicUsize::new(0);
+
+/// The jobs every pool of the process has run so far.
+#[cfg(feature = "test-util")]
+pub fn jobs_run() -> usize {
+    JOBS_RUN.load(Ordering::Relaxed)
+}
+
 /// The runnable view of a [`Task`], which is what the queue holds.
 #[lore_macro::test_pub]
 trait Job: Send + Sync {
@@ -164,6 +198,8 @@ where
         let Some(work) = work else {
             return;
         };
+        #[cfg(feature = "test-util")]
+        JOBS_RUN.fetch_add(1, Ordering::Relaxed);
 
         // Deliberately not under the lock: the work is a blocking syscall, and the awaiter polls
         // while it runs.
@@ -231,12 +267,60 @@ pub(crate) fn retry_on_interrupt<T>(
 }
 
 #[lore_macro::test_pub]
+struct Queued {
+    job: Arc<dyn Job>,
+    submitted_at: Instant,
+}
+
+#[lore_macro::test_pub]
 struct PoolState {
-    queue: VecDeque<Arc<dyn Job>>,
+    queue: VecDeque<Queued>,
     idle: usize,
     running: usize,
+    /// Threads that have started and not yet exited. `running` also counts slots reserved for
+    /// threads still being spawned.
+    alive: usize,
+    /// Threads of the pool's cap lent out by [`SyscallPool::lend`], which the pool starts no
+    /// thread of its own for while they are lent.
+    lent: usize,
     queue_high_water: usize,
     threads_high_water: usize,
+    submitted: u64,
+    started: u64,
+    saturated: u64,
+    spawn_refused: u64,
+    queue_wait: Duration,
+    window: PoolWindow,
+}
+
+impl PoolState {
+    #[lore_macro::test_pub]
+    fn push(&mut self, job: Arc<dyn Job>, submitted_at: Instant) {
+        self.queue.push_back(Queued { job, submitted_at });
+        self.submitted += 1;
+        let depth = self.queue.len();
+        self.queue_high_water = self.queue_high_water.max(depth);
+        self.window.queue_high_water = self.window.queue_high_water.max(depth);
+    }
+
+    /// Takes the oldest job and adds the time it spent queued to the wait totals.
+    #[lore_macro::test_pub]
+    fn pop(&mut self) -> Option<Arc<dyn Job>> {
+        let Queued { job, submitted_at } = self.queue.pop_front()?;
+        let waited = submitted_at.elapsed();
+        self.started += 1;
+        self.queue_wait += waited;
+        self.window.max_queue_wait = self.window.max_queue_wait.max(waited);
+        Some(job)
+    }
+
+    /// Counts a worker thread once it is running, and raises the thread peaks to match.
+    #[lore_macro::test_pub]
+    fn thread_started(&mut self) {
+        self.alive += 1;
+        self.threads_high_water = self.threads_high_water.max(self.alive);
+        self.window.threads_high_water = self.window.threads_high_water.max(self.alive);
+    }
 }
 
 /// A snapshot of the syscall pool's occupancy.
@@ -248,7 +332,8 @@ struct PoolState {
 pub struct PoolStats {
     /// Jobs submitted and not yet started.
     pub queued: usize,
-    /// Jobs currently running on a pool thread.
+    /// Jobs currently running on a pool thread. Work run on the submitting thread or on a thread
+    /// of its own is not counted.
     pub executing: usize,
     /// Threads alive, idle ones included.
     pub threads: usize,
@@ -258,6 +343,32 @@ pub struct PoolStats {
     pub queue_high_water: usize,
     /// The cap `threads` never exceeds.
     pub max_threads: usize,
+    /// Threads of the cap lent out, which `threads` stays below the cap by once the idle threads
+    /// past it have woken and ended.
+    pub lent: usize,
+    /// Jobs queued for a pool thread since the pool was created. Work run on the submitting
+    /// thread, or on a thread of its own that started, never queues and is not counted.
+    pub submitted: u64,
+    /// Jobs a thread has taken from the queue since the pool was created.
+    pub started: u64,
+    /// Jobs queued with no thread idle and no room under the cap, less the threads lent, to start
+    /// one.
+    pub saturated: u64,
+    /// Submissions whose new thread the operating system refused to start.
+    pub spawn_refused: u64,
+    /// Total time the `started` jobs spent queued, from submission until a thread took them.
+    /// Dividing its increase by the increase in `started` gives the mean wait over an interval.
+    pub queue_wait: Duration,
+}
+
+/// Peaks in the syscall pool's occupancy since each was last read. The depth and thread peaks
+/// restart from the current level when read, and the wait peak restarts from zero.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PoolWindow {
+    queue_high_water: usize,
+    threads_high_water: usize,
+    max_queue_wait: Duration,
 }
 
 #[lore_macro::test_pub]
@@ -265,6 +376,105 @@ struct PoolInner {
     state: Mutex<PoolState>,
     work_available: Condvar,
     max_threads: usize,
+}
+
+thread_local! {
+    /// Whether this thread runs the work it submits itself
+    /// ([`run_file_operations_on_this_thread`]).
+    static RUNS_OWN_WORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the current thread is inside [`run_file_operations_on_this_thread`].
+#[lore_macro::test_pub]
+pub(crate) fn runs_file_operations_on_this_thread() -> bool {
+    RUNS_OWN_WORK.get()
+}
+
+/// Runs `call` with every job this thread submits to a syscall pool within it run on this thread,
+/// inside the submission, rather than on a pool thread, which saves the two thread hand-offs of
+/// each job.
+///
+/// Only for a thread that meets all of these:
+///
+/// - It isn't an async runtime worker, which a job would block.
+/// - It blocks until the operations it starts within `call` finish, as a thread inside `block_on`
+///   does, so that running them delays nothing else.
+/// - The work awaits its file operations one at a time. Joined ones run one after another, and a
+///   timeout around one can't fire while it runs.
+///
+/// It applies to every pool and to all code `call` reaches on this thread, and to no other
+/// thread. Work given a thread of its own still gets one
+/// ([`crate::IoDriver::remove_dir_all_in_background`]), and the positional reads and writes of
+/// the completion backends, which submit no job, are issued as they are without it.
+pub fn run_file_operations_on_this_thread<T>(call: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RUNS_OWN_WORK.set(self.0);
+        }
+    }
+    let _restore = Restore(RUNS_OWN_WORK.replace(true));
+    call()
+}
+
+/// Lends up to `wanted` threads of the cap of the process's syscall pool, the one every file
+/// operation runs on, to work that runs them itself, as [`SyscallPool::lend`] does.
+pub fn lend_threads(wanted: usize) -> Lent<'static> {
+    SyscallPool::global().lend(wanted)
+}
+
+/// Threads of a [`SyscallPool`]'s cap that [`SyscallPool::lend`] lent, given back when dropped.
+pub struct Lent<'a> {
+    pool: &'a SyscallPool,
+    count: usize,
+}
+
+impl Lent<'_> {
+    /// How many threads were lent.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Takes over the threads `other` holds, which the same pool lent, so they are given back with
+    /// these.
+    pub fn absorb(&mut self, mut other: Lent<'_>) {
+        debug_assert!(std::ptr::eq(self.pool, other.pool), "lent by another pool");
+        self.count += std::mem::take(&mut other.count);
+    }
+
+    /// Gives `count` of the threads back before the rest, as when the work they were lent to
+    /// could not start them, and starts a thread in each slot given back for a job that queued
+    /// while they were lent and that no idle thread will take, so the queue drains at the full
+    /// cap again rather than waiting for a later submission to start one.
+    pub fn give_back(&mut self, count: usize) {
+        let count = count.min(self.count);
+        if count == 0 {
+            return;
+        }
+        self.count -= count;
+        let inner = &self.pool.inner;
+        let spawn = {
+            let mut state = inner.state.lock();
+            state.lent -= count;
+            let room = inner.max_threads.saturating_sub(state.running + state.lent);
+            let spawn = room.min(state.queue.len().saturating_sub(state.idle));
+            state.running += spawn;
+            spawn
+        };
+        for started in 0..spawn {
+            if spawn_worker_thread(Arc::clone(inner)).is_err() {
+                self.pool.run_without_workers(spawn - started);
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for Lent<'_> {
+    /// Gives every thread still lent back, as [`Lent::give_back`] does.
+    fn drop(&mut self) {
+        self.give_back(self.count);
+    }
 }
 
 /// Bounded pool of threads dedicated to running blocking syscalls.
@@ -286,8 +496,16 @@ impl SyscallPool {
                     queue: VecDeque::new(),
                     idle: 0,
                     running: 0,
+                    alive: 0,
+                    lent: 0,
                     queue_high_water: 0,
                     threads_high_water: 0,
+                    submitted: 0,
+                    started: 0,
+                    saturated: 0,
+                    spawn_refused: 0,
+                    queue_wait: Duration::ZERO,
+                    window: PoolWindow::default(),
                 }),
                 work_available: Condvar::new(),
                 max_threads,
@@ -300,41 +518,90 @@ impl SyscallPool {
         GLOBAL.get_or_init(|| SyscallPool::new(configured_max_threads()))
     }
 
+    /// Lends up to `wanted` threads of the pool's cap to work that runs them itself, for as long
+    /// as the [`Lent`] is held. The pool lends at most half its cap in all, and no thread busy with
+    /// work; its idle threads past the cap end as they wake. So, once those have ended, the threads
+    /// it runs and the threads lent stay within its cap, and at least half the cap stays for every
+    /// other file operation. May lend none.
+    #[lore_macro::test_pub]
+    pub(crate) fn lend(&self, wanted: usize) -> Lent<'_> {
+        let mut state = self.inner.state.lock();
+        let busy = state.running - state.idle;
+        let lendable = (self.inner.max_threads / 2)
+            .saturating_sub(state.lent)
+            .min(self.inner.max_threads.saturating_sub(busy + state.lent));
+        let count = wanted.min(lendable);
+        state.lent += count;
+        if count > 0 {
+            // Lent threads can leave more threads running than the cap allows; idle ones end at
+            // once rather than at their keep-alive.
+            self.inner.work_available.notify_all();
+        }
+        Lent { pool: self, count }
+    }
+
+    /// Queues `work` for a pool thread, or runs it before returning on a thread inside
+    /// [`run_file_operations_on_this_thread`]. Either way the task answers with its result, and
+    /// resumes a panic of the work on its awaiter.
     #[lore_macro::test_pub]
     pub(crate) fn submit<T, F>(&self, work: F) -> SyscallTask<T>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let task = Arc::new(Task {
-            state: Mutex::new(TaskState::Pending {
-                work: Some(work),
-                waker: None,
-            }),
-        });
-        let job: Arc<dyn Job> = task.clone();
-        let completion: Arc<dyn Completion<T>> = task;
+        let (job, task) = new_task(work);
+        if runs_file_operations_on_this_thread() {
+            job.run();
+            return task;
+        }
+        self.enqueue(job);
+        task
+    }
 
+    /// Runs `work` on a thread of its own, outside the pool and its cap, for work that holds its
+    /// thread for minutes and would hold a pool thread from every other file operation as long.
+    /// The thread is named `name` and ends with the work. It counts against no pool cap: each call
+    /// adds a thread for as long as its work runs. Where the system refuses the thread, the work
+    /// goes to the pool.
+    #[lore_macro::test_pub]
+    pub(crate) fn run_on_own_thread<T, F>(&self, name: &str, work: F) -> SyscallTask<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let (job, task) = new_task(work);
+        let runner = Arc::clone(&job);
+        if std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || runner.run())
+            .is_err()
+        {
+            self.enqueue(job);
+        }
+        task
+    }
+
+    /// Queues `job` for a pool thread, starting one where none is idle and the cap allows.
+    fn enqueue(&self, job: Arc<dyn Job>) {
+        // Read before the lock, so time spent waiting for it counts as queueing.
+        let submitted_at = Instant::now();
         let spawn_worker = {
             let mut state = self.inner.state.lock();
-            state.queue.push_back(job);
-            state.queue_high_water = state.queue_high_water.max(state.queue.len());
+            state.push(job, submitted_at);
             if state.idle > 0 {
                 self.inner.work_available.notify_one();
                 false
-            } else if state.running < self.inner.max_threads {
+            } else if state.running + state.lent < self.inner.max_threads {
                 state.running += 1;
-                state.threads_high_water = state.threads_high_water.max(state.running);
                 true
             } else {
+                state.saturated += 1;
                 false
             }
         };
         if spawn_worker && spawn_worker_thread(Arc::clone(&self.inner)).is_err() {
             self.run_without_worker();
         }
-
-        SyscallTask { completion }
     }
 
     /// A snapshot of the pool's occupancy. Taken under the pool's own lock, so it is consistent
@@ -344,12 +611,60 @@ impl SyscallPool {
         let state = self.inner.state.lock();
         PoolStats {
             queued: state.queue.len(),
-            executing: state.running.saturating_sub(state.idle),
-            threads: state.running,
+            executing: state.alive.saturating_sub(state.idle),
+            threads: state.alive,
             threads_high_water: state.threads_high_water,
             queue_high_water: state.queue_high_water,
             max_threads: self.inner.max_threads,
+            submitted: state.submitted,
+            started: state.started,
+            saturated: state.saturated,
+            spawn_refused: state.spawn_refused,
+            queue_wait: state.queue_wait,
+            lent: state.lent,
         }
+    }
+
+    /// The deepest the queue has been since the previous call, or since the pool was created.
+    /// The next peak starts from the current depth, so a burst spanning two calls is reported by
+    /// both.
+    #[lore_macro::test_pub]
+    pub(crate) fn take_queue_high_water(&self) -> usize {
+        let mut state = self.inner.state.lock();
+        let depth = state.queue.len();
+        std::mem::replace(&mut state.window.queue_high_water, depth)
+    }
+
+    /// The most threads alive at once since the previous call, or since the pool was created.
+    /// The next peak starts from the threads alive now.
+    #[lore_macro::test_pub]
+    pub(crate) fn take_threads_high_water(&self) -> usize {
+        let mut state = self.inner.state.lock();
+        let alive = state.alive;
+        std::mem::replace(&mut state.window.threads_high_water, alive)
+    }
+
+    /// The longest any job has waited in the queue since the previous call, or since the pool was
+    /// created. A job still queued counts with its wait so far, so a pool whose threads are all
+    /// blocked reports its oldest job's wait rather than nothing.
+    #[lore_macro::test_pub]
+    pub(crate) fn take_max_queue_wait(&self) -> Duration {
+        let mut state = self.inner.state.lock();
+        let oldest = state
+            .queue
+            .front()
+            .map_or(Duration::ZERO, |queued| queued.submitted_at.elapsed());
+        std::mem::replace(&mut state.window.max_queue_wait, Duration::ZERO).max(oldest)
+    }
+
+    /// Recovers from the operating system refusing the first of `unstarted` worker threads whose
+    /// slots were reserved together: gives back the slots of the threads after it, then recovers
+    /// from the refused one as [`Self::run_without_worker`] does.
+    #[lore_macro::test_pub]
+    fn run_without_workers(&self, unstarted: usize) {
+        // The slots of the threads after the refused one are given back first, as its own is.
+        self.inner.state.lock().running -= unstarted - 1;
+        self.run_without_worker();
     }
 
     /// Recovers from the operating system refusing a worker thread.
@@ -369,8 +684,9 @@ impl SyscallPool {
         let job = {
             let mut state = self.inner.state.lock();
             state.running -= 1;
+            state.spawn_refused += 1;
             if state.running == 0 {
-                state.queue.pop_front()
+                state.pop()
             } else {
                 None
             }
@@ -379,6 +695,23 @@ impl SyscallPool {
             job.run();
         }
     }
+}
+
+/// A task for `work`, as the queue or a thread runs it and as its caller awaits it.
+fn new_task<T, F>(work: F) -> (Arc<dyn Job>, SyscallTask<T>)
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let task = Arc::new(Task {
+        state: Mutex::new(TaskState::Pending {
+            work: Some(work),
+            waker: None,
+        }),
+    });
+    let job: Arc<dyn Job> = task.clone();
+    let completion: Arc<dyn Completion<T>> = task;
+    (job, SyscallTask { completion })
 }
 
 /// Starts a worker thread, reporting refusal rather than panicking: a host that has already
@@ -394,12 +727,33 @@ fn spawn_worker_thread(inner: Arc<PoolInner>) -> std::io::Result<()> {
 }
 
 fn worker_loop(inner: &PoolInner) {
+    inner.state.lock().thread_started();
+    let idle_hooks = IDLE_HOOKS.get();
     loop {
+        // Whether the thread ran the begin hook since its last job.
+        let mut waited = false;
         let job = {
             let mut state = inner.state.lock();
             loop {
-                if let Some(job) = state.queue.pop_front() {
+                // Lending can leave more threads running than the cap allows; the surplus ends
+                // here, and the threads within the cap take the queued work.
+                if state.running + state.lent > inner.max_threads {
+                    state.running -= 1;
+                    state.alive -= 1;
+                    break None;
+                }
+                if let Some(job) = state.pop() {
                     break Some(job);
+                }
+                if let Some(hooks) = idle_hooks.filter(|_| !waited) {
+                    // Outside the lock every submitter takes. Counted idle meanwhile, so work queued
+                    // now wakes a waiting thread rather than starting one, and the loop checks the
+                    // queue again.
+                    waited = true;
+                    state.idle += 1;
+                    MutexGuard::unlocked(&mut state, hooks.begin);
+                    state.idle -= 1;
+                    continue;
                 }
                 state.idle += 1;
                 let timed_out = inner
@@ -409,12 +763,18 @@ fn worker_loop(inner: &PoolInner) {
                 state.idle -= 1;
                 if timed_out && state.queue.is_empty() {
                     state.running -= 1;
+                    state.alive -= 1;
                     break None;
                 }
             }
         };
         match job {
-            Some(job) => job.run(),
+            Some(job) => {
+                if let Some(hooks) = idle_hooks.filter(|_| waited) {
+                    (hooks.end)();
+                }
+                job.run();
+            }
             None => return,
         }
     }
@@ -423,12 +783,12 @@ fn worker_loop(inner: &PoolInner) {
 /// Completion future for work submitted to the syscall pool.
 ///
 /// Wakes through a plain waker and therefore runs under any executor. A
-/// panic on the pool thread resumes on the awaiting task.
+/// panic of the work resumes on the awaiting task.
 ///
 /// Dropping this cancels nothing: the work owns its buffer and runs to completion, publishing a
-/// result nobody reads, and the allocation — with that buffer in it — is freed when the pool
-/// thread releases its own handle. That is what makes an early free of kernel-visible memory
-/// unrepresentable rather than merely avoided.
+/// result nobody reads, and the allocation — with that buffer in it — is freed once the thread
+/// running the work has released its own handle. That is what makes an early free of
+/// kernel-visible memory unrepresentable rather than merely avoided.
 ///
 /// Work that is discarded rather than run leaves this pending forever. Only a pool dropped with a
 /// non-empty queue can do that, which the process-wide pool never is. Detecting it here is not

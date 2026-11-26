@@ -28,7 +28,9 @@ use crate::event::LoreErrorDetail;
 /// Delivered on successful `lore_storage_open`. Carries the handle id the
 /// caller must pass to subsequent ops against this store.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageOpenedEventData {
     /// Handle id for the opened store.
@@ -40,7 +42,7 @@ pub struct LoreStorageOpenedEventData {
 /// computed content hash — for the resolved variants, the content the key now
 /// resolves to; on failure `error` is populated and `address` is zero.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStoragePutItemCompleteEventData {
     /// Correlation id of the item.
@@ -61,7 +63,9 @@ pub struct LoreStoragePutItemCompleteEventData {
 /// Leading event for each regular `get` item. Reports the total
 /// reassembled content size before any `GET_DATA` events arrive.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageGetHeaderEventData {
     /// Correlation id of the item.
@@ -75,7 +79,9 @@ pub struct LoreStorageGetHeaderEventData {
 /// Per-fragment (or single-buffer) payload event for `get`. The `bytes`
 /// view is valid only during the callback invocation.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageGetDataEventData {
     /// Correlation id of the item.
@@ -91,7 +97,9 @@ pub struct LoreStorageGetDataEventData {
 /// Per-leaf event for `get_resolved` with `fragments` set: one leaf fragment of the
 /// item's content and its payload. The `bytes` view is valid only during the callback invocation.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageGetFragmentEventData {
     /// Correlation id of the item.
@@ -101,7 +109,9 @@ pub struct LoreStorageGetFragmentEventData {
     /// The byte offset of this leaf within the item's content.
     pub offset: u64,
     /// The leaf's fragment, describing `bytes`: the compression among its flags, the payload size
-    /// and the content size the payload expands to.
+    /// and the content size the payload expands to. A hole of the content arrives as a
+    /// `LORE_EVENT_STORAGE_GET_FRAGMENT` whose fragment has a `size_payload` of zero and no
+    /// payload, covering `size_content` bytes that read as zeros.
     pub fragment: Fragment,
     /// The leaf's payload, compressed as `fragment` states.
     pub bytes: LoreBytes,
@@ -113,7 +123,7 @@ pub struct LoreStorageGetFragmentEventData {
 /// filesystem. For the two resolved variants `address` is the address the key
 /// resolved to, so it is an output rather than an echo of the request.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageGetItemCompleteEventData {
     /// Correlation id of the item.
@@ -130,7 +140,7 @@ pub struct LoreStorageGetItemCompleteEventData {
 /// destination tuple's context — the destination address is `(target_partition,
 /// source_address.hash, target_context)`.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageCopyItemCompleteEventData {
     /// Correlation id of the item.
@@ -153,7 +163,7 @@ pub struct LoreStorageCopyItemCompleteEventData {
 /// (`globals.offline`/`local`/`remote`) — when a side is skipped, its `_success` flag is `0`
 /// rather than a misleading `1`. `error` is populated if either side that DID run failed.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageObliterateItemCompleteEventData {
     /// Correlation id of the item.
@@ -177,7 +187,7 @@ pub struct LoreStorageObliterateItemCompleteEventData {
 /// `LoreStorageGetItemCompleteEventData`'s shape minus the absence of any preceding
 /// `GET_HEADER` / `GET_DATA` events — `get_metadata` carries no payload bytes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageGetMetadataItemCompleteEventData {
     /// Correlation id of the item.
@@ -193,7 +203,7 @@ pub struct LoreStorageGetMetadataItemCompleteEventData {
 /// Terminal per-item event for `upload`. `already_durable` is 1 when the
 /// item was already flagged durable and no upload was performed.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageUploadItemCompleteEventData {
     /// Correlation id of the item.
@@ -206,12 +216,39 @@ pub struct LoreStorageUploadItemCompleteEventData {
     pub error: LoreErrorDetail,
 }
 
+/// What one `lore_storage_put*` or `lore_storage_upload` call cost, sent once
+/// every item of the call has finished, at statistics level one and above.
+///
+/// A call that runs no item sends none. The counts cover the whole call, so a
+/// call of one item reports that item's cost.
+#[repr(C)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreStoragePutStatsEventData {
+    /// Items the call ran.
+    pub items: u64,
+    /// Of `items`, those that failed.
+    pub items_failed: u64,
+    /// What the call's fragment writes cost.
+    pub fragments: lore_storage::FragmentWriteCounts,
+}
+
 /// Terminal per-item event for `mutable_load`. On success `error.error_code == 0` and `value`
 /// is the loaded value hash (`Hash::default()` when the key holds a null/removed value); on
 /// miss `error` carries the miss the answering backend raised — `AddressNotFound` from a local
 /// store, `NotFound` from a remote one — and `value` is zero.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageMutableLoadItemCompleteEventData {
     /// Correlation id of the item.
@@ -224,7 +261,7 @@ pub struct LoreStorageMutableLoadItemCompleteEventData {
 
 /// Terminal per-item event for `mutable_store`. `error.error_code == 0` on a successful store.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageMutableStoreItemCompleteEventData {
     /// Correlation id of the item.
@@ -237,7 +274,7 @@ pub struct LoreStorageMutableStoreItemCompleteEventData {
 /// before the swap (equal to the caller's `expected` when the swap took effect, otherwise the
 /// actual current value). `error.error_code == 0` on success.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageMutableCompareAndSwapItemCompleteEventData {
     /// Correlation id of the item.
@@ -250,7 +287,9 @@ pub struct LoreStorageMutableCompareAndSwapItemCompleteEventData {
 
 /// One `(key, value)` pair emitted by `mutable_list`, before the item's terminal event.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageMutableListEntryEventData {
     /// Correlation id of the listing item.
@@ -264,7 +303,7 @@ pub struct LoreStorageMutableListEntryEventData {
 /// Terminal per-item event for `mutable_list`, emitted after every `MUTABLE_LIST_ENTRY` for the
 /// item. `error.error_code == 0` once the listing completes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageMutableListItemCompleteEventData {
     /// Correlation id of the listing item.

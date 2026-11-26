@@ -19,6 +19,7 @@ use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::util::collect_stream::collect_stream_with_summary;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::path_diff::link_pin_path_diffs;
@@ -160,6 +161,7 @@ async fn pin_move_surfaces_linked_content_with_partition() {
                 immutable_store,
                 mutable_store,
                 parent_id.into(),
+                allow_all_repositories(),
             ));
             let linked = Arc::new(parent.to_server_context(linked_id.into()));
 
@@ -243,9 +245,10 @@ async fn unauthorized_link_is_not_descended() {
     LORE_CONTEXT
         .scope(execution, async move {
             let parent = Arc::new(RepositoryContext::new_server_context(
-                immutable_store,
-                mutable_store,
+                immutable_store.clone(),
+                mutable_store.clone(),
                 parent_id.into(),
+                allow_all_repositories(),
             ));
             let linked = Arc::new(parent.to_server_context(linked_id.into()));
 
@@ -257,11 +260,12 @@ async fn unauthorized_link_is_not_descended() {
                 write_parent_revision_with_link(&parent, "linked", linked_id.into(), link_v2).await;
 
             let forbidden = RepositoryId::from(linked_id);
-            let restricted = Arc::new(
-                parent
-                    .to_server_context(parent_id.into())
-                    .with_link_read(Arc::new(move |id| id != forbidden)),
-            );
+            let restricted = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                parent_id.into(),
+                Arc::new(move |id| id != forbidden),
+            ));
 
             let changes = collect_diff(restricted.clone(), parent_v1, parent_v2).await;
             let paths: Vec<String> = changes
@@ -298,6 +302,7 @@ async fn registry_comparison_classifies_add_remove_and_unchanged() {
                 immutable_store,
                 mutable_store,
                 parent_id.into(),
+                allow_all_repositories(),
             ));
             let linked = Arc::new(parent.to_server_context(linked_id.into()));
 
@@ -322,4 +327,52 @@ async fn registry_comparison_classifies_add_remove_and_unchanged() {
             assert!(unchanged.is_empty(), "{unchanged:?}");
         })
         .await;
+}
+
+#[tokio::test]
+async fn a_cancelled_request_answers_cancelled() {
+    let repository_id = random::<Context>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("create stores");
+
+    #[allow(clippy::large_futures)]
+    let status = LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id.into(),
+                lore_revision::state::allow_all_repositories(),
+            ));
+            let from = write_file_revision(&repository, "a.txt", b"v1\n").await;
+            let to = write_file_revision(&repository, "a.txt", b"v2\n").await;
+
+            let mut request = tonic::Request::new(lore_proto::RevisionDiffRequest {
+                revision_from: from.into(),
+                revision_to: to.into(),
+            });
+            request.metadata_mut().insert_bin(
+                lore_transport::grpc::REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository_id.data()),
+            );
+
+            let cancellation = lore_revision::runtime::Cancellation::new();
+            cancellation.cancel();
+            lore_server::util::core_hop::with_request_cancellation(
+                cancellation,
+                lore_server::grpc::handlers::revision_diff::handler(
+                    request,
+                    immutable_store,
+                    mutable_store,
+                    Arc::new(
+                        lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                    ),
+                ),
+            )
+            .await
+            .expect_err("a cancelled request stops before it answers")
+        })
+        .await;
+
+    assert_eq!(status.code(), tonic::Code::Cancelled, "{status:?}");
 }

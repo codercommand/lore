@@ -290,6 +290,11 @@ pub struct IocpStats {
 /// `FlushFileBuffers`, `CreateFile` or the metadata calls: they block whoever issues them, so a
 /// pool thread is the right place for them and this backend cannot improve on it. They are defined
 /// here rather than left out because a backend owns its whole surface.
+///
+/// A file opened unbuffered ([`crate::OpenOptions::unbuffered`]) takes its overlapped writes past
+/// the file cache. The unbuffered whole-file write
+/// ([`crate::IoDriver::write_file_bytes_unbuffered`]) runs on the syscall pool, as for every
+/// backend.
 #[lore_macro::test_pub]
 pub(crate) struct IocpDriver {
     inner: Arc<IocpInner>,
@@ -760,42 +765,32 @@ impl IocpDriver {
         PsyncDriver.set_permissions(path, permissions).await
     }
 
+    pub(crate) async fn make_owner_writable(&self, path: PathBuf) -> std::io::Result<()> {
+        PsyncDriver.make_owner_writable(path).await
+    }
+
     pub(crate) async fn write_file_bytes(
         &self,
         path: PathBuf,
         data: Bytes,
         durable: bool,
     ) -> std::io::Result<std::fs::Metadata> {
-        PsyncDriver.write_file_bytes(path, data, durable).await
-    }
-
-    pub(crate) async fn write_file_segments<B: StableBufList>(
-        &self,
-        options: std::fs::OpenOptions,
-        path: PathBuf,
-        buffers: B,
-        durable: bool,
-    ) -> std::io::Result<()> {
         PsyncDriver
-            .write_file_segments(options, path, buffers, durable)
+            .write_file_bytes(path, data, durable, false)
             .await
-    }
-
-    pub(crate) async fn write_file_segments_atomic<B: StableBufList>(
-        &self,
-        options: std::fs::OpenOptions,
-        temporary_path: PathBuf,
-        final_path: PathBuf,
-        buffers: B,
-        durable: bool,
-    ) -> std::io::Result<()> {
-        PsyncDriver
-            .write_file_segments_atomic(options, temporary_path, final_path, buffers, durable)
-            .await
+            .map(|(metadata, _)| metadata)
     }
 
     pub(crate) async fn metadata(&self, path: PathBuf) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.metadata(path).await
+    }
+
+    pub(crate) async fn stat(&self, path: PathBuf) -> std::io::Result<crate::Stat> {
+        PsyncDriver.stat(path).await
+    }
+
+    pub(crate) async fn symlink_stat(&self, path: PathBuf) -> std::io::Result<crate::Stat> {
+        PsyncDriver.symlink_stat(path).await
     }
 
     pub(crate) async fn holds_name_exactly(&self, path: PathBuf) -> Option<bool> {
@@ -807,10 +802,6 @@ impl IocpDriver {
         file: Arc<File>,
     ) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.file_metadata(file).await
-    }
-
-    pub(crate) async fn set_len(&self, file: Arc<File>, len: u64) -> std::io::Result<()> {
-        PsyncDriver.set_len(file, len).await
     }
 
     pub(crate) async fn rename(&self, from: PathBuf, to: PathBuf) -> std::io::Result<()> {

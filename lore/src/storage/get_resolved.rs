@@ -24,7 +24,9 @@
 //! With `fragments` set the leaves arrive as stored: `GET_HEADER`, then one
 //! `GET_FRAGMENT { id, address, offset, fragment, bytes }` per leaf in content order, then
 //! `GET_ITEM_COMPLETE`. `fragment` describes `bytes`. No leaf is expanded or checked against its
-//! hash. `offset` and the byte-count backstop count content, as in streaming mode.
+//! hash. `offset` and the byte-count backstop count content, as in streaming mode. A hole of the
+//! content arrives as a `LORE_EVENT_STORAGE_GET_FRAGMENT` whose fragment has a `size_payload` of
+//! zero and no payload, covering `size_content` bytes that read as zeros.
 //!
 //! `address` is the resolved address (`{ resolved_hash, context }`), so callers may cache the
 //! key->hash mapping from the event stream.
@@ -50,6 +52,7 @@ use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
 use lore_revision::event::LoreBytes;
 use lore_revision::event::LoreBytesMut;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::lore::execution_context;
@@ -68,12 +71,20 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One get-resolved item — the mutable key to resolve and the context to read it in.
 #[repr(C)]
-#[derive(Copy, Clone, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreStorageGetResolvedItem {
     /// Caller-chosen id echoed back in every event for this item
     pub id: u64,
@@ -91,13 +102,16 @@ pub struct LoreStorageGetResolvedItem {
     /// partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
     /// success code
     pub streaming: u8,
-    /// Cache fetched bytes back to the local store even without the producer's
-    /// `PayloadLocalCachePriority` hint
+    /// Cache fetched bytes in the local store, as they always are for a fragment written with
+    /// `PayloadLocalCachePriority` or one of revision state. A fetched fragment whose bytes are not
+    /// cached is still written to the local store as an entry without its payload, so a put of
+    /// the same content uploads nothing. Either is marked stored durable
     pub local_cache: u8,
     /// Deliver one `GET_FRAGMENT` per leaf fragment in content order in place of `GET_DATA`, each
     /// carrying the leaf's fragment and its payload as stored, with `streaming` ignored. No leaf
-    /// is expanded or checked against its hash. An item with `data_out` supplied rejects with
-    /// `INVALID_ARGUMENTS`
+    /// is expanded or checked against its hash. A hole of the content arrives as a `GET_FRAGMENT`
+    /// whose fragment has a `size_payload` of zero and no payload, covering `size_content` bytes
+    /// that read as zeros. An item with `data_out` supplied rejects with `INVALID_ARGUMENTS`
     pub fragments: u8,
     /// Writable buffer receiving the content, `len` stating its capacity. Zero-initialized selects
     /// delivery in events.
@@ -124,7 +138,16 @@ impl core::fmt::Debug for LoreStorageGetResolvedItem {
 
 /// Arguments for `lore_storage_get_resolved`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(get_resolved_local)]
 pub struct LoreStorageGetResolvedArgs {
     /// Open storage handle
@@ -134,12 +157,12 @@ pub struct LoreStorageGetResolvedArgs {
 }
 
 /// Resolve one or more mutable keys and read the content they point at.
-pub async fn get_resolved(
+pub fn get_resolved(
     globals: LoreGlobalArgs,
     args: LoreStorageGetResolvedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, get_resolved_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, get_resolved_local)
 }
 
 async fn get_resolved_local(
@@ -162,24 +185,30 @@ async fn get_resolved_local(
             }
             let effective = store.effective_flags(per_call)?;
             let mut reuse = crate::storage::store::SessionReuse::default();
+            let mut lent = crate::storage::lent::LentBuffers::default();
 
-            crate::storage::fan_out_items!(items, "get_resolved", |item| {
+            let result = crate::storage::fan_out_items!(items, "get_resolved", |item| {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                async move { get_resolved_item(store, &item, effective, session).await }
-            })
+                let lender = lent.lender(&item.data_out);
+                async move { get_resolved_item(store, &item, effective, session, lender).await }
+            });
+            lent.returned().await;
+            result
         },
     )
     .await
 }
 
-/// Resolve and read one item, emitting its `HEADER` ... `ITEM_COMPLETE` sequence.
-/// Returns the item's own error so the call-level reduction can pick the dominant failure.
+/// Resolve and read one item, emitting its `HEADER` ... `ITEM_COMPLETE` sequence, into the item's
+/// `data_out` through `lender` when it supplies one. Returns the item's own error so the call-level
+/// reduction can pick the dominant failure.
 async fn get_resolved_item(
     store: Arc<StoreInternal>,
     item: &LoreStorageGetResolvedItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
+    lender: Option<crate::storage::lent::ItemLender>,
 ) -> Result<(), StorageError> {
     if item.partition == Partition::default() {
         return emit_item_complete(
@@ -213,15 +242,15 @@ async fn get_resolved_item(
         return get_resolved_item_streaming(
             store,
             item,
-            read_options.no_decompress().no_verify(),
+            fragments_read_options(read_options),
             remote_session,
             emit_fragment,
         )
         .await;
     }
 
-    if item.data_out.is_supplied() {
-        return get_resolved_item_into(store, item, read_options, remote_session).await;
+    if let Some(lender) = lender {
+        return get_resolved_item_into(store, item, read_options, remote_session, lender).await;
     }
 
     if item.streaming != 0 {
@@ -266,6 +295,13 @@ async fn get_resolved_item(
     }
 }
 
+/// The read options of `fragments` delivery: payloads as stored, from a remote trusted, as the
+/// caller checks what it takes, so no leaf is decoded or hashed on its way.
+#[lore_macro::test_pub]
+fn fragments_read_options(options: lore_storage::ReadOptions) -> lore_storage::ReadOptions {
+    options.no_decompress().trusting_remote()
+}
+
 /// Counterpart of [`get_resolved_item`] delivering the content into `data_out`. Emits
 /// `GET_HEADER` with the number of bytes written, then `GET_ITEM_COMPLETE`; content exceeding the
 /// stated capacity fails the item rather than truncating.
@@ -274,13 +310,9 @@ async fn get_resolved_item_into(
     item: &LoreStorageGetResolvedItem,
     read_options: lore_storage::ReadOptions,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
+    lender: crate::storage::lent::ItemLender,
 ) -> Result<(), StorageError> {
-    // SAFETY: `data_out` names caller memory that stays valid, and untouched by anyone else, for
-    // the duration of the call this future is wholly within. `len` bounds the read.
-    let mut dst = unsafe {
-        lore_storage::CallerBuffer::new(item.data_out.ptr.cast::<u8>(), item.data_out.len)
-    };
-
+    let mut dst = lender.lend(&item.data_out);
     match lore_storage::read_resolved_into_buffer(
         store.immutable.clone(),
         store.mutable.clone(),
@@ -418,7 +450,7 @@ fn emit_item_complete(
     LoreEvent::StorageGetItemComplete(LoreStorageGetItemCompleteEventData {
         id: item.id,
         address,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result

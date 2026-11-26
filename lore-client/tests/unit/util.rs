@@ -1,34 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-mod format_bytes_tests {
-    use lore_client::util::format_bytes_to_string;
-
-    /// A count of bytes is exact, so a decimal on it is noise at best and
-    /// misleading at worst — "600.00 bytes" reads as a measurement that was
-    /// rounded when it was not.
-    #[test]
-    fn a_raw_byte_count_carries_no_decimals() {
-        assert_eq!(format_bytes_to_string(0), "0 bytes");
-        assert_eq!(format_bytes_to_string(1), "1 bytes");
-        assert_eq!(format_bytes_to_string(600), "600 bytes");
-        assert_eq!(format_bytes_to_string(1024), "1024 bytes");
-    }
-
-    #[test]
-    fn a_scaled_unit_carries_decimals_because_the_remainder_means_something() {
-        assert_eq!(format_bytes_to_string(1025), "1.00 KiB");
-        assert_eq!(format_bytes_to_string(1536), "1.50 KiB");
-        assert_eq!(format_bytes_to_string(3 * 1024 * 1024 / 2), "1.50 MiB");
-        assert_eq!(
-            format_bytes_to_string(3 * 1024 * 1024 * 1024 / 2),
-            "1.50 GiB"
-        );
-    }
-}
-
 mod termination_signal_tests {
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
     use lore_client::util::TerminationSignals;
 
     /// What registering ahead of the socket relies on: the handler is what holds
@@ -46,5 +22,32 @@ mod termination_signal_tests {
         tokio::time::timeout(Duration::from_secs(5), signals.recv())
             .await
             .expect("a signal delivered before the wait must still end it");
+    }
+}
+
+mod rfc2822_display_tests {
+    use lore_client::util::rfc2822_display;
+
+    #[test]
+    fn a_timestamp_displays_as_rfc2822_in_utc() {
+        assert_eq!(
+            rfc2822_display(1_795_351_520_303).as_deref(),
+            Some("Sun, 22 Nov 2026 12:45:20 +0000")
+        );
+    }
+
+    /// The timestamp is read as signed, so the largest one is a millisecond before the epoch.
+    #[test]
+    fn a_timestamp_past_the_signed_range_displays_before_the_epoch() {
+        assert_eq!(
+            rfc2822_display(u64::MAX).as_deref(),
+            Some("Wed, 31 Dec 1969 23:59:59 +0000")
+        );
+    }
+
+    #[test]
+    fn a_timestamp_past_the_year_9999_displays_nothing() {
+        assert_eq!(rfc2822_display(253_402_300_800_000), None);
+        assert_eq!(rfc2822_display(1 << 63), None);
     }
 }

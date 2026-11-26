@@ -9,46 +9,36 @@ name = "lore_revision"
 test = false
 
 [dependencies]
-async-stream = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bitcode = { workspace = true }
 blake3 = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
-crossbeam = { workspace = true }
+crossbeam-epoch = { workspace = true }
+crossbeam-queue = { workspace = true }
+crossbeam-utils = { workspace = true }
 dashmap = { workspace = true }
 diffy = { workspace = true }
-fastcdc = { workspace = true }
 futures = { workspace = true }
 glob-match = { workspace = true }
 governor = { workspace = true }
 hex = { workspace = true }
-http = { workspace = true }
 infer = { workspace = true }
-jsonwebtoken = { workspace = true }
-keyring = { workspace = true }
 libc = { workspace = true }
 open = "5.3.2"
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
-prost-types = { workspace = true }
-quinn = { workspace = true }
+pin-project = { workspace = true }
 rand = { workspace = true }
 ring = { workspace = true }
 rustls = { workspace = true }
-rustls-native-certs = { workspace = true }
 serde = { workspace = true }
-serde_with = { workspace = true }
 smallvec = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }
-tonic = { workspace = true }
-tower = { workspace = true }
-chrono = { workspace = true }
 url = { workspace = true }
 lore-base = { workspace = true }
 lore-error-set = { workspace = true }
@@ -68,9 +58,39 @@ zerocopy = { workspace = true }
 # staleness reads its error constants from the latter, so both are named here.
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+arc-swap = { workspace = true }
+lore-fuse = { path = "../lore-fuse" }
+
+# `MockTransport`, for provider tests that need the dispatcher's reply path.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+lore-fuse = { path = "../lore-fuse", features = ["test-util"] }
+
+[[example]]
+name = "state_bench"
+path = "examples/state_bench/main.rs"
+required-features = ["state-bench"]
+
+# The walk benchmark, run by hand, as `lore-revision/BENCHMARKS.md` describes. Naming the feature
+# keeps `cargo test` and builds of all targets from building it.
+[[example]]
+name = "walk"
+path = "examples/walk.rs"
+required-features = ["walk-bench"]
+
+# The node operations' stress harness, run by hand through `scripts/state-stress/stress.py`, which
+# enables `state-stress`. Naming the feature keeps `cargo test` and builds of all targets from
+# building it.
+[[example]]
+name = "state_stress"
+path = "examples/state_stress/main.rs"
+required-features = ["state-stress"]
+
 [dev-dependencies]
 ctor = { workspace = true }
+keyring-core = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+lore-io = { workspace = true, features = ["test-util"] }
 lore-revision = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true, features = ["test-util"] }
 lore-transport = { workspace = true, features = ["test-util"] }
@@ -89,12 +109,38 @@ failure_generator = []
 seeding = []
 trace_log = ["lore-base/trace_log"]
 vfs = []
-swfs = []
-test-util = []
+test-util = ["lore-io/test-util"]
+# A build the instruction gate counts (`state-bench`, and lore's `revision-tree-bench`): the
+# test-only lock counters (`state::lock_counting`, `node::read_contention`) count nothing, so the
+# count measures the paths that ship. Examples build with the dev-dependencies, which turn on
+# test-util.
+bench = []
+# The node operation bench, run by hand: `cargo run --release -p lore-revision --example
+# state_bench --features state-bench`. Naming the feature keeps `cargo test` and builds of all
+# targets from building it.
+state-bench = ["bench"]
+# The walk benchmark, run by hand: `cargo run --release -p lore-revision --example walk --features
+# walk-bench`.
+walk-bench = []
+# The node operations' scheduling points (`state::node::hooks`), which the stress harness drives:
+# enabled by `state-stress` alone, so no other build or test run carries them. Benchmarks never
+# build with it.
+state-hooks = []
+# The builds of the stress harness, with the scheduling points and the test utilities it drives:
+# the stress example (`examples/state_stress`) and the deterministic scenarios
+# (`tests/state_scenarios`), both run by hand.
+state-stress = ["state-hooks", "test-util"]
 
 [[test]]
 name = "compile_fail"
 required-features = ["compile_fail_tests"]
+
+# The node operations' deterministic scenarios, run by hand: naming the feature keeps a plain
+# `cargo test` testing the build that ships, without the scheduling points.
+[[test]]
+name = "state_scenarios"
+path = "tests/state_scenarios/main.rs"
+required-features = ["state-stress"]
 
 [lints]
 workspace = true

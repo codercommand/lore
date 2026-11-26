@@ -244,6 +244,8 @@ mod tests {
                 token: LoreString::from("irrelevant"),
                 token_type: LoreString::from("lore"),
                 auth_url: LoreString::default(),
+                client_id: LoreString::default(),
+                client_secret: LoreString::default(),
             },
             callback_capturing(outcome.clone()),
         )
@@ -286,6 +288,7 @@ mod tests {
                 user_ids: LoreArray::default(),
                 with_identity_token: 0,
                 with_access_token: 0,
+                with_claims: 0,
             },
             callback_capturing(outcome.clone()),
         )

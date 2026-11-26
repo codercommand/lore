@@ -1,16 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 mod environment;
+mod forwarded_lock_service;
 mod forwarded_repository;
 mod forwarded_requests;
 mod forwarded_revision;
 mod handlers;
 mod lock_service;
 mod notification_service;
+mod push_protected;
 mod repository;
 mod revision;
 mod server;
 mod storage;
+mod storage_service;
 mod thinclient;
 mod tower;
 
@@ -30,8 +33,10 @@ use lore_revision::metadata::branch::BranchMetadataError;
 use lore_revision::metadata::repository::RepositoryMetadataError;
 use lore_revision::repository::RepositoryError;
 use lore_revision::state::StateError;
+use lore_revision::state::allow_all_repositories;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
@@ -74,7 +79,7 @@ mod link_read {
             &self,
             _token: Option<&VerifiedToken<'_>>,
             _repository_id: RepositoryId,
-            _action: Option<&str>,
+            _action: Action,
         ) -> Result<(), Status> {
             self.async_entered.store(true, Ordering::SeqCst);
             Ok(())
@@ -84,9 +89,9 @@ mod link_read {
             &self,
             _token: Option<&VerifiedToken<'_>>,
             repository_id: RepositoryId,
-            action: Option<&str>,
+            action: Action,
         ) -> Option<Result<(), Status>> {
-            assert_eq!(action, None, "a link read asks reachability only");
+            assert_eq!(action, Action::Read, "a link read asks read");
             self.answers.then(|| {
                 if self.granted.contains(&repository_id) {
                     Ok(())
@@ -169,6 +174,17 @@ mod link_read {
         assert!(can_read(repository(GRANTED)));
         assert!(!can_read(repository(UNGRANTED)));
 
+        // Any entry naming the partition grants the link read, whatever it lists.
+        let write_only = AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id: format!("urc-{}", repository(GRANTED)),
+                permission: vec!["write".to_string()],
+            }]),
+            ..Default::default()
+        };
+        let can_read = link_read_authorizer(&authorizer, &extensions_with_token(write_only));
+        assert!(can_read(repository(GRANTED)));
+
         // A verifier is configured but this request carries no token:
         // nothing is granted.
         let can_read = link_read_authorizer(&authorizer, &Extensions::new());
@@ -225,376 +241,287 @@ fn get_authorization_extracts_auth() {
     assert_eq!(authz_data, test_authz_token);
 }
 
-#[test]
-fn user_permissions_includes_matched_repo_permissions() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
+mod may_administer {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
 
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec!["test_permission".to_string()],
-    };
+    use async_trait::async_trait;
+    use lore_server::authnz::repository_authorizer::Grants;
 
-    test_authz_token.resources = Some(vec![test_resource_permission.clone()]);
-    extensions.insert(test_authz_token.clone());
+    use super::*;
 
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let matched_permissions = user_permissions(&extensions, test_repository_context);
-    let no_matched_permissions = user_permissions(&extensions, test_unrelated_repository_context);
-    assert_eq!(matched_permissions, vec!["test_permission".to_string()]);
-    assert_eq!(no_matched_permissions, Vec::<String>::new());
-}
-
-#[test]
-fn user_permissions_includes_wildcard_resource() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec!["test_permission".to_string()],
-    };
-    let test_wildcard_resource_permission = ResourcePermission {
-        resource_id: "urc-*".to_string().clone(),
-        permission: vec!["test_wildcard_permission".to_string()],
-    };
-
-    test_authz_token.resources = Some(vec![
-        test_resource_permission.clone(),
-        test_wildcard_resource_permission.clone(),
-    ]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let matched_permissions = user_permissions(&extensions, test_repository_context);
-    let no_matched_permissions = user_permissions(&extensions, test_unrelated_repository_context);
-    assert_eq!(
-        matched_permissions,
-        vec![
-            "test_permission".to_string(),
-            "test_wildcard_permission".to_string()
-        ]
-    );
-    assert_eq!(
-        no_matched_permissions,
-        vec!["test_wildcard_permission".to_string()]
-    );
-}
-
-#[test]
-fn finds_existing_matching_permission_with_regular_repo() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec![
-            "test_permission".to_string(),
-            "other_permission".to_string(),
-        ],
-    };
-
-    test_authz_token.resources = Some(vec![test_resource_permission.clone()]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-
-    // user has test_permission for a given repo in their token
-    assert!(
-        user_permissions(&extensions, test_repository_context)
-            .contains(&"test_permission".to_string())
-    );
-    // user has other_permission for a given repo in their token
-    assert!(
-        user_permissions(&extensions, test_repository_context)
-            .contains(&"other_permission".to_string())
-    );
-    // user doesn't have test_permission2 for a given repo in their token
-    assert!(
-        !user_permissions(&extensions, test_repository_context)
-            .contains(&"test_permission2".to_string())
-    );
-    // user doesn't have test_permission for an unrelated repository
-    assert!(
-        !user_permissions(&extensions, test_unrelated_repository_context)
-            .contains(&"test_permission".to_string())
-    );
-    // user doesn't have other_permission for an unrelated repository
-    assert!(
-        !user_permissions(&extensions, test_unrelated_repository_context)
-            .contains(&"other_permission".to_string())
-    );
-}
-
-#[test]
-fn finds_existing_matching_permission_with_wildcard_repo() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec![
-            "test_permission".to_string(),
-            "unique_permission".to_string(),
-        ],
-    };
-    let test_wildcard_resource_permission = ResourcePermission {
-        resource_id: "urc-*".to_string().clone(),
-        permission: vec![
-            "test_permission".to_string(),
-            "test_wildcard_permission".to_string(),
-            "another_wildcard_permission".to_string(),
-        ],
-    };
-
-    test_authz_token.resources = Some(vec![
-        test_resource_permission.clone(),
-        test_wildcard_resource_permission.clone(),
-    ]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-
-    // user has test_permission for a given repo in their token
-    assert!(
-        user_permissions(&extensions, test_repository_context)
-            .contains(&"test_permission".to_string())
-    );
-    // user has unique_permission for a given repo in their token
-    assert!(
-        user_permissions(&extensions, test_repository_context)
-            .contains(&"unique_permission".to_string())
-    );
-    // user has test_wildcard_permission for a given repo — through the wildcard resource
-    assert!(
-        user_permissions(&extensions, test_repository_context)
-            .contains(&"test_wildcard_permission".to_string())
-    );
-    // user also has test_permission for an unrelated repository — through the wildcard resource
-    assert!(
-        user_permissions(&extensions, test_unrelated_repository_context)
-            .contains(&"test_permission".to_string())
-    );
-
-    // user doesn't have unique_permission for an unrelated repository
-    assert!(
-        !user_permissions(&extensions, test_unrelated_repository_context)
-            .contains(&"unique_permission".to_string())
-    );
-}
-
-#[test]
-fn can_admin_lock_with_direct_permission_claim() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec!["test_permission".to_string(), "migrate".to_string()],
-    };
-
-    test_authz_token.resources = Some(vec![test_resource_permission.clone()]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-
-    // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-    assert!(can_admin_lock(&extensions, test_repository_context));
-
-    // as user doesn't have "migrate" permission for an unrelated repo, they CAN'T admin lock that repo
-    assert!(!can_admin_lock(
-        &extensions,
-        test_unrelated_repository_context
-    ));
-}
-
-#[test]
-fn can_admin_lock_with_wildcard_permission_claim() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec!["test_permission".to_string(), "migrate".to_string()],
-    };
-
-    let test_wildcard_resource_permission = ResourcePermission {
-        resource_id: "urc-*".to_string().clone(),
-        permission: vec![
-            "migrate".to_string(),
-            "test_wildcard_permission".to_string(),
-        ],
-    };
-
-    test_authz_token.resources = Some(vec![
-        test_resource_permission.clone(),
-        test_wildcard_resource_permission.clone(),
-    ]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-
-    // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-    assert!(can_admin_lock(&extensions, test_repository_context));
-
-    // user doesn't have direct "migrate" permission for an unrelated repo
-    // but they have a wildcard token with "migrate", so they should be able to admin lock arbitrary repo
-    assert!(can_admin_lock(
-        &extensions,
-        test_unrelated_repository_context
-    ));
-}
-
-/// Regression: two entries matching the same partition merge
-/// their permission lists. The old reader stopped at the first matching
-/// entry, so whichever permission sat in a later entry was lost.
-#[test]
-fn user_permissions_merge_across_matching_entries() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permissions = vec![
-        ResourcePermission {
-            resource_id: test_repository_id.clone(),
-            permission: vec!["push".to_string()],
-        },
-        ResourcePermission {
-            resource_id: "urc-*".to_string(),
-            permission: vec!["migrate".to_string()],
-        },
-        ResourcePermission {
-            resource_id: test_repository_id.clone(),
-            permission: vec!["obliterate".to_string()],
-        },
-    ];
-
-    test_authz_token.resources = Some(test_resource_permissions);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-
-    assert_eq!(
-        user_permissions(&extensions, test_repository_context),
-        vec![
-            "push".to_string(),
-            "migrate".to_string(),
-            "obliterate".to_string()
-        ]
-    );
-}
-
-/// Regression: a `urc-*` grant now satisfies `can_obliterate`
-/// and `is_owner_or_admin`, not just `can_admin_lock`. The old
-/// `user_permissions` reader never looked at the wildcard entry, so the
-/// three checks disagreed about one token.
-#[test]
-fn wildcard_grant_satisfies_every_action_check() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_wildcard_resource_permission = ResourcePermission {
-        resource_id: "urc-*".to_string(),
-        permission: vec![
-            "obliterate".to_string(),
-            "admin".to_string(),
-            "migrate".to_string(),
-        ],
-    };
-
-    test_authz_token.resources = Some(vec![test_wildcard_resource_permission]);
-    extensions.insert(test_authz_token.clone());
-
-    for repository_id in [test_repository_id, unrelated_repository_id] {
-        let repository_context: RepositoryId =
-            Context::from_str(repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-        assert!(can_obliterate(&extensions, repository_context));
-        assert!(is_owner_or_admin(&extensions, repository_context));
-        assert!(can_admin_lock(&extensions, repository_context));
+    /// Grants a fixed action set and records the questions asked of it.
+    /// `enumerates: false` models an authorizer that answers only
+    /// per-action questions.
+    struct Recording {
+        enumerates: bool,
+        actions: HashSet<String>,
+        asked: Mutex<Vec<String>>,
+        enumerated: Mutex<usize>,
     }
-}
 
-#[test]
-fn no_grant_denies_every_action_check() {
-    let mut extensions = Extensions::new();
-    let mut test_authz_token = AuthorizationToken::default();
-    let test_resource_permissions = Vec::new();
-    test_authz_token.resources = Some(test_resource_permissions);
-    extensions.insert(test_authz_token.clone());
+    impl Recording {
+        fn new(enumerates: bool, actions: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                enumerates,
+                actions: actions.iter().map(ToString::to_string).collect(),
+                asked: Mutex::new(Vec::new()),
+                enumerated: Mutex::new(0),
+            })
+        }
+    }
 
-    let test_repository_context: RepositoryId =
-        Context::from_str("0194b726b34e72b0b45550b88a967076")
+    #[async_trait]
+    impl RepositoryAuthorizer for Recording {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+            action: Action,
+        ) -> Result<(), Status> {
+            self.asked.lock().unwrap().push(action.to_string());
+            if self.actions.contains(action.as_str()) {
+                Ok(())
+            } else {
+                Err(Status::permission_denied("not granted"))
+            }
+        }
+
+        async fn granted_actions(
+            &self,
+            _token: Option<&VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+        ) -> Result<Option<Grants>, Status> {
+            if !self.enumerates {
+                return Ok(None);
+            }
+            *self.enumerated.lock().unwrap() += 1;
+            Ok(Some(Grants::Actions(self.actions.clone())))
+        }
+    }
+
+    fn extensions_with_token() -> Extensions {
+        let mut extensions = Extensions::new();
+        extensions.insert(AuthorizationToken::default());
+        extensions.insert(RawToken("raw.jwt".to_string()));
+        extensions
+    }
+
+    /// An enumerating authorizer answers `owner` and `admin` from one
+    /// enumeration, with no per-action question.
+    #[tokio::test]
+    async fn one_enumeration_answers_owner_and_admin() {
+        for (actions, permitted) in [(&["admin"][..], true), (&["write"][..], false)] {
+            let recording = Recording::new(true, actions);
+            let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+            assert_eq!(
+                may_administer_repository(
+                    &authorizer,
+                    &extensions_with_token(),
+                    RepositoryId::default(),
+                    "alice",
+                    "mallory",
+                )
+                .await
+                .unwrap(),
+                permitted,
+                "{actions:?}"
+            );
+            assert_eq!(*recording.enumerated.lock().unwrap(), 1);
+            assert!(recording.asked.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_enumerating_authorizer_is_asked_per_action() {
+        let recording = Recording::new(false, &["admin"]);
+        let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+        assert!(
+            may_administer_repository(
+                &authorizer,
+                &extensions_with_token(),
+                RepositoryId::default(),
+                "alice",
+                "mallory",
+            )
+            .await
             .unwrap()
-            .into();
+        );
+        assert_eq!(
+            *recording.asked.lock().unwrap(),
+            ["owner".to_string(), "admin".to_string()]
+        );
+    }
 
-    assert!(!is_owner_or_admin(&extensions, test_repository_context));
-    assert!(!can_obliterate(&extensions, test_repository_context));
-    assert!(!can_admin_lock(&extensions, test_repository_context));
+    /// The creator needs `write`, answered from the same one enumeration.
+    #[tokio::test]
+    async fn the_creator_needs_write() {
+        for (actions, permitted) in [(&["write"][..], true), (&["read"][..], false)] {
+            let recording = Recording::new(true, actions);
+            let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+            assert_eq!(
+                may_administer_repository(
+                    &authorizer,
+                    &extensions_with_token(),
+                    RepositoryId::default(),
+                    "alice",
+                    "alice",
+                )
+                .await
+                .unwrap(),
+                permitted,
+                "{actions:?}"
+            );
+            assert!(recording.asked.lock().unwrap().is_empty());
+            assert_eq!(*recording.enumerated.lock().unwrap(), 1);
+        }
+    }
+
+    /// A non-enumerating authorizer is asked `owner`, `admin` and then
+    /// `write`, and `write` permits only the recorded creator.
+    #[tokio::test]
+    async fn a_non_enumerating_authorizer_decides_the_creator_path_per_action() {
+        for (user, permitted) in [("alice", true), ("mallory", false)] {
+            let recording = Recording::new(false, &["write"]);
+            let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+            assert_eq!(
+                may_administer_repository(
+                    &authorizer,
+                    &extensions_with_token(),
+                    RepositoryId::default(),
+                    "alice",
+                    user,
+                )
+                .await
+                .unwrap(),
+                permitted,
+                "{user}"
+            );
+            assert_eq!(
+                *recording.asked.lock().unwrap(),
+                [
+                    "owner".to_string(),
+                    "admin".to_string(),
+                    "write".to_string()
+                ]
+            );
+        }
+    }
+
+    /// The grants the partition-access layer already enumerated answer, so
+    /// the authorizer is not asked again.
+    #[tokio::test]
+    async fn the_layers_grants_answer_without_another_enumeration() {
+        let recording = Recording::new(true, &[]);
+        let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+        let mut extensions = extensions_with_token();
+        extensions.insert(
+            lore_server::authnz::repository_authorizer::PartitionGrants {
+                repository_id: RepositoryId::default(),
+                grants: Grants::Actions(["admin".to_string()].into()),
+            },
+        );
+        assert!(
+            may_administer_repository(
+                &authorizer,
+                &extensions,
+                RepositoryId::default(),
+                "alice",
+                "mallory",
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(*recording.enumerated.lock().unwrap(), 0);
+        assert!(recording.asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_layers_grants_answer_set_protected() {
+        let (immutable_store, mutable_store, _execution) =
+            crate::store::test_support::test_store_create()
+                .await
+                .expect("Failed to create stores");
+        let recording = Recording::new(false, &[]);
+        let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+        let mut extensions = extensions_with_token();
+        extensions.insert(
+            lore_server::authnz::repository_authorizer::PartitionGrants {
+                repository_id: RepositoryId::default(),
+                grants: Grants::Actions(["set-protected".to_string()].into()),
+            },
+        );
+        let repository = Arc::new(
+            lore_revision::repository::RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                RepositoryId::default(),
+                allow_all_repositories(),
+            ),
+        );
+        require_branch_protection_administration(&authorizer, &extensions, repository, "mallory")
+            .await
+            .expect("set-protected permits");
+        assert!(recording.asked.lock().unwrap().is_empty());
+    }
+
+    /// No verified token means no identity to compare, as on a server with
+    /// no `[server.auth]` where every caller is `<unknown>` and the recorded
+    /// creator is whatever the client sent: `write` alone decides.
+    #[tokio::test]
+    async fn without_a_token_write_alone_decides() {
+        for (actions, permitted) in [(&["write"][..], true), (&["read"][..], false)] {
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Recording::new(true, actions);
+            assert_eq!(
+                may_administer_repository(
+                    &authorizer,
+                    &Extensions::new(),
+                    RepositoryId::default(),
+                    "alice",
+                    "<unknown>",
+                )
+                .await
+                .unwrap(),
+                permitted,
+                "{actions:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_is_an_error_and_a_denial_is_not() {
+        for (refusal, outcome) in [
+            (Status::permission_denied("denied"), Ok(false)),
+            (
+                Status::resource_exhausted("rate limited"),
+                Err(Code::ResourceExhausted),
+            ),
+        ] {
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(
+                crate::authnz::repository_authorizer::RefusingAuthorizer(refusal),
+            );
+            let result = may_administer_repository(
+                &authorizer,
+                &extensions_with_token(),
+                RepositoryId::default(),
+                "alice",
+                "mallory",
+            )
+            .await
+            .map_err(|status| status.code());
+            assert_eq!(result, outcome);
+        }
+    }
 }
 
 mod timeout_grpc_tests {
     use std::time::Duration;
+
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_revision::runtime::Cancellation;
+    use lore_revision::runtime::check_cancelled;
+    use lore_server::util::core_hop::with_request_cancellation;
+    use lore_server::util::setup_execution;
 
     use super::*;
 
@@ -614,16 +541,88 @@ mod timeout_grpc_tests {
         assert_eq!(status.message(), "missing");
     }
 
+    /// A handler that runs until its call is cancelled, then fails as cancelled.
+    async fn until_cancelled() -> Result<i32, Status> {
+        let execution = setup_execution("test", String::default(), String::default());
+        LORE_CONTEXT
+            .scope(execution, async {
+                loop {
+                    if check_cancelled().is_err() {
+                        return Err(Status::cancelled("stopped"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+    }
+
     #[tokio::test]
-    async fn returns_cancelled_when_future_exceeds_timeout() {
+    async fn holds_the_handler_future_once() {
+        let handler = async {
+            let buffer = [0u8; 4096];
+            tokio::task::yield_now().await;
+            Ok::<_, Status>(buffer.len())
+        };
+        let handler_size = size_of_val(&handler);
+        let timed = timeout_grpc(Duration::from_secs(1), handler);
+        assert!(
+            size_of_val(&timed) < 2 * handler_size,
+            "the timeout holds {} bytes for a handler of {handler_size}",
+            size_of_val(&timed)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancels_the_handler_at_the_deadline_and_reports_the_timeout() {
+        let status = timeout_grpc(Duration::from_millis(10), until_cancelled())
+            .await
+            .expect_err("the handler stops once cancelled");
+        assert_eq!(status.code(), Code::Cancelled);
+        assert_eq!(status.message(), "Request handler timeout exceeded");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_that_finishes_past_the_deadline_keeps_its_result() {
         let fut = async {
             tokio::time::sleep(Duration::from_secs(10)).await;
             Ok::<_, Status>(42)
         };
-        let result = timeout_grpc(Duration::from_millis(10), fut).await;
-        let status = result.unwrap_err();
+        let value = timeout_grpc(Duration::from_millis(10), fut)
+            .await
+            .expect("the handler is not dropped at the deadline");
+        assert_eq!(value, 42);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_request_cancelled_after_the_deadline_keeps_its_own_status() {
+        let request = Cancellation::new();
+        let cancel_late = request.clone();
+        let handler = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cancel_late.cancel();
+            Err::<i32, _>(Status::cancelled("client left"))
+        };
+        let status =
+            with_request_cancellation(request, timeout_grpc(Duration::from_millis(10), handler))
+                .await
+                .expect_err("the handler fails as cancelled");
         assert_eq!(status.code(), Code::Cancelled);
-        assert!(status.message().contains("timeout"));
+        assert_eq!(status.message(), "client left");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_the_request_cancels_the_handler_before_the_deadline() {
+        let request = Cancellation::new();
+        let handler = with_request_cancellation(
+            request.clone(),
+            timeout_grpc(Duration::from_secs(3600), until_cancelled()),
+        );
+        request.cancel();
+        let status = handler
+            .await
+            .expect_err("the handler stops once its request is cancelled");
+        assert_eq!(status.code(), Code::Cancelled);
+        assert_eq!(status.message(), "stopped");
     }
 }
 
@@ -805,5 +804,131 @@ mod map_message_handle_error_to_status {
         assert_eq!(status.code(), Code::InvalidArgument);
         assert_eq!(status.message(), "Invalid argument: bad key_type");
         assert!(!is_code_considered_server_error(&status.code()));
+    }
+}
+
+mod hook_error_to_status {
+    use std::time::Duration;
+
+    use lore_server::hooks::HookError;
+    use lore_server::hooks::StatusCode;
+
+    use super::*;
+
+    #[test]
+    fn unavailable_rejection_answers_unavailable() {
+        let error =
+            HookError::rejected("auth", "auth service unreachable", StatusCode::Unavailable);
+
+        assert_eq!(hook_error_to_status(error).code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn timeout_answers_unavailable() {
+        let error = HookError::timeout("auth", Duration::from_millis(200));
+
+        assert_eq!(hook_error_to_status(error).code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn panic_answers_internal() {
+        let error = HookError::panic("auth", "boom");
+
+        assert_eq!(hook_error_to_status(error).code(), Code::Internal);
+    }
+}
+
+mod until_request_cancelled {
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_revision::runtime::Cancellation;
+    use lore_server::grpc::until_request_cancelled;
+    use lore_server::util::core_hop::with_request_cancellation;
+    use lore_server::util::setup_execution;
+
+    #[tokio::test]
+    async fn a_waiting_stream_ends_once_the_request_is_cancelled() {
+        let request = Cancellation::new();
+        let execution = with_request_cancellation(request.clone(), async {
+            setup_execution("test", String::default(), String::default())
+        })
+        .await;
+        let next = LORE_CONTEXT
+            .scope(execution, async {
+                let mut stream =
+                    std::pin::pin!(until_request_cancelled(futures::stream::pending::<u32>()));
+                request.cancel();
+                tokio::time::timeout(Duration::from_secs(5), stream.next()).await
+            })
+            .await
+            .expect("the stream ends without another message");
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
+    async fn a_stream_already_waiting_ends_once_the_request_is_cancelled() {
+        let request = Cancellation::new();
+        let execution = with_request_cancellation(request.clone(), async {
+            setup_execution("test", String::default(), String::default())
+        })
+        .await;
+        let next = LORE_CONTEXT
+            .scope(execution, async {
+                let mut stream =
+                    std::pin::pin!(until_request_cancelled(futures::stream::pending::<u32>()));
+                assert!(futures::poll!(stream.next()).is_pending());
+                request.cancel();
+                tokio::time::timeout(Duration::from_secs(5), stream.next()).await
+            })
+            .await
+            .expect("the cancellation wakes the waiting stream");
+        assert_eq!(next, None);
+    }
+
+    #[tokio::test]
+    async fn every_message_passes_while_the_request_is_live() {
+        let request = Cancellation::new();
+        let execution = with_request_cancellation(request, async {
+            setup_execution("test", String::default(), String::default())
+        })
+        .await;
+        let items = LORE_CONTEXT
+            .scope(execution, async {
+                until_request_cancelled(futures::stream::iter([1, 2, 3]))
+                    .collect::<Vec<_>>()
+                    .await
+            })
+            .await;
+        assert_eq!(items, [1, 2, 3]);
+    }
+}
+
+mod run_detached {
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_revision::runtime::Cancellation;
+    use lore_revision::runtime::check_cancelled;
+    use lore_server::util::core_hop::with_request_cancellation;
+    use lore_server::util::setup_execution;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn the_task_is_not_cancelled_with_its_request() {
+        let cancellation = Cancellation::new();
+        cancellation.cancel();
+        let request = with_request_cancellation(cancellation, async {
+            setup_execution("test", String::default(), String::default())
+        })
+        .await;
+
+        let checked = LORE_CONTEXT
+            .scope(request, async {
+                run_detached("test", async { check_cancelled() }).await
+            })
+            .await
+            .expect("the task runs to its end");
+        checked.expect("the task does not see its request's cancellation");
     }
 }

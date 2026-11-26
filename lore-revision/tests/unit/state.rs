@@ -1,27 +1,49 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use futures::FutureExt;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_base::types::ZeroHeapAlloc;
 use lore_revision::change::FileAction;
 use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
-use lore_revision::immutable;
+use lore_revision::immutable::WriteToImmutable;
 use lore_revision::instance::InstanceId;
 use lore_revision::link::LinkFlags;
 use lore_revision::lore::*;
 use lore_revision::nametable::NameTable;
 use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::util::path::RelativePath;
 use lore_revision::util::path::RelativePathBuf;
 use lore_storage::hash;
 use zerocopy::FromZeros;
 
+mod apply;
+mod attach;
+mod chain_log;
 mod diff;
+mod discard;
+mod found;
+mod hierarchy_walk;
+mod link_target;
+mod namespace;
+mod pending;
+mod relocate;
 mod reparent;
+mod save;
+mod scoped_diff;
+mod served;
 mod stream;
+mod sweep;
+mod unserved;
 
 /// Each action the walk settles on records a dirty flag and the staged flag standing
 /// for the same change.
@@ -58,9 +80,12 @@ fn an_action_records_matching_dirty_and_staged_flags() {
 }
 
 use lore_base::runtime::LORE_CONTEXT;
+use lore_revision::state::push_distinct;
 use lore_revision::state::*;
+use lore_storage::FlushOptions;
 
 use crate::fs::filesystem_provider::setup_test_execution;
+use crate::fs::filesystem_provider::test_store_create;
 
 /// The key every stored modification time is filed under. It has to stay the
 /// digest over the path's own lowercase form, or a scan finds nothing it wrote
@@ -162,6 +187,34 @@ fn resolve_branch_returns_own_branch_when_non_zero() {
     assert_eq!(link_ref.resolve_branch(parent), own_branch);
 }
 
+/// An auto-following link resolving to its parent's branch stores zero, whatever it stored
+/// before. Another branch, or a link that does not follow, keeps the branch.
+#[test]
+fn branch_to_store_is_zero_only_for_an_auto_following_link_on_the_parent_branch() {
+    let parent = BranchId::from([1u8; 16]);
+    let other = BranchId::from([2u8; 16]);
+    let follows = LinkFlags::NoFlags.bits();
+    let pinned = LinkFlags::DisableAutoFollow.bits();
+    for (stored, flags, branch, expected) in [
+        (BranchId::default(), follows, parent, BranchId::default()),
+        (parent, follows, parent, BranchId::default()),
+        (other, follows, parent, BranchId::default()),
+        (BranchId::default(), follows, other, other),
+        (parent, pinned, parent, parent),
+    ] {
+        let link_ref = LinkReference {
+            branch: stored,
+            flags,
+            ..LinkReference::default()
+        };
+        assert_eq!(
+            link_ref.branch_to_store(branch, parent),
+            expected,
+            "stored {stored}, flags {flags}, resolving to {branch}"
+        );
+    }
+}
+
 /// A state with no serialized link list, so the registry lives only in the runtime copy and
 /// every read has to come from there.
 async fn null_repository() -> Arc<RepositoryContext> {
@@ -170,6 +223,16 @@ async fn null_repository() -> Arc<RepositoryContext> {
 
 /// [`null_repository`] whose ignore filter excludes `globs`.
 async fn null_repository_excluding(globs: &[&str]) -> Arc<RepositoryContext> {
+    null_repository_filtering(globs, &[]).await
+}
+
+/// [`null_repository`] whose view excludes `globs`.
+async fn null_repository_viewing(globs: &[&str]) -> Arc<RepositoryContext> {
+    null_repository_filtering(&[], globs).await
+}
+
+/// [`null_repository`] whose ignore filter excludes `ignore` and whose view excludes `view`.
+async fn null_repository_filtering(ignore: &[&str], view: &[&str]) -> Arc<RepositoryContext> {
     let immutable_store = lore_storage::local::immutable_store::create(
         None::<&str>,
         lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
@@ -187,13 +250,1105 @@ async fn null_repository_excluding(globs: &[&str]) -> Arc<RepositoryContext> {
     .expect("in-memory mutable store");
 
     let mut filter = lore_revision::filter::Filter::default();
-    for glob in globs {
-        filter.ignore.add_exclusion(glob).expect("filter exclusion");
+    for glob in ignore {
+        filter.ignore.add_exclusion(glob).expect("ignore exclusion");
+    }
+    for glob in view {
+        filter.view.add_exclusion(glob).expect("view exclusion");
     }
 
-    let mut context = RepositoryContext::new_null_context(immutable_store, mutable_store);
+    let mut context = RepositoryContext::new_null_context(
+        immutable_store,
+        mutable_store,
+        allow_all_repositories(),
+    );
     context.filter = Arc::new(filter);
     Arc::new(context)
+}
+
+/// Runs `body` against a [`null_repository`], inside the execution scope the State's edits read
+/// their globals from.
+async fn with_repository<F, Fut>(body: F)
+where
+    F: FnOnce(Arc<RepositoryContext>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let repository = null_repository().await;
+    LORE_CONTEXT
+        .scope(setup_test_execution(), body(repository))
+        .await;
+}
+
+/// Runs `body` against a fresh State over a [`null_repository`], as [`with_repository`] does.
+pub(crate) async fn with_state<F, Fut>(body: F)
+where
+    F: FnOnce(Arc<RepositoryContext>, Arc<State>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    with_repository(|repository| body(repository, State::new())).await;
+}
+
+/// A directory record named `name`.
+pub(crate) fn directory(name: &str) -> Node {
+    Node {
+        name_hash: hash::hash_string(name),
+        ..Default::default()
+    }
+}
+
+/// A file record named `name`.
+pub(crate) fn file(name: &str) -> Node {
+    Node {
+        flags: NodeFlags::File.bits(),
+        name_hash: hash::hash_string(name),
+        ..Default::default()
+    }
+}
+
+/// Adds `node` under `parent` as `name`.
+pub(crate) async fn add(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    parent: NodeID,
+    node: Node,
+    name: &str,
+) -> NodeID {
+    state
+        .node_add(repository.clone(), parent, node, name)
+        .await
+        .expect("adding a node succeeds")
+}
+
+/// Adds files below `dir` until block `block` is full, answering them.
+async fn fill(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    dir: NodeID,
+    block: usize,
+) -> Vec<NodeID> {
+    let mut files = Vec::new();
+    for index in 0.. {
+        let name = format!("f{index}");
+        let id = add(state, repository, dir, file(&name), &name).await;
+        files.push(id);
+        if NodeBlock::index(id) == block && Node::index(id) == BLOCK_NODE_COUNT - 1 {
+            break;
+        }
+    }
+    files
+}
+
+/// `node`'s record.
+async fn record(state: &State, repository: &Arc<RepositoryContext>, node: NodeID) -> Node {
+    state
+        .node(repository.clone(), node)
+        .await
+        .expect("the node reads")
+}
+
+/// `state` saved to the in-memory store and loaded again: no block is in memory but the ones
+/// the load reads, and none is recorded changed.
+async fn reload(state: &Arc<State>, repository: &Arc<RepositoryContext>) -> Arc<State> {
+    let token = RepositoryWriteToken::in_memory(&InMemoryMarker);
+    let signature = state
+        .serialize(repository.clone(), &token)
+        .await
+        .expect("the State serializes");
+    State::deserialize(repository.clone(), signature)
+        .await
+        .expect("the State loads")
+}
+
+/// A sibling chain that leaves a block and comes back to it holds the block once, so its
+/// name table loads once.
+#[test]
+fn a_chain_returning_to_a_block_holds_it_once() {
+    let (first, second) = (NodeBlock::new_zeroed(), NodeBlock::new_zeroed());
+    let mut blocks = Vec::new();
+    let pushed: Vec<bool> = [&first, &first, &second, &first, &second]
+        .into_iter()
+        .map(|block| push_distinct(&mut blocks, block))
+        .collect();
+    assert_eq!(pushed, vec![true, false, true, false, false]);
+    assert_eq!(blocks.len(), 2);
+}
+
+struct InMemoryMarker;
+impl lore_revision::repository::InMemoryContext for InMemoryMarker {}
+
+/// Sets `slot` of file metadata block `block_index` to `value`, as a metadata set does.
+async fn set_file_metadata(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    block_index: usize,
+    slot: usize,
+    value: Hash,
+) {
+    let block = state
+        .block_file_metadata(repository.clone(), block_index)
+        .await
+        .expect("file metadata block");
+    let dirtied = {
+        let mut writer = block.write();
+        writer.node(slot).metadata = value;
+        writer.mark_dirty()
+    };
+    if dirtied {
+        state.block_file_metadata_modified(block, block_index);
+    }
+    state.mark_dirty();
+}
+
+async fn file_metadata(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    block_index: usize,
+    slot: usize,
+) -> Hash {
+    let block = state
+        .block_file_metadata(repository.clone(), block_index)
+        .await
+        .expect("file metadata block");
+    block.read().node(slot).metadata
+}
+
+/// A State that serialized a file metadata block list reads that list for a block added
+/// after it, never the list it was loaded with.
+#[tokio::test]
+async fn a_block_added_after_a_serialize_reads_the_serialized_file_metadata_list() {
+    let repository = null_repository().await;
+    let token = RepositoryWriteToken::in_memory(&InMemoryMarker);
+    let (old, new) = (Hash::from([1u8; 32]), Hash::from([2u8; 32]));
+    let first = State::new();
+    set_file_metadata(&first, &repository, 0, 1, old).await;
+    let loaded = first
+        .serialize(repository.clone(), &token)
+        .await
+        .expect("the first State serializes");
+
+    let state = State::deserialize(repository.clone(), loaded)
+        .await
+        .expect("the State loads");
+    assert_eq!(file_metadata(&state, &repository, 0, 1).await, old);
+    set_file_metadata(&state, &repository, 0, 1, new).await;
+    state
+        .serialize(repository.clone(), &token)
+        .await
+        .expect("the State serializes its edit");
+
+    state
+        .block(repository.clone(), 0)
+        .await
+        .expect("the first node block");
+    state.allocate_fresh_block().expect("a second node block");
+    state
+        .block_file_metadata(repository.clone(), 1)
+        .await
+        .expect("the second block's file metadata");
+    assert_eq!(
+        file_metadata(&state, &repository, 0, 1).await,
+        new,
+        "the first block reads what the last serialize wrote"
+    );
+}
+
+/// A store that holds every get of the hashes it is told to hold until released, answers every get
+/// of the hashes it is told to refuse as missing, and the next gets of those it is told to fail
+/// with the error it is given, and counts every get.
+pub(crate) struct HoldingStore {
+    inner: Arc<dyn lore_storage::ImmutableStore>,
+    held: std::sync::Mutex<Vec<Hash>>,
+    refused: std::sync::Mutex<Vec<Hash>>,
+    /// Each hash whose next gets fail, how many more, and the error they answer.
+    failing: std::sync::Mutex<Vec<(Hash, usize, lore_storage::StoreError)>>,
+    released: tokio::sync::Notify,
+    gets: std::sync::atomic::AtomicUsize,
+}
+
+/// A store over `backing`'s holding nothing yet, and a repository reading through it.
+async fn holding_repository(
+    backing: &Arc<RepositoryContext>,
+) -> (Arc<HoldingStore>, Arc<RepositoryContext>) {
+    let (store, repository) = holding_context(backing).await;
+    (store, Arc::new(repository))
+}
+
+/// [`holding_repository`], its local reads telling a failed read apart from a miss
+/// ([`RepositoryContext::strict_local_reads`]).
+async fn strict_holding_repository(
+    backing: &Arc<RepositoryContext>,
+) -> (Arc<HoldingStore>, Arc<RepositoryContext>) {
+    let (store, repository) = holding_context(backing).await;
+    (store, Arc::new(repository.strict_local_reads()))
+}
+
+/// A store over `backing`'s holding nothing yet, and a context reading through it.
+async fn holding_context(
+    backing: &Arc<RepositoryContext>,
+) -> (Arc<HoldingStore>, RepositoryContext) {
+    let store = HoldingStore::over(backing.immutable_store());
+    let mutable = lore_storage::local::mutable_store::create(
+        None::<&str>,
+        lore_storage::MutableStoreSettings::default(),
+        store.clone(),
+    )
+    .await
+    .expect("in-memory mutable store");
+    let repository =
+        RepositoryContext::new_null_context(store.clone(), mutable, allow_all_repositories());
+    (store, repository)
+}
+
+impl HoldingStore {
+    /// A store over `inner`, holding and refusing nothing yet.
+    pub(crate) fn over(inner: Arc<dyn lore_storage::ImmutableStore>) -> Arc<Self> {
+        Arc::new(HoldingStore {
+            inner,
+            held: std::sync::Mutex::new(Vec::new()),
+            refused: std::sync::Mutex::new(Vec::new()),
+            failing: std::sync::Mutex::new(Vec::new()),
+            released: tokio::sync::Notify::new(),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Answers every later get of `hash` as missing.
+    pub(crate) fn refuse(&self, hash: Hash) {
+        self.refused.lock().expect("refused hashes").push(hash);
+    }
+
+    /// Answers the next `count` gets of `hash` with `error`, and those after them as the store it
+    /// wraps does.
+    pub(crate) fn fail_next(&self, hash: Hash, count: usize, error: lore_storage::StoreError) {
+        (self.failing.lock().expect("failing hashes")).push((hash, count, error));
+    }
+
+    /// The error a get of `hash` answers in place of the store it wraps, spending a failure of it
+    /// where it is told to fail: missing where it is refused.
+    fn failure(&self, hash: &Hash) -> Option<lore_storage::StoreError> {
+        if self.refused.lock().expect("refused hashes").contains(hash) {
+            return Some(lore_storage::StoreError::from(lore_base::error::NotFound));
+        }
+        let mut failing = self.failing.lock().expect("failing hashes");
+        let (_, left, error) = failing
+            .iter_mut()
+            .find(|(failing, left, _)| failing == hash && *left > 0)?;
+        *left -= 1;
+        Some(error.clone())
+    }
+
+    fn gets(&self) -> usize {
+        self.gets.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn hold(&self, hash: Hash) {
+        self.held.lock().expect("held hashes").push(hash);
+    }
+
+    fn release(&self) {
+        self.held.lock().expect("held hashes").clear();
+        self.released.notify_waiters();
+    }
+
+    async fn wait_while_held(&self, hash: &Hash) {
+        loop {
+            let released = self.released.notified();
+            if !self.held.lock().expect("held hashes").contains(hash) {
+                return;
+            }
+            released.await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl lore_storage::ImmutableStore for HoldingStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, lore_storage::StoreError> {
+        self.inner.clone().hold_for_command().await
+    }
+
+    async fn get(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        address: Address,
+    ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
+        self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(error) = self.failure(&address.hash) {
+            return Err(error);
+        }
+        self.wait_while_held(&address.hash).await;
+        self.inner.clone().get(partition, address).await
+    }
+
+    async fn query(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        addresses: &[Address],
+        results: &mut [lore_storage::StoreMatchResult],
+    ) -> Result<(), lore_storage::StoreError> {
+        self.inner
+            .clone()
+            .query(partition, addresses, results)
+            .await
+    }
+
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        address: Address,
+    ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
+        self.inner.clone().get_metadata(partition, address).await
+    }
+
+    async fn put(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        address: Address,
+        fragment: lore_base::types::Fragment,
+        payload: Option<Bytes>,
+        force: bool,
+    ) -> Result<(), lore_storage::StoreError> {
+        self.inner
+            .clone()
+            .put(partition, address, fragment, payload, force)
+            .await
+    }
+
+    async fn obliterate(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        address: Address,
+        stats: Arc<lore_storage::StoreObliterateStats>,
+    ) -> Result<(), lore_storage::StoreError> {
+        self.inner
+            .clone()
+            .obliterate(partition, address, stats)
+            .await
+    }
+
+    async fn evict(
+        self: Arc<Self>,
+        max_capacity: usize,
+        sync_data: bool,
+        sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+    ) -> Result<usize, lore_storage::StoreError> {
+        self.inner
+            .clone()
+            .evict(max_capacity, sync_data, sink)
+            .await
+    }
+
+    async fn compact(
+        self: Arc<Self>,
+        max_size: usize,
+        at: Option<usize>,
+        sync_data: bool,
+        sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+    ) -> Result<Option<usize>, lore_storage::StoreError> {
+        self.inner
+            .clone()
+            .compact(max_size, at, sync_data, sink)
+            .await
+    }
+
+    async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+        self.inner.clone().compact_resume_at().await
+    }
+
+    fn max_query_batch(&self) -> Option<usize> {
+        self.inner.max_query_batch()
+    }
+
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), lore_storage::StoreError> {
+        self.inner.clone().flush(options).await
+    }
+
+    async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
+        self.inner.clone().verify(heal).await
+    }
+
+    async fn copy(
+        self: Arc<Self>,
+        source_partition: lore_base::types::Partition,
+        source_address: Address,
+        destination_partition: lore_base::types::Partition,
+        destination_context: lore_base::types::Context,
+        behavior: lore_storage::immutable_store::CopyBehavior,
+    ) -> Result<(), lore_storage::StoreError> {
+        self.inner
+            .clone()
+            .copy(
+                source_partition,
+                source_address,
+                destination_partition,
+                destination_context,
+                behavior,
+            )
+            .await
+    }
+}
+
+/// Loading a node block of a State whose tree records file metadata leaves no task holding
+/// the repository: once the State is dropped, the caller holds the only reference, even
+/// while the store holds every read of the file metadata.
+#[tokio::test]
+async fn loading_a_node_block_leaves_no_task_holding_the_repository() {
+    let backing = null_repository().await;
+    let token = RepositoryWriteToken::in_memory(&InMemoryMarker);
+    let first = State::new();
+    add_dirty_node(&first, backing.clone(), ROOT_NODE, "a.txt", NodeFlags::File).await;
+    set_file_metadata(&first, &backing, 0, 1, Hash::from([1u8; 32])).await;
+    let stored = first
+        .serialize(backing.clone(), &token)
+        .await
+        .expect("the State serializes");
+
+    let (store, repository) = holding_repository(&backing).await;
+    let state = State::deserialize(repository.clone(), stored)
+        .await
+        .expect("the State loads");
+    let tree = state.tree(repository.clone()).await.expect("the tree");
+    assert!(
+        !tree.hash_file_metadata.is_zero(),
+        "the tree records file metadata"
+    );
+    store.hold(tree.hash_file_metadata);
+    state
+        .block(repository.clone(), 0)
+        .await
+        .expect("the node block");
+    drop(state);
+    let holders = Arc::strong_count(&repository);
+    store.release();
+    assert_eq!(
+        holders, 1,
+        "a task the block load started holds the repository"
+    );
+}
+
+/// A node block read the store fails, though it answers the reads after, fails with the store's
+/// answer: the block is in the current format, so no older format's read answers in its place.
+#[tokio::test]
+async fn a_node_block_read_the_store_fails_fails_with_the_stores_answer() {
+    let backing = null_repository().await;
+    let address = NodeBlockData::new_from_heap_zeroed()
+        .write_to_immutable(
+            backing.clone(),
+            Context::default(),
+            lore_storage::options::WriteOptions::default(),
+        )
+        .await
+        .expect("the block writes");
+    let (store, repository) = holding_repository(&backing).await;
+    let missing = lore_storage::StoreError::from(lore_base::error::NotFound);
+    store.fail_next(address.hash, 1, missing);
+
+    let state = State::new();
+    let failed = NodeBlock::deserialize(repository.clone(), &state, address)
+        .await
+        .map(|_| ())
+        .expect_err("the store fails the read");
+    assert!(
+        failed.is_address_not_found(),
+        "the store's answer: {failed}"
+    );
+    NodeBlock::deserialize(repository, &state, address)
+        .await
+        .expect("the block reads once the store answers");
+}
+
+/// A node block read the store fails as internal, through reads that report a failed local read,
+/// fails with the store's error, though the store answers the reads after: the read in the smaller
+/// format refuses the content as larger, so the block is of neither older format.
+#[tokio::test]
+async fn a_node_block_read_the_store_fails_as_internal_fails_with_the_stores_error() {
+    let backing = null_repository().await;
+    let address = NodeBlockData::new_from_heap_zeroed()
+        .write_to_immutable(
+            backing.clone(),
+            Context::default(),
+            lore_storage::options::WriteOptions::default(),
+        )
+        .await
+        .expect("the block writes");
+    let (store, repository) = strict_holding_repository(&backing).await;
+    let failure = lore_storage::StoreError::internal("a read the test fails");
+    store.fail_next(address.hash, 2, failure);
+    let gets = store.gets();
+
+    let state = State::new();
+    let failed = NodeBlock::deserialize(repository.clone(), &state, address)
+        .await
+        .map(|_| ())
+        .expect_err("the store fails the read");
+    assert!(failed.is_internal(), "the store's error: {failed}");
+    assert_eq!(
+        store.gets() - gets,
+        3,
+        "the strict read probes the store twice, then the smaller format's read reaches the block"
+    );
+    NodeBlock::deserialize(repository, &state, address)
+        .await
+        .expect("the block reads once the store answers");
+}
+
+/// A collection of the name tables of node blocks takes a V2-format block's, read in its own
+/// format.
+#[tokio::test]
+async fn a_name_table_collection_takes_a_v2_blocks_name_table() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let repository = null_repository().await;
+            let mut block = NodeBlockDataV2::new_from_heap_zeroed();
+            block.name_table = Hash::from([7u8; 32]);
+            let address = block
+                .write_to_immutable(
+                    repository.clone(),
+                    Context::default(),
+                    lore_storage::options::WriteOptions::default(),
+                )
+                .await
+                .expect("the block writes");
+
+            let collected = collect_name_fragments(repository, vec![address])
+                .await
+                .expect("the collection reads the block");
+            assert_eq!(collected, [Address::zero_context_hash(block.name_table)]);
+        })
+        .await;
+}
+
+/// A collection of the name tables of node blocks whose block read the store fails, through reads
+/// that report a failed local read, fails with the store's error, though the store answers the
+/// reads after.
+#[tokio::test]
+async fn a_name_table_collection_the_store_fails_fails_with_the_stores_error() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let backing = null_repository().await;
+            let address = NodeBlockData::new_from_heap_zeroed()
+                .write_to_immutable(
+                    backing.clone(),
+                    Context::default(),
+                    lore_storage::options::WriteOptions::default(),
+                )
+                .await
+                .expect("the block writes");
+            let (store, repository) = strict_holding_repository(&backing).await;
+            let failure = lore_storage::StoreError::from(lore_base::error::Disconnected);
+            store.fail_next(address.hash, 2, failure);
+
+            let failed = collect_name_fragments(repository.clone(), vec![address])
+                .await
+                .expect_err("the store fails the read");
+            assert!(failed.is_disconnected(), "the store's error: {failed}");
+            collect_name_fragments(repository, vec![address])
+                .await
+                .expect("the block reads once the store answers");
+        })
+        .await;
+}
+
+/// Content a byte short of a node block, the size of no block format, fails as the read in the
+/// current format fails it, not as the read in the smaller format refuses it.
+#[tokio::test]
+async fn content_of_no_node_block_format_fails_as_the_current_format_reads_it() {
+    let repository = null_repository().await;
+    let address = lore_revision::immutable::write(
+        repository.clone(),
+        Context::default(),
+        Bytes::from(vec![0u8; size_of::<NodeBlockData>() - 1]),
+        lore_storage::options::WriteOptions::default(),
+    )
+    .await
+    .expect("the content writes");
+
+    let failed = NodeBlock::deserialize(repository, &State::new(), address)
+        .await
+        .map(|_| ())
+        .expect_err("no block format reads it");
+    assert!(
+        failed.is_internal(),
+        "the current format's failure: {failed}"
+    );
+}
+
+/// Files under `fill/` in [`stored_with_free_slots`], running past the first node block.
+const FILL_NODES: usize = 600;
+
+/// A stored revision of two node blocks, recording file metadata for both: the root holds
+/// `a.txt` and `fill/` in the first block, and `fill/` holds [`FILL_NODES`] files running into
+/// the second, where the tree's unused chain starts, with free slots.
+async fn stored_with_free_slots(repository: &Arc<RepositoryContext>) -> Hash {
+    let token = RepositoryWriteToken::in_memory(&InMemoryMarker);
+    let state = State::new();
+    add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "a.txt",
+        NodeFlags::File,
+    )
+    .await;
+    let fill = add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "fill",
+        NodeFlags::NoFlags,
+    )
+    .await;
+    for index in 0..FILL_NODES {
+        let name = format!("f{index}");
+        add_dirty_node(&state, repository.clone(), fill, &name, NodeFlags::File).await;
+    }
+    for block_index in 0..2 {
+        set_file_metadata(&state, repository, block_index, 1, Hash::from([1u8; 32])).await;
+    }
+    state
+        .serialize(repository.clone(), &token)
+        .await
+        .expect("the State serializes")
+}
+
+/// A State with no node block in memory puts a fresh block past the tree's blocks, its block
+/// count grows by one rather than shrinking to the fresh block's, and serializing it keeps the
+/// blocks it never loaded.
+#[tokio::test]
+async fn a_fresh_block_of_a_state_with_no_block_in_memory_goes_past_the_trees_blocks() {
+    let repository = null_repository().await;
+    let stored = stored_with_free_slots(&repository).await;
+    let state = State::deserialize(repository.clone(), stored)
+        .await
+        .expect("the State loads");
+    let tree = state.tree(repository.clone()).await.expect("the tree");
+    let count = state.block_count();
+    assert_eq!(count, tree.block_count as usize);
+    assert_eq!(count, 2, "the tree holds two blocks");
+
+    let (index, block) = state.allocate_fresh_block().expect("a fresh block");
+    assert_eq!(index, count, "the fresh block goes past the tree's blocks");
+    assert_eq!(
+        state.block_count(),
+        count + 1,
+        "the block count grows by one"
+    );
+    assert!(
+        state
+            .resident_block(index)
+            .is_some_and(|resident| Arc::ptr_eq(&resident, &block)),
+        "the fresh block is found at its index"
+    );
+
+    state.mark_dirty();
+    let token = RepositoryWriteToken::in_memory(&InMemoryMarker);
+    let reserialized = state
+        .serialize(repository.clone(), &token)
+        .await
+        .expect("the State serializes");
+    let reloaded = State::deserialize(repository.clone(), reserialized)
+        .await
+        .expect("the State reloads");
+    let fill = reloaded
+        .find_subnode(repository.clone(), ROOT_NODE, hash::hash_string("fill"))
+        .await
+        .expect("the root still holds fill");
+    assert_eq!(
+        reloaded
+            .node_children(repository, fill)
+            .await
+            .expect("fill's children")
+            .len(),
+        FILL_NODES,
+        "fill still holds its files"
+    );
+}
+
+/// A State taking new nodes from fresh blocks gives an attach a slot in a block past the
+/// stored tree's, reading nothing from the store, though the stored unused chain starts at a
+/// block with free slots, and that block, the last, is in memory without its name table or
+/// file metadata.
+#[tokio::test]
+async fn an_attach_on_a_state_taking_fresh_blocks_reads_nothing_from_the_store() {
+    let backing = null_repository().await;
+    let stored = stored_with_free_slots(&backing).await;
+    let (store, repository) = holding_repository(&backing).await;
+    let state = State::deserialize(repository.clone(), stored)
+        .await
+        .expect("the State loads");
+    let tree = state.tree(repository.clone()).await.expect("the tree");
+    assert_eq!(
+        tree.block_unused_first, 1,
+        "the chain starts at the last block"
+    );
+    state
+        .take_new_nodes_from_fresh_blocks(repository.clone())
+        .await
+        .expect("the State takes fresh blocks");
+    state
+        .block_with_nametable(repository.clone(), 0)
+        .await
+        .expect("the root's block");
+    let _last = state
+        .block(repository.clone(), 1)
+        .await
+        .expect("the last stored block");
+
+    let reads = store.gets();
+    assert!(
+        state.attach_slot_resident(),
+        "the slot needs nothing from the store"
+    );
+    let attached = state
+        .node_attach(
+            repository.clone(),
+            ROOT_NODE,
+            dirty_node("new.txt", NodeFlags::File),
+            "new.txt",
+        )
+        .await
+        .expect("the attach");
+    assert_eq!(
+        store.gets(),
+        reads,
+        "the attach read nothing from the store"
+    );
+    let AttachOutcome::Attached(node_id) = attached else {
+        panic!("the name is free: {attached:?}");
+    };
+    assert_eq!(NodeBlock::index(node_id), 2, "the node takes a fresh block");
+}
+
+/// On a State taking new nodes from fresh blocks, a node detached from a stored block and a
+/// node then attached under its name leave the directory holding the name once, as the new
+/// node, in a fresh block; the detached node stays discarded.
+#[tokio::test]
+async fn an_attach_after_a_detach_in_a_stored_block_holds_the_name_once() {
+    let repository = null_repository().await;
+    let stored = stored_with_free_slots(&repository).await;
+    let state = State::deserialize(repository.clone(), stored)
+        .await
+        .expect("the State loads");
+    state
+        .take_new_nodes_from_fresh_blocks(repository.clone())
+        .await
+        .expect("the State takes fresh blocks");
+    let name_hash = lore_storage::hash::hash_string("a.txt");
+    let old = state
+        .find_subnode(repository.clone(), ROOT_NODE, name_hash)
+        .await
+        .expect("a.txt");
+    state
+        .node_detach(
+            repository.clone(),
+            old,
+            lore_revision::state::Detach::Always,
+        )
+        .await
+        .expect("the detach");
+
+    let attached = state
+        .node_attach(
+            repository.clone(),
+            ROOT_NODE,
+            dirty_node("a.txt", NodeFlags::File),
+            "a.txt",
+        )
+        .await
+        .expect("the attach");
+    let AttachOutcome::Attached(new) = attached else {
+        panic!("the detached name is free: {attached:?}");
+    };
+    assert_eq!(NodeBlock::index(new), 2, "the node takes a fresh block");
+    assert_eq!(
+        state
+            .find_subnode(repository.clone(), ROOT_NODE, name_hash)
+            .await
+            .expect("a.txt again"),
+        new
+    );
+    let children = state
+        .node_children(repository.clone(), ROOT_NODE)
+        .await
+        .expect("the root's children");
+    assert!(children.contains(&new) && !children.contains(&old));
+    assert_eq!(children.len(), 2, "a.txt and fill/");
+    assert!(
+        state
+            .node(repository.clone(), old)
+            .await
+            .expect("the detached slot")
+            .is_discarded()
+    );
+}
+
+/// On a State taking new nodes from fresh blocks, the attach after the one that takes a fresh
+/// block's last slot needs nothing from the store either: the full block leaves the chain and
+/// the slot comes from the next fresh block.
+#[tokio::test]
+async fn an_attach_past_a_full_fresh_block_reads_nothing_from_the_store() {
+    let backing = null_repository().await;
+    let stored = stored_with_free_slots(&backing).await;
+    let (store, repository) = holding_repository(&backing).await;
+    let state = State::deserialize(repository.clone(), stored)
+        .await
+        .expect("the State loads");
+    state
+        .take_new_nodes_from_fresh_blocks(repository.clone())
+        .await
+        .expect("the State takes fresh blocks");
+    state
+        .block_with_nametable(repository.clone(), 0)
+        .await
+        .expect("the root's block");
+    let attach = async |name: &str| {
+        state
+            .node_attach_resident(
+                repository.clone(),
+                ROOT_NODE,
+                dirty_node(name, NodeFlags::File),
+                name,
+                None,
+            )
+            .await
+            .expect("the attach")
+    };
+    for index in 0..BLOCK_NODE_COUNT {
+        let name = format!("n{index}");
+        let attached = attach(&name).await;
+        assert!(
+            matches!(attached, Some(AttachOutcome::Attached(node)) if NodeBlock::index(node) == 2),
+            "{name} fills the first fresh block: {attached:?}"
+        );
+    }
+
+    let reads = store.gets();
+    assert!(
+        state.attach_slot_resident(),
+        "the slot past the full fresh block needs nothing from the store"
+    );
+    let attached = attach("past").await;
+    assert_eq!(
+        store.gets(),
+        reads,
+        "the attach read nothing from the store"
+    );
+    assert!(
+        matches!(attached, Some(AttachOutcome::Attached(node)) if NodeBlock::index(node) == 3),
+        "the node takes the next fresh block: {attached:?}"
+    );
+}
+
+/// A find by name through blocks in memory only reads nothing from the store: it answers `None`
+/// where the parent's block or the chain's runs into one not in memory, and otherwise answers as
+/// a find reading blocks does, a detached directory's included.
+#[tokio::test]
+async fn a_find_through_blocks_in_memory_reads_nothing_from_the_store() {
+    let backing = null_repository().await;
+    let stored = stored_with_free_slots(&backing).await;
+    let (store, repository) = holding_repository(&backing).await;
+    let state = State::deserialize(repository.clone(), stored)
+        .await
+        .expect("the State loads");
+    let _root = state
+        .block(repository.clone(), 0)
+        .await
+        .expect("the root's block");
+    let fill = state
+        .find_subnode(repository.clone(), ROOT_NODE, hash::hash_string("fill"))
+        .await
+        .expect("fill");
+    assert!(
+        state.resident_block(1).is_none(),
+        "fill's newest files lie in a block not in memory"
+    );
+
+    let reads = store.gets();
+    assert_eq!(
+        state
+            .find_subnode_resident(ROOT_NODE, hash::hash_string("fill"))
+            .expect("the find"),
+        Some(fill)
+    );
+    assert!(
+        state
+            .find_subnode_resident(ROOT_NODE, hash::hash_string("missing"))
+            .is_err_and(|error| error.is_node_not_found())
+    );
+    assert_eq!(
+        state
+            .find_subnode_resident(fill, hash::hash_string("f0"))
+            .expect("the find"),
+        None,
+        "the chain runs into a block not in memory"
+    );
+    assert_eq!(
+        state
+            .find_subnode_resident(BLOCK_NODE_COUNT as NodeID, hash::hash_string("f0"))
+            .expect("the find"),
+        None,
+        "the parent's own block is not in memory"
+    );
+    assert_eq!(store.gets(), reads, "the finds read nothing from the store");
+
+    let _last = state
+        .block(repository.clone(), 1)
+        .await
+        .expect("the last block");
+    let reads = store.gets();
+    let f0 = state
+        .find_subnode_resident(fill, hash::hash_string("f0"))
+        .expect("the find");
+    assert_eq!(
+        f0,
+        Some(
+            state
+                .find_subnode(repository.clone(), fill, hash::hash_string("f0"))
+                .await
+                .expect("f0")
+        )
+    );
+    assert!(
+        state
+            .find_subnode_resident(fill, hash::hash_string("missing"))
+            .is_err_and(|error| error.is_node_not_found())
+    );
+    assert!(
+        state
+            .find_subnode_resident(f0.expect("f0"), hash::hash_string("x"))
+            .is_err_and(|error| error.is_node_not_found()),
+        "a file holds no names"
+    );
+    assert_eq!(store.gets(), reads, "the finds read nothing from the store");
+
+    state
+        .node_detach(repository.clone(), fill, Detach::Always)
+        .await
+        .expect("detach fill");
+    let reads = store.gets();
+    let resident = state
+        .find_subnode_resident(fill, hash::hash_string("f0"))
+        .map_err(|error| error.is_node_not_found());
+    assert_eq!(store.gets(), reads, "the find read nothing from the store");
+    let read = state
+        .find_subnode(repository.clone(), fill, hash::hash_string("f0"))
+        .await
+        .map(Some)
+        .map_err(|error| error.is_node_not_found());
+    assert_eq!(
+        resident, read,
+        "a detached directory reads as a find reading blocks reads it"
+    );
+}
+
+/// A find through blocks in memory counts the chain steps it takes, as a find reading blocks
+/// does: `b`, at the head of `dir`'s chain, then `a`.
+#[tokio::test]
+async fn a_find_through_blocks_in_memory_counts_its_steps() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let dir = add_directory(&state, &repository, ROOT_NODE, "dir").await;
+    let a = add_directory(&state, &repository, dir, "a").await;
+    add_directory(&state, &repository, dir, "b").await;
+    let before = counted_steps();
+    let found = state
+        .find_subnode_resident(dir, hash::hash_string("a"))
+        .expect("the find");
+    assert_eq!(found, Some(a));
+    assert_eq!(
+        step_counting::thread_chain_steps() - before,
+        2,
+        "the find counted 'b' and 'a'"
+    );
+}
+
+/// `find`'s answer, with the allocations it makes on this thread.
+async fn counting_allocations<T>(find: impl std::future::Future<Output = T>) -> (T, u64) {
+    struct StopCounting;
+    impl Drop for StopCounting {
+        fn drop(&mut self) {
+            lore_base::allocator::set_allocation_counting(false);
+        }
+    }
+    lore_base::allocator::set_allocation_counting(true);
+    let _stop = StopCounting;
+    let before = lore_base::allocator::thread_allocation_count();
+    let answer = find.await;
+    (
+        answer,
+        lore_base::allocator::thread_allocation_count() - before,
+    )
+}
+
+/// [`State::find_live_subnode_if_present`] answers `None`, allocating nothing, where
+/// [`State::find_live_subnode`] answers `NodeNotFound`: a name the directory does not hold, and a
+/// name below a file. It answers a name the directory holds as that does.
+#[tokio::test]
+async fn a_live_find_answers_an_absent_name_without_allocating() {
+    with_state(|repository, state| async move {
+        let dir = add(&state, &repository, ROOT_NODE, directory("dir"), "dir").await;
+        let f = add(&state, &repository, dir, file("f"), "f").await;
+        for (parent, name) in [(dir, "missing"), (f, "x")] {
+            let name_hash = hash::hash_string(name);
+            assert!(
+                state
+                    .find_live_subnode(repository.clone(), parent, name_hash)
+                    .await
+                    .is_err_and(|error| error.is_node_not_found()),
+                "{name}: the find answers NodeNotFound"
+            );
+            let (found, allocations) = counting_allocations(state.find_live_subnode_if_present(
+                repository.clone(),
+                parent,
+                name_hash,
+            ))
+            .await;
+            assert_eq!(
+                (found.expect("the find"), allocations),
+                (None, 0),
+                "{name}: (answer, allocations)"
+            );
+        }
+        assert_eq!(
+            state
+                .find_live_subnode_if_present(repository.clone(), dir, hash::hash_string("f"))
+                .await
+                .expect("the find"),
+            Some((f, false))
+        );
+    })
+    .await;
+}
+
+/// Serializing a State that takes new nodes from fresh blocks panics in a debug build.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn serializing_a_state_taking_fresh_blocks_panics() {
+    let repository = null_repository().await;
+    let stored = stored_with_free_slots(&repository).await;
+    let state = State::deserialize(repository.clone(), stored)
+        .await
+        .expect("the State loads");
+    state
+        .take_new_nodes_from_fresh_blocks(repository.clone())
+        .await
+        .expect("the State takes fresh blocks");
+    add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "new.txt",
+        NodeFlags::File,
+    )
+    .await;
+    let token = RepositoryWriteToken::in_memory(&InMemoryMarker);
+    let serialized = AssertUnwindSafe(state.serialize(repository, &token))
+        .catch_unwind()
+        .await;
+    assert!(serialized.is_err(), "the serialize panics");
 }
 
 /// A repository with a working tree, so a file on disk can be measured against a node.
@@ -216,13 +1371,10 @@ async fn working_tree_repository(path: &std::path::Path) -> Arc<RepositoryContex
 
     // Built with the path rather than assigned one afterwards, so the filesystem provider is
     // rooted where the working tree is.
-    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
+    use crate::helper::RepositoryContextCreationArgsExt;
     Arc::new(RepositoryContext::new(
-        crate::repository::test_helpers::default_repository_creation_args(
-            immutable_store,
-            mutable_store,
-        )
-        .with_path(path),
+        crate::helper::default_repository_creation_args(immutable_store, mutable_store)
+            .with_path(path),
     ))
 }
 
@@ -248,7 +1400,8 @@ async fn write_working_file(
     let path = lore_revision::util::path::RelativePathBuf::new().push_and_freeze(name);
     lore_io::IoDriver::global()
         .write_file_bytes(
-            path.to_absolute_path(repository.require_path().expect("working tree")),
+            path.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
             bytes::Bytes::copy_from_slice(content),
             false,
         )
@@ -288,6 +1441,7 @@ async fn what_one_comparison_established_answers_the_next() {
             repository.clone(),
             &first,
             first.size,
+            0,
             &path,
             &operation,
             &established,
@@ -298,7 +1452,10 @@ async fn what_one_comparison_established_answers_the_next() {
     ));
 
     lore_io::IoDriver::global()
-        .remove_file(path.to_absolute_path(repository.require_path().expect("working tree")))
+        .remove_file(
+            path.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
+        )
         .await
         .expect("remove working file");
 
@@ -309,6 +1466,7 @@ async fn what_one_comparison_established_answers_the_next() {
             repository,
             &second,
             second.size,
+            0,
             &path,
             &operation,
             &established,
@@ -317,6 +1475,99 @@ async fn what_one_comparison_established_answers_the_next() {
         .expect("an established comparison reads nothing"),
         NodeComparison::Differs
     ));
+}
+
+/// A file written right after [`time_before_next_write`] carries a later time, so a time recorded
+/// for content served from elsewhere never matches the file a later write puts at the path.
+/// Each round can write within the millisecond the time was taken in. The probe directory is
+/// in no working tree and holds nothing afterward.
+#[tokio::test]
+async fn a_file_written_after_the_time_before_the_next_write_carries_a_later_time() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let probe = dir.child("probe");
+    let driver = lore_io::IoDriver::global();
+    driver
+        .create_dir_all(&probe)
+        .await
+        .expect("create the probe directory");
+    let file = dir.path().join("written.bin");
+    for round in 0..64u8 {
+        let before = time_before_next_write(Some(&probe)).await;
+        driver
+            .write_file_bytes(&file, Bytes::copy_from_slice(&[round]), false)
+            .await
+            .expect("write the file");
+        let written = lore_revision::util::fs::modified_millis(
+            driver.stat(&file).await.expect("stat the file").modified,
+        );
+        assert!(
+            written > before,
+            "round {round}: written at {written}, recorded {before}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(&probe)
+            .expect("list the probe directory")
+            .count(),
+        0,
+        "the probe is removed"
+    );
+}
+
+/// A file written right after [`wait_until_settled`] returns for the time the filesystem stamped
+/// a file with carries a later time. Each round can write within the millisecond of the stamp.
+/// The probe directory is in no working tree and holds nothing afterward.
+#[tokio::test]
+async fn a_file_written_after_the_wait_until_settled_carries_a_later_time() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let probe = dir.child("probe");
+    let driver = lore_io::IoDriver::global();
+    driver
+        .create_dir_all(&probe)
+        .await
+        .expect("create the probe directory");
+    let file = dir.path().join("written.bin");
+    let written = async |round: u8| {
+        driver
+            .write_file_bytes(&file, Bytes::copy_from_slice(&[round]), false)
+            .await
+            .expect("write the file");
+        lore_revision::util::fs::modified_millis(
+            driver.stat(&file).await.expect("stat the file").modified,
+        )
+    };
+    for round in 0..64u8 {
+        let stamped = written(round).await;
+        wait_until_settled(&probe, stamped).await;
+        let after = written(round).await;
+        assert!(
+            after > stamped,
+            "round {round}: written at {after}, settled past {stamped}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(&probe)
+            .expect("list the probe directory")
+            .count(),
+        0,
+        "the probe is removed"
+    );
+}
+
+/// A directory that cannot be stamped, or none, gives the process clock.
+#[tokio::test]
+async fn the_time_before_the_next_write_is_the_process_clock_without_a_probe() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let missing = dir.child("missing");
+    for probe in [None, Some(missing.as_path())] {
+        let before = lore_revision::util::fs::modified_millis(None);
+        let time = time_before_next_write(probe).await;
+        let after = lore_revision::util::fs::modified_millis(None);
+        assert!(
+            (before..=after).contains(&time),
+            "{probe:?}: {time} not in {before}..={after}"
+        );
+    }
 }
 
 /// A file removed under a run of comparisons reads as unreadable, not as differing.
@@ -340,6 +1591,7 @@ async fn a_file_removed_between_comparisons_reads_as_unreadable() {
             repository.clone(),
             &first,
             first.size,
+            0,
             &path,
             &operation,
             &established,
@@ -350,7 +1602,10 @@ async fn a_file_removed_between_comparisons_reads_as_unreadable() {
     ));
 
     lore_io::IoDriver::global()
-        .remove_file(path.to_absolute_path(repository.require_path().expect("working tree")))
+        .remove_file(
+            path.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
+        )
         .await
         .expect("remove working file");
 
@@ -361,6 +1616,7 @@ async fn a_file_removed_between_comparisons_reads_as_unreadable() {
             repository,
             &second,
             second.size,
+            0,
             &path,
             &operation,
             &established,
@@ -392,6 +1648,7 @@ async fn a_comparison_that_settles_nothing_reads_as_modified() {
             repository.clone(),
             &node,
             node.size,
+            0,
             &path,
             &operation,
             &established,
@@ -434,6 +1691,7 @@ async fn an_unfragmented_file_is_decided_by_its_own_hash() {
             repository.clone(),
             &node,
             node.size,
+            0,
             &path,
             &operation,
             &established,
@@ -447,7 +1705,8 @@ async fn an_unfragmented_file_is_decided_by_its_own_hash() {
     edited[content.len() / 2] ^= 0xff;
     lore_io::IoDriver::global()
         .write_file_bytes(
-            path.to_absolute_path(repository.require_path().expect("working tree")),
+            path.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
             bytes::Bytes::from(edited),
             false,
         )
@@ -567,6 +1826,45 @@ async fn reading_the_link_list_leaves_it_editable() {
         Hash::from([2u8; 32]),
         "the untouched link must keep its signature"
     );
+}
+
+/// Replacing the row of a link the registry doesn't hold fails as not found, and leaves the
+/// registry as it was.
+#[tokio::test]
+async fn replacing_an_unregistered_link_row_is_not_found() {
+    let repository = null_repository().await;
+    let state = State::new();
+    state
+        .link_add(
+            repository.clone(),
+            link_id(1),
+            BranchId::default(),
+            Hash::from([1u8; 32]),
+            2,
+            LinkFlags::NoFlags,
+        )
+        .await
+        .expect("adding the link");
+
+    let unregistered = LinkReference {
+        repository: link_id(1),
+        local_node: 3,
+        flags: LinkFlags::DisableAutoFollow.bits(),
+        ..Default::default()
+    };
+    assert!(
+        state
+            .link_replace(repository.clone(), unregistered)
+            .await
+            .expect_err("a link the registry doesn't hold")
+            .is_link_not_found()
+    );
+    let links = state
+        .link_list(repository)
+        .await
+        .expect("reading the registry");
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].flags, LinkFlags::NoFlags.bits());
 }
 
 /// A node carrying `flags`, named for the name table by its hash.
@@ -730,7 +2028,7 @@ async fn forge_sibling(
         .block(repository, NodeBlock::index(node))
         .await
         .expect("the block holding the node");
-    block.write().node(Node::index(node)).sibling = sibling;
+    block.write_for_tests().node(Node::index(node)).sibling = sibling;
 }
 
 /// The dirty paths under `parent_node`, in the order the walk records them.
@@ -792,7 +2090,7 @@ async fn dirty_paths_are_recorded_depth_first_along_each_sibling_chain() {
         repository.clone(),
         ROOT_NODE,
         "alpha",
-        NodeFlags::DirtyAdd,
+        NodeFlags::DirtyModify,
     )
     .await;
 
@@ -845,9 +2143,50 @@ async fn dirty_paths_are_recorded_depth_first_along_each_sibling_chain() {
     );
 }
 
+/// A new directory holding nodes is carried by them and records no path of its
+/// own, since re-applied it would mark everything the working tree holds below
+/// it, marked or not. An empty new directory has nothing to carry it, so it is
+/// recorded.
+#[tokio::test]
+async fn a_new_directory_is_recorded_only_where_it_is_empty() {
+    let repository = null_repository().await;
+    let state = State::new();
+
+    let added = add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "added",
+        NodeFlags::DirtyAdd,
+    )
+    .await;
+    add_dirty_node(
+        &state,
+        repository.clone(),
+        added,
+        "leaf.txt",
+        NodeFlags::DirtyAdd | NodeFlags::File,
+    )
+    .await;
+    add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "empty",
+        NodeFlags::DirtyAdd,
+    )
+    .await;
+
+    assert_eq!(
+        walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+        vec!["added/leaf.txt", "empty"],
+        "the new directory is carried by its file, and the empty one by itself"
+    );
+}
+
 /// A directory that carries an action of its own and is also descended is
-/// recorded before anything below it: the action re-creates the directory the
-/// paths under it are re-applied into.
+/// recorded before anything below it, so its action is re-applied before the
+/// paths under it.
 #[tokio::test]
 async fn a_directory_is_recorded_before_the_paths_under_it() {
     let repository = null_repository().await;
@@ -866,7 +2205,7 @@ async fn a_directory_is_recorded_before_the_paths_under_it() {
         repository.clone(),
         ROOT_NODE,
         "added",
-        NodeFlags::DirtyAdd,
+        NodeFlags::DirtyModify,
     )
     .await;
     let inner = add_dirty_node(
@@ -874,7 +2213,7 @@ async fn a_directory_is_recorded_before_the_paths_under_it() {
         repository.clone(),
         added,
         "inner",
-        NodeFlags::DirtyAdd,
+        NodeFlags::DirtyModify,
     )
     .await;
     add_dirty_node(
@@ -1202,6 +2541,161 @@ async fn a_deleted_or_moved_directory_is_recorded_without_descending() {
     );
 }
 
+/// The paths `State::collect_dirty_paths` collects at `root`, whose path is `path`: those staged
+/// with what the working tree holds below them, then the directories staged as themselves, each
+/// sorted.
+async fn stage_targets(
+    state: &State,
+    repository: Arc<RepositoryContext>,
+    root: NodeID,
+    path: &str,
+) -> (Vec<String>, Vec<String>) {
+    let path = RelativePath::new_from_initial_path(path).expect("a clean relative path");
+    let collected = LORE_CONTEXT
+        .scope(
+            setup_test_execution(),
+            state.collect_dirty_paths(repository, root, path),
+        )
+        .await
+        .expect("collecting the stage's targets");
+    let spelled = |paths: &[RelativePath]| {
+        let mut spelled: Vec<String> = paths.iter().map(|path| path.as_str().to_string()).collect();
+        spelled.sort();
+        spelled
+    };
+    (spelled(&collected.paths), spelled(&collected.directories))
+}
+
+/// Each directory marked moved is a target of its own, whatever it holds: empty directories two
+/// levels deep, a deletion, an unchanged node, a node the view leaves out; and so is an empty one
+/// named itself. The marked changes below them are targets of their own too.
+#[tokio::test]
+async fn each_moved_directory_is_a_stage_target_of_its_own() {
+    let repository = null_repository_viewing(&["secret.bin"]).await;
+    let state = State::new();
+    let add = async |parent, name, flags| {
+        add_dirty_node(&state, repository.clone(), parent, name, flags).await
+    };
+
+    let moved = add(ROOT_NODE, "dir", NodeFlags::DirtyMove).await;
+    let sub = add(moved, "Sub", NodeFlags::DirtyMove).await;
+    add(sub, "Deep", NodeFlags::DirtyMove).await;
+    let other = add(moved, "Other", NodeFlags::DirtyMove).await;
+    let emptied = add(ROOT_NODE, "emptied", NodeFlags::DirtyMove).await;
+    add(
+        emptied,
+        "gone.txt",
+        NodeFlags::DirtyDelete | NodeFlags::File,
+    )
+    .await;
+    let kept = add(ROOT_NODE, "kept", NodeFlags::DirtyMove).await;
+    add(kept, "a.txt", NodeFlags::File).await;
+    let hidden = add(ROOT_NODE, "hidden", NodeFlags::DirtyMove).await;
+    add(hidden, "secret.bin", NodeFlags::DirtyMove | NodeFlags::File).await;
+
+    assert_eq!(
+        stage_targets(&state, repository.clone(), ROOT_NODE, "").await,
+        (
+            vec!["emptied/gone.txt".to_string()],
+            [
+                "dir",
+                "dir/Other",
+                "dir/Sub",
+                "dir/Sub/Deep",
+                "emptied",
+                "hidden",
+                "kept"
+            ]
+            .map(String::from)
+            .to_vec()
+        )
+    );
+    assert_eq!(
+        stage_targets(&state, repository, other, "dir/Other").await,
+        (Vec::new(), vec!["dir/Other".to_string()])
+    );
+}
+
+/// Each directory marked added is a target of its own, whatever it holds, beside the marked
+/// changes below it; a staged add is a path staged with what the working tree holds below it, as
+/// it holds what staging put there.
+#[tokio::test]
+async fn each_added_directory_is_a_stage_target_of_its_own() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let add = async |parent, name, flags| {
+        add_dirty_node(&state, repository.clone(), parent, name, flags).await
+    };
+
+    add(ROOT_NODE, "empty", NodeFlags::DirtyAdd).await;
+    let holding = add(ROOT_NODE, "holding", NodeFlags::DirtyAdd).await;
+    add(holding, "a.txt", NodeFlags::DirtyAdd | NodeFlags::File).await;
+    let staged = add(
+        ROOT_NODE,
+        "staged",
+        NodeFlags::DirtyAdd | NodeFlags::StagedAdd,
+    )
+    .await;
+    add(staged, "b.txt", NodeFlags::DirtyAdd | NodeFlags::File).await;
+
+    assert_eq!(
+        stage_targets(&state, repository, ROOT_NODE, "").await,
+        (
+            ["holding/a.txt", "staged", "staged/b.txt"]
+                .map(String::from)
+                .to_vec(),
+            ["empty", "holding"].map(String::from).to_vec()
+        )
+    );
+}
+
+/// A moved directory's moved files, and a moved file and an added empty directory elsewhere, are
+/// targets of their own beside the directories.
+#[tokio::test]
+async fn the_stage_targets_of_a_moved_directory_holding_files_are_it_and_its_files() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let moved_file = NodeFlags::DirtyMove | NodeFlags::File;
+
+    let moved = add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "e",
+        NodeFlags::DirtyMove,
+    )
+    .await;
+    add_dirty_node(&state, repository.clone(), moved, "a.txt", moved_file).await;
+    let sub = add_dirty_node(
+        &state,
+        repository.clone(),
+        moved,
+        "sub",
+        NodeFlags::DirtyMove,
+    )
+    .await;
+    add_dirty_node(&state, repository.clone(), sub, "b.txt", moved_file).await;
+    add_dirty_node(&state, repository.clone(), ROOT_NODE, "g.txt", moved_file).await;
+    add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "new",
+        NodeFlags::DirtyAdd,
+    )
+    .await;
+
+    assert_eq!(
+        stage_targets(&state, repository, ROOT_NODE, "").await,
+        (
+            ["e/a.txt", "e/sub/b.txt", "g.txt"]
+                .map(String::from)
+                .to_vec(),
+            ["e", "e/sub", "new"].map(String::from).to_vec()
+        )
+    );
+}
+
 /// The buffer the walk names into carries the whole ancestry, and a sibling
 /// visited after a descent is named against its own parent again.
 ///
@@ -1307,7 +2801,7 @@ async fn a_directory_is_recorded_before_it_is_descended() {
         repository.clone(),
         ROOT_NODE,
         "added",
-        NodeFlags::DirtyAdd,
+        NodeFlags::DirtyModify,
     )
     .await;
     add_dirty_node(&state, repository.clone(), added, "leaf.txt", file).await;
@@ -1316,7 +2810,7 @@ async fn a_directory_is_recorded_before_it_is_descended() {
         repository.clone(),
         added,
         "deeper",
-        NodeFlags::DirtyAdd,
+        NodeFlags::DirtyModify,
     )
     .await;
     add_dirty_node(&state, repository.clone(), deeper, "deep.txt", file).await;
@@ -1453,11 +2947,11 @@ async fn a_staged_node_is_recorded_only_when_staged_nodes_are_wanted() {
     );
 }
 
-/// A path the filter excludes cannot be re-applied against a checkout that
+/// A path the view excludes cannot be re-applied against a checkout that
 /// never materializes it, so it is not recorded. `force` records it anyway.
 #[tokio::test]
 async fn a_filtered_path_is_recorded_only_under_force() {
-    let repository = null_repository_excluding(&["ignored.txt"]).await;
+    let repository = null_repository_viewing(&["ignored.txt"]).await;
     let state = State::new();
 
     for name in ["ignored.txt", "kept.txt"] {
@@ -1496,12 +2990,83 @@ async fn a_filtered_path_is_recorded_only_under_force() {
     );
 }
 
+/// The ignore file has no say over a node the tree tracks, one the revision it was built on holds,
+/// so a dirty mark on one is recorded below a directory the ignore file names. An add or a copy
+/// merely marked dirty there is not: the revision holds neither, and the ignore file leaves them
+/// out.
+#[tokio::test]
+async fn a_tracked_path_the_ignore_file_names_is_recorded_and_a_marked_add_or_copy_is_not() {
+    let repository = null_repository_excluding(&["build/"]).await;
+    let token = repository
+        .try_write_token()
+        .expect("a null context carries a write token");
+
+    let committed = State::new();
+    let build = add_dirty_node(
+        &committed,
+        repository.clone(),
+        ROOT_NODE,
+        "build",
+        NodeFlags::NoFlags,
+    )
+    .await;
+    let tracked = add_dirty_node(
+        &committed,
+        repository.clone(),
+        build,
+        "tracked.o",
+        NodeFlags::File,
+    )
+    .await;
+    committed.set_revision_number(1);
+    let revision = committed
+        .serialize(repository.clone(), token)
+        .await
+        .expect("serializing the committed revision");
+
+    let state = State::deserialize(repository.clone(), revision)
+        .await
+        .expect("deserializing the revision to build on");
+    state.reparent_onto(revision);
+    state
+        .node_mark(
+            &repository,
+            tracked,
+            Mark::dirty(
+                NodeFlags::DirtyModify,
+                Ext::Set(NodeExtFlags::NoFlags),
+                true,
+            ),
+        )
+        .await
+        .expect("marking the tracked file");
+    for (name, action) in [
+        ("new.o", NodeFlags::DirtyAdd),
+        ("copy.o", NodeFlags::DirtyCopy),
+    ] {
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            build,
+            name,
+            action | NodeFlags::File,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+        vec!["build/tracked.o"],
+        "the tracked file is carried, and the add and the copy beside it are not"
+    );
+}
+
 /// Excluding a directory prunes its subtree: the filter is asked about the
 /// directory before the walk descends into it, so a path below an excluded
 /// directory is never reached.
 #[tokio::test]
 async fn an_excluded_directory_is_not_descended() {
-    let repository = null_repository_excluding(&["build"]).await;
+    let repository = null_repository_viewing(&["build"]).await;
     let state = State::new();
 
     let build = add_dirty_node(
@@ -1670,13 +3235,42 @@ async fn diff_in_order(
         .collect()
 }
 
-/// A directory added or deleted as a whole is emitted depth first along each sibling chain,
-/// and a link below it is emitted without what it holds.
+/// Asserts that `emitted` holds what `expected` names, as often, and names every directory
+/// before what it holds. A path named twice, as an unnamed directory is under its parent's
+/// name, is held to that at its first.
 ///
-/// Adding a node prepends it, so each level's chain is the reverse of the order its children
-/// are added in here.
+/// A hierarchy is walked by several tasks at once, so siblings come in no fixed order.
+fn assert_emitted_parents_first(
+    emitted: Vec<(FileAction, String)>,
+    expected: &[(FileAction, String)],
+    message: &str,
+) {
+    let by_path = |changes: &mut Vec<(FileAction, String)>| {
+        changes.sort_by(|lhs, rhs| (&lhs.1, lhs.0 as u16).cmp(&(&rhs.1, rhs.0 as u16)));
+    };
+    let mut sorted = emitted.clone();
+    by_path(&mut sorted);
+    let mut wanted = expected.to_vec();
+    by_path(&mut wanted);
+    assert_eq!(sorted, wanted, "{message}");
+    for (index, (_, path)) in emitted.iter().enumerate() {
+        if emitted[..index].iter().any(|(_, earlier)| earlier == path) {
+            continue;
+        }
+        let below = format!("{path}/");
+        assert!(
+            emitted[..index]
+                .iter()
+                .all(|(_, earlier)| !earlier.starts_with(&below)),
+            "{message}: {path} came after something it holds, in {emitted:?}"
+        );
+    }
+}
+
+/// A directory added or deleted as a whole is emitted before what it holds, and a link below
+/// it is emitted without what it holds.
 #[tokio::test]
-async fn a_hierarchy_is_emitted_depth_first_along_each_sibling_chain() {
+async fn a_hierarchy_is_emitted_parents_first() {
     let repository = null_repository().await;
     let empty = State::new();
     let tree = State::new();
@@ -1724,10 +3318,417 @@ async fn a_hierarchy_is_emitted_depth_first_along_each_sibling_chain() {
             .iter()
             .map(|path| (action, path.to_string()))
             .collect();
+        assert_emitted_parents_first(
+            diff_in_order(repository.clone(), from, to).await,
+            &expected,
+            &format!(
+                "a {action:?} emits each directory before what it holds, and nothing a link holds"
+            ),
+        );
+    }
+}
+
+/// Adds the file `name` under `parent`, carrying the file identity `identity`.
+async fn add_identified_file(
+    state: &State,
+    repository: Arc<RepositoryContext>,
+    parent: NodeID,
+    name: &str,
+    identity: u8,
+) -> NodeID {
+    let mut node = dirty_node(name, NodeFlags::File);
+    node.address = Address {
+        hash: Hash::hash_buffer(name.as_bytes()),
+        context: [identity; 16].into(),
+    };
+    state
+        .node_add(repository, parent, node, name)
+        .await
+        .expect("adding a file to the walked tree")
+}
+
+/// A change as its action, its path and the path a move came from.
+fn change_key(change: &lore_revision::change::NodeChange) -> (u16, String, String) {
+    (
+        change.action as u16,
+        change.path().as_str().to_string(),
+        change
+            .move_source()
+            .map_or_else(String::new, |source| source.as_str().to_string()),
+    )
+}
+
+/// A sync lists a directory deleted as a whole once, and what the listed changes and its
+/// expansion name together is what the full diff names. A file moved out of a deleted directory
+/// into an added one is listed as the move, and the expansion doesn't repeat it.
+#[tokio::test]
+async fn a_whole_directory_is_listed_once_and_expands_to_the_full_diff() {
+    let repository = null_repository().await;
+    let from = State::new();
+    let to = State::new();
+    let directory = NodeFlags::NoFlags;
+
+    for state in [&from, &to] {
+        let kept = add_dirty_node(state, repository.clone(), ROOT_NODE, "kept", directory).await;
+        add_identified_file(state, repository.clone(), kept, "same.txt", 9).await;
+    }
+    let gone = add_dirty_node(&from, repository.clone(), ROOT_NODE, "gone", directory).await;
+    add_identified_file(&from, repository.clone(), gone, "a.txt", 1).await;
+    let sub = add_dirty_node(&from, repository.clone(), gone, "sub", directory).await;
+    add_identified_file(&from, repository.clone(), sub, "b.txt", 2).await;
+    add_identified_file(&from, repository.clone(), gone, "moved.txt", 3).await;
+
+    let new = add_dirty_node(&to, repository.clone(), ROOT_NODE, "new", directory).await;
+    add_identified_file(&to, repository.clone(), new, "c.txt", 4).await;
+    let deep = add_dirty_node(&to, repository.clone(), new, "deep", directory).await;
+    add_identified_file(&to, repository.clone(), deep, "d.txt", 5).await;
+    add_identified_file(&to, repository.clone(), new, "arrived.txt", 3).await;
+
+    let walk = async move {
+        let full = diff_collect(
+            repository.clone(),
+            from.clone(),
+            repository.clone(),
+            to.clone(),
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the full diff");
+        let (listed, subtrees) = diff_collect_subtrees(
+            repository.clone(),
+            from,
+            repository.clone(),
+            to,
+            lore_revision::state::diff::DiffFlags::empty(),
+            FilterMode::Full,
+        )
+        .await
+        .expect("the diff listing subtrees");
+        let mut expanded = Vec::new();
+        for change in listed.iter().filter(|change| change.flags.is_subtree()) {
+            let mut expansion = subtrees.expand(change);
+            while let Some(below) = expansion.next().await {
+                expanded.push(below);
+            }
+            expansion.finish().await.expect("expanding a subtree");
+        }
+        (full, listed, expanded)
+    };
+    let (full, listed, expanded) = LORE_CONTEXT.scope(setup_test_execution(), walk).await;
+
+    let mut subtrees: Vec<_> = listed
+        .iter()
+        .filter(|change| change.flags.is_subtree())
+        .map(change_key)
+        .collect();
+    subtrees.sort();
+    assert_eq!(
+        subtrees,
+        vec![(FileAction::Delete as u16, "gone".to_string(), String::new())],
+        "a directory deleted as a whole is one subtree change, and one added isn't"
+    );
+    assert!(
+        listed.iter().any(|change| change_key(change)
+            == (
+                FileAction::Move as u16,
+                "new/arrived.txt".to_string(),
+                "gone/moved.txt".to_string()
+            )),
+        "the move between the two subtrees is listed: {listed:?}"
+    );
+    assert_eq!(
+        listed.len(),
+        6,
+        "the added directory is listed file by file, and nothing else is: {listed:?}"
+    );
+
+    let mut together: Vec<_> = listed.iter().chain(&expanded).map(change_key).collect();
+    together.sort();
+    let mut wanted: Vec<_> = full.iter().map(change_key).collect();
+    wanted.sort();
+    assert_eq!(
+        together, wanted,
+        "the listed changes and their expansions are the full diff"
+    );
+}
+
+/// Two files below a deleted directory sharing a file identity with an add are both listed, one
+/// as the move and the other as a delete of its own, and the expansion repeats neither.
+#[tokio::test]
+async fn files_of_a_deleted_directory_sharing_an_identity_with_an_add_are_listed_once() {
+    let repository = null_repository().await;
+    let from = State::new();
+    let to = State::new();
+    let directory = NodeFlags::NoFlags;
+
+    let twin = async |state: &State, parent: NodeID, name: &str| {
+        let mut node = crate::repository::test_helpers::file_node(b"twin");
+        node.name_hash = lore_storage::hash::hash_string(name);
+        node.address.context = [7; 16].into();
+        state
+            .node_add(repository.clone(), parent, node, name)
+            .await
+            .expect("adding a twin");
+    };
+    let new = add_dirty_node(&to, repository.clone(), ROOT_NODE, "new", directory).await;
+    twin(&to, new, "arrived.txt").await;
+    let gone = add_dirty_node(&from, repository.clone(), ROOT_NODE, "gone", directory).await;
+    twin(&from, gone, "one.txt").await;
+    twin(&from, gone, "two.txt").await;
+    add_identified_file(&from, repository.clone(), gone, "other.txt", 8).await;
+
+    let walk = async move {
+        let full = diff_collect(
+            repository.clone(),
+            from.clone(),
+            repository.clone(),
+            to.clone(),
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the full diff");
+        let (listed, subtrees) = diff_collect_subtrees(
+            repository.clone(),
+            from,
+            repository.clone(),
+            to,
+            lore_revision::state::diff::DiffFlags::empty(),
+            FilterMode::Full,
+        )
+        .await
+        .expect("the diff listing subtrees");
+        let mut expanded = Vec::new();
+        for change in listed.iter().filter(|change| change.flags.is_subtree()) {
+            let mut expansion = subtrees.expand(change);
+            while let Some(below) = expansion.next().await {
+                expanded.push(below);
+            }
+            expansion.finish().await.expect("expanding a subtree");
+        }
+        (full, listed, expanded)
+    };
+    let (full, listed, expanded) = LORE_CONTEXT.scope(setup_test_execution(), walk).await;
+
+    let expanded_paths: Vec<_> = expanded
+        .iter()
+        .map(|change| change.path().as_str().to_string())
+        .collect();
+    assert_eq!(
+        expanded_paths,
+        vec!["gone/other.txt".to_string()],
+        "the expansion holds only the file no add shares an identity with"
+    );
+    let mut together: Vec<_> = listed.iter().chain(&expanded).map(change_key).collect();
+    together.sort();
+    let mut wanted: Vec<_> = full.iter().map(change_key).collect();
+    wanted.sort();
+    assert_eq!(
+        together, wanted,
+        "the listed changes and the expansion are the full diff"
+    );
+}
+
+/// A directory moved to another parent is a deleted directory whose every file is listed as the
+/// move to its new place, and the expansion holds only the directories the moves leave behind.
+#[tokio::test]
+async fn a_directory_moved_to_another_parent_lists_each_file_as_a_move_once() {
+    let repository = null_repository().await;
+    let from = State::new();
+    let to = State::new();
+    let directory = NodeFlags::NoFlags;
+
+    let gone = add_dirty_node(&from, repository.clone(), ROOT_NODE, "gone", directory).await;
+    let gone_inner = add_dirty_node(&from, repository.clone(), gone, "inner", directory).await;
+    let new = add_dirty_node(&to, repository.clone(), ROOT_NODE, "new", directory).await;
+    let moved = add_dirty_node(&to, repository.clone(), new, "moved", directory).await;
+    let moved_inner = add_dirty_node(&to, repository.clone(), moved, "inner", directory).await;
+    let mut files = 0;
+    for identity in 10..50u8 {
+        let name = format!("{identity}.txt");
+        add_identified_file(&from, repository.clone(), gone, &name, identity).await;
+        add_identified_file(&to, repository.clone(), moved, &name, identity).await;
+        files += 1;
+    }
+    for identity in 100..110u8 {
+        let name = format!("{identity}.txt");
+        add_identified_file(&from, repository.clone(), gone_inner, &name, identity).await;
+        add_identified_file(&to, repository.clone(), moved_inner, &name, identity).await;
+        files += 1;
+    }
+
+    let walk = async move {
+        let full = diff_collect(
+            repository.clone(),
+            from.clone(),
+            repository.clone(),
+            to.clone(),
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("the full diff");
+        let (listed, subtrees) = diff_collect_subtrees(
+            repository.clone(),
+            from,
+            repository.clone(),
+            to,
+            lore_revision::state::diff::DiffFlags::empty(),
+            FilterMode::Full,
+        )
+        .await
+        .expect("the diff listing subtrees");
+        let mut expanded = Vec::new();
+        for change in listed.iter().filter(|change| change.flags.is_subtree()) {
+            let mut expansion = subtrees.expand(change);
+            while let Some(below) = expansion.next().await {
+                expanded.push(below);
+            }
+            expansion.finish().await.expect("expanding a subtree");
+        }
+        (full, listed, expanded)
+    };
+    let (full, listed, expanded) = LORE_CONTEXT.scope(setup_test_execution(), walk).await;
+
+    let subtree_paths: Vec<_> = listed
+        .iter()
+        .filter(|change| change.flags.is_subtree())
+        .map(|change| change.path().as_str().to_string())
+        .collect();
+    assert_eq!(subtree_paths, vec!["gone".to_string()]);
+    let moves: Vec<_> = listed
+        .iter()
+        .filter(|change| change.action == FileAction::Move)
+        .map(change_key)
+        .collect();
+    assert_eq!(moves.len(), files, "each file is one move: {listed:?}");
+    assert!(
+        moves.iter().all(|(_, path, source)| {
+            source.starts_with("gone/")
+                && path.strip_prefix("new/moved/") == source.strip_prefix("gone/")
+        }),
+        "each move carries a file to the same place in the moved directory: {moves:?}"
+    );
+    let mut expanded_paths: Vec<_> = expanded
+        .iter()
+        .map(|change| change.path().as_str().to_string())
+        .collect();
+    expanded_paths.sort();
+    assert_eq!(
+        expanded_paths,
+        vec!["gone/inner".to_string()],
+        "the expansion repeats no file the moves list"
+    );
+    let mut together: Vec<_> = listed.iter().chain(&expanded).map(change_key).collect();
+    together.sort();
+    let mut wanted: Vec<_> = full.iter().map(change_key).collect();
+    wanted.sort();
+    assert_eq!(
+        together, wanted,
+        "the listed changes and the expansion are the full diff"
+    );
+}
+
+/// Expanding a level of a deleted directory yields the nodes directly below it, a directory among
+/// them as a subtree change of its own, and nothing below that.
+#[tokio::test]
+async fn a_level_of_a_deleted_directory_holds_its_children_alone() {
+    let repository = null_repository().await;
+    let from = State::new();
+    let to = State::new();
+    let directory = NodeFlags::NoFlags;
+
+    let gone = add_dirty_node(&from, repository.clone(), ROOT_NODE, "gone", directory).await;
+    add_identified_file(&from, repository.clone(), gone, "a.txt", 1).await;
+    let sub = add_dirty_node(&from, repository.clone(), gone, "sub", directory).await;
+    add_identified_file(&from, repository.clone(), sub, "b.txt", 2).await;
+
+    let walk = async move {
+        let (listed, subtrees) = diff_collect_subtrees(
+            repository.clone(),
+            from,
+            repository.clone(),
+            to,
+            lore_revision::state::diff::DiffFlags::empty(),
+            FilterMode::Full,
+        )
+        .await
+        .expect("the diff listing subtrees");
+        let gone = listed
+            .iter()
+            .find(|change| change.flags.is_subtree())
+            .expect("the deleted directory is a subtree change");
+        let mut level = subtrees.expand_level(gone);
+        let mut below = Vec::new();
+        while let Some(change) = level.next().await {
+            below.push((
+                change.path().as_str().to_string(),
+                change.flags.is_subtree(),
+            ));
+        }
+        level.finish().await.expect("expanding a level");
+        below
+    };
+    let mut below = LORE_CONTEXT.scope(setup_test_execution(), walk).await;
+    below.sort();
+    assert_eq!(
+        below,
+        vec![
+            ("gone/a.txt".to_string(), false),
+            ("gone/sub".to_string(), true),
+        ]
+    );
+}
+
+/// A child whose stored name the read path refuses, written before a rule refused it, is left
+/// out of a directory added or deleted as a whole, as a listing leaves it out, and its siblings
+/// are emitted.
+#[tokio::test]
+async fn a_hierarchy_leaves_out_a_child_whose_name_the_read_path_refuses() {
+    let repository = null_repository().await;
+    let empty = State::new();
+    let tree = State::new();
+
+    let top = add_dirty_node(
+        &tree,
+        repository.clone(),
+        ROOT_NODE,
+        "top",
+        NodeFlags::NoFlags,
+    )
+    .await;
+    add_dirty_node(&tree, repository.clone(), top, "kept.txt", NodeFlags::File).await;
+    let planted = add_dirty_node(&tree, repository.clone(), top, "planted", NodeFlags::File).await;
+    let block_index = NodeBlock::index(planted);
+    let block = tree
+        .block_with_nametable(repository.clone(), block_index)
+        .await
+        .expect("the block reads back");
+    {
+        let mut writer = block.write_for_tests();
+        let node = *writer.node(Node::index(planted));
+        let (offset, length) = writer
+            .node_name_store_unchecked(".URC", node.name_offset, node.name_length)
+            .expect("the unchecked store takes the name");
+        let node = writer.node(Node::index(planted));
+        node.name_hash = hash::hash_string(".URC");
+        node.name_offset = offset;
+        node.name_length = length;
+        writer.mark_dirty();
+    }
+    tree.block_modified_for_tests(block, block_index);
+
+    for (action, from, to) in [
+        (FileAction::Add, empty.clone(), tree.clone()),
+        (FileAction::Delete, tree, empty),
+    ] {
         assert_eq!(
             diff_in_order(repository.clone(), from, to).await,
-            expected,
-            "a {action:?} emits each directory before what it holds, and nothing a link holds"
+            vec![
+                (action, "top".to_string()),
+                (action, "top/kept.txt".to_string())
+            ],
         );
     }
 }
@@ -1780,10 +3781,10 @@ async fn siblings_after_an_excluded_or_unnamed_child_are_named_under_their_paren
     .iter()
     .map(|path| (FileAction::Add, path.to_string()))
     .collect();
-    assert_eq!(
+    assert_emitted_parents_first(
         diff_in_order(repository, State::new(), tree).await,
-        expected,
-        "nothing under the excluded directory is emitted, and every sibling keeps the prefix"
+        &expected,
+        "nothing under the excluded directory is emitted, and every sibling keeps the prefix",
     );
 }
 
@@ -1833,15 +3834,18 @@ async fn tree_readers_hold_its_fields_not_the_tree() {
         .scope(setup_test_execution(), async {
             let repository = null_repository().await;
             let state = State::new();
-            let options = immutable::read_options_from_repository(&repository);
 
-            let list_read = immutable::read(repository.clone(), Address::default(), None, options);
+            let block_read = NodeFileMetadataBlockData::read_box_from_immutable_compat(
+                repository.clone(),
+                Address::default(),
+                true,
+            );
             let name_table_read = NameTable::deserialize(repository.clone(), Hash::default());
             let load = state.block_file_metadata_load(repository.clone(), 0);
             let name_table = state.nametable_load(repository);
 
             for (what, future, read) in [
-                ("load", size_of_val(&load), size_of_val(&list_read)),
+                ("load", size_of_val(&load), size_of_val(&block_read)),
                 (
                     "name table load",
                     size_of_val(&name_table),
@@ -1857,88 +3861,1480 @@ async fn tree_readers_hold_its_fields_not_the_tree() {
         .await;
 }
 
-/// Files under `fill/` in [`stored_with_two_blocks`]: with the root and `fill/`, they run past the
-/// first node block.
-const FILL_NODES: usize = BLOCK_NODE_COUNT;
+/// Dropping repeats keeps each node once, at the copy that came last.
+#[test]
+fn dropping_repeats_keeps_the_last_copy_of_each_node() {
+    let mut items: Vec<(NodeID, u32)> = (0..300u32).map(|at| ((at * 7) % 61, at)).collect();
+    drop_repeated_nodes(&mut items, |&(id, at)| (id, at));
+    let ids: Vec<NodeID> = items.iter().map(|&(id, _)| id).collect();
+    assert_eq!(ids, (0..61).collect::<Vec<NodeID>>());
+    for &(id, at) in &items {
+        let last = (0..300u32).rev().find(|at| (at * 7) % 61 == id);
+        assert_eq!(Some(at), last, "node {id} must keep its last copy");
+    }
+}
 
-/// A stored revision of two node blocks: the root holds `fill/`, and `fill/` holds
-/// [`FILL_NODES`] files running into the second.
-async fn stored_with_two_blocks(repository: &Arc<RepositoryContext>) -> Hash {
+async fn add_directory(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    parent: NodeID,
+    name: &str,
+) -> NodeID {
+    state
+        .node_add(repository.clone(), parent, directory(name), name)
+        .await
+        .expect("adding a directory must succeed")
+}
+
+/// An add whose parent is detached after the add checked it, while the add waits for its
+/// slot, refuses the publish under the locks: the detached parent gains no child.
+#[tokio::test]
+async fn an_add_whose_parent_is_detached_before_its_publish_attaches_nothing() {
+    let repository = null_repository().await;
     let state = State::new();
-    let fill = add_dirty_node(
+    let parent = add_directory(&state, &repository, ROOT_NODE, "parent").await;
+    let head = state
+        .block(repository.clone(), state.unused_head() as usize)
+        .await
+        .expect("the block slots come from");
+    let mut filler = 0;
+    while !head.read().is_full() {
+        add_directory(&state, &repository, ROOT_NODE, &format!("f{filler}")).await;
+        filler += 1;
+    }
+    let permit = state.unused.acquire().await.expect("the allocation permit");
+
+    let mut add =
+        std::pin::pin!(state.node_add(repository.clone(), parent, directory("child"), "child"));
+    assert!(
+        futures::poll!(add.as_mut()).is_pending(),
+        "the add waits for the allocation permit, past its check of the parent"
+    );
+    state
+        .node_detach(
+            repository.clone(),
+            parent,
+            lore_revision::state::Detach::Always,
+        )
+        .await
+        .expect("the detach");
+    drop(permit);
+    let added = add.await;
+
+    assert!(
+        added.is_err(),
+        "an add under a parent detached before its publish must fail, got {added:?}"
+    );
+    assert_eq!(
+        state
+            .node(repository.clone(), parent)
+            .await
+            .expect("the detached parent")
+            .child(),
+        None,
+        "the detached parent must gain no child"
+    );
+}
+
+/// An attach whose name lookup started from a chain whose head then moves away, gains
+/// the attached name as a new child and comes back must see, under its locks, that the
+/// chain changed.
+#[tokio::test]
+async fn an_attach_sees_the_head_it_scanned_from_move_away_and_back() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let parent = add_directory(&state, &repository, ROOT_NODE, "parent").await;
+    let other = add_directory(&state, &repository, ROOT_NODE, "other").await;
+    let head = add_directory(&state, &repository, parent, "head").await;
+    let parent_block = state
+        .block(repository.clone(), NodeBlock::index(parent))
+        .await
+        .expect("the parent's block");
+    let (_, scanned) = parent_block.node_with_chain_changes(Node::index(parent));
+
+    state
+        .node_reattach(repository.clone(), head, other, "head")
+        .await
+        .expect("the head moves away");
+    state
+        .node_attach(repository.clone(), parent, directory("x"), "x")
+        .await
+        .expect("x attaches");
+    state
+        .node_reattach(repository.clone(), head, parent, "head")
+        .await
+        .expect("the head moves back");
+
+    let mut locks = BlockLocks::lock([
+        Some((NodeBlock::index(parent), &parent_block)),
+        None,
+        None,
+        None,
+    ]);
+    assert!(
+        !chain_unchanged(&mut locks, parent, &parent_block, scanned),
+        "a chain that gained a name since the lookup must not pass as unchanged"
+    );
+}
+
+/// An absence read from another block than the directory's block an attach locks, as a block
+/// evicted and loaded again leaves it, says nothing of the locked block's log: the attach and
+/// the reattach find the name by walking, and never attach it twice.
+#[tokio::test]
+async fn an_absence_read_from_another_block_walks_and_never_attaches_a_duplicate() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let dir = add_directory(&state, &repository, ROOT_NODE, "dir").await;
+    let mover = add_directory(&state, &repository, ROOT_NODE, "mover").await;
+    let held = add_directory(&state, &repository, dir, "held").await;
+    let block = state
+        .block(repository.clone(), NodeBlock::index(dir))
+        .await
+        .expect("the directory's block");
+    // Installed after `held` was attached, so the log names no patch for it.
+    let (mark, _) = block.watch_chain(Node::index(dir), None);
+    let absent = Absent::new(
         &state,
+        mark.seq,
+        NodeBlock::new_zeroed(),
+        dir,
+        hash::hash_string("held"),
+    );
+
+    let attached = state
+        .node_attach_absent(
+            repository.clone(),
+            dir,
+            directory("held"),
+            "held",
+            Some(&absent),
+        )
+        .await
+        .expect("the attach");
+    assert_eq!(attached, AttachOutcome::Exists(held));
+    let moved = state
+        .node_reattach_absent(repository.clone(), mover, dir, "held", Some(&absent))
+        .await
+        .expect("the reattach");
+    assert_eq!(moved, AttachOutcome::Exists(held));
+    assert_eq!(
+        state
+            .node_children(repository.clone(), dir)
+            .await
+            .expect("the directory's children"),
+        vec![held]
+    );
+}
+
+/// The chain steps finds by name have taken on this thread, counting from now on. Left on:
+/// tests count at once, and one turning counting off would cut another's count short.
+fn counted_steps() -> u64 {
+    step_counting::set_chain_step_counting(true);
+    step_counting::thread_chain_steps()
+}
+
+/// `dir` and `mover` below the root of `state`, `dir`'s block, and the position of `dir`'s log,
+/// installed now.
+async fn watched_directory(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+) -> (NodeID, NodeID, Arc<NodeBlock>, u32) {
+    let dir = add_directory(state, repository, ROOT_NODE, "dir").await;
+    let mover = add_directory(state, repository, ROOT_NODE, "mover").await;
+    let block = state
+        .block(repository.clone(), NodeBlock::index(dir))
+        .await
+        .expect("the directory's block");
+    let (mark, _) = block.watch_chain(Node::index(dir), None);
+    (dir, mover, block, mark.seq)
+}
+
+/// An absence read from the directory's own block is checked against its log under the write
+/// locks, with no walk: a name the log shows taken since is held, any other is free.
+#[tokio::test]
+async fn an_absence_read_from_the_directorys_block_is_checked_against_its_log() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let (dir, mover, block, at) = watched_directory(&state, &repository).await;
+    let absent = |name: &str| Absent::new(&state, at, block.clone(), dir, hash::hash_string(name));
+    let before = counted_steps();
+
+    let attach = |name: &'static str| {
+        let (state, repository, absent) = (&state, repository.clone(), absent(name));
+        async move {
+            state
+                .node_attach_absent(repository, dir, directory(name), name, Some(&absent))
+                .await
+                .expect("the attach")
+        }
+    };
+    let AttachOutcome::Attached(taken) = attach("taken").await else {
+        panic!("the name is free");
+    };
+    assert_eq!(attach("taken").await, AttachOutcome::Exists(taken));
+    assert_eq!(
+        state
+            .node_reattach_absent(
+                repository.clone(),
+                mover,
+                dir,
+                "taken",
+                Some(&absent("taken"))
+            )
+            .await
+            .expect("the reattach"),
+        AttachOutcome::Exists(taken)
+    );
+    assert_eq!(
+        state
+            .node_reattach_absent(
+                repository.clone(),
+                mover,
+                dir,
+                "moved",
+                Some(&absent("moved"))
+            )
+            .await
+            .expect("the reattach"),
+        AttachOutcome::Attached(mover)
+    );
+    assert_eq!(
+        step_counting::thread_chain_steps(),
+        before,
+        "no find walked the chain"
+    );
+}
+
+/// An attach that took a slot and then found its name held under the publish's locks hands the
+/// slot back.
+#[tokio::test]
+async fn an_attach_whose_absence_turns_out_held_hands_its_slot_back() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let (dir, _, block, at) = watched_directory(&state, &repository).await;
+    let absent = Absent::new(&state, at, block, dir, hash::hash_string("taken"));
+    let attach = async || {
+        state
+            .node_attach_absent(
+                repository.clone(),
+                dir,
+                directory("taken"),
+                "taken",
+                Some(&absent),
+            )
+            .await
+            .expect("the attach")
+    };
+    let AttachOutcome::Attached(taken) = attach().await else {
+        panic!("the name is free");
+    };
+    let slots = state
+        .block(repository.clone(), NodeBlock::index(taken))
+        .await
+        .expect("the block slots come from");
+    let free = || {
+        let reader = slots.read();
+        BLOCK_NODE_COUNT - reader.node_count() + reader.raw().node_unused_count as usize
+    };
+    let before = free();
+
+    assert_eq!(attach().await, AttachOutcome::Exists(taken));
+    assert_eq!(
+        free(),
+        before,
+        "an attach that found its name held must hand its slot back"
+    );
+}
+
+/// A reattach whose absence the directory's log has moved past finds its name by walking: a
+/// name attached among the patches the log no longer holds is held.
+#[tokio::test]
+async fn a_reattach_whose_absence_left_the_log_walks_and_finds_the_holder() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let (dir, mover, block, at) = watched_directory(&state, &repository).await;
+    let absent = Absent::new(&state, at, block.clone(), dir, hash::hash_string("target"));
+    let holder = add_directory(&state, &repository, dir, "target").await;
+    let capacity = block
+        .read()
+        .chain_log(Node::index(dir))
+        .map_or(0, ChainLog::capacity);
+    for i in 0..capacity {
+        add_directory(&state, &repository, dir, &format!("d{i}")).await;
+    }
+    let before = counted_steps();
+    let moved = state
+        .node_reattach_absent(repository.clone(), mover, dir, "target", Some(&absent))
+        .await
+        .expect("the reattach");
+    assert_eq!(moved, AttachOutcome::Exists(holder));
+    assert!(
+        step_counting::thread_chain_steps() > before,
+        "the reattach walked the chain"
+    );
+}
+
+/// An absence read from another directory's log in the same block, or for another name, says
+/// nothing of this name in this directory: the attach finds it by walking.
+#[tokio::test]
+async fn an_absence_of_another_directory_or_name_walks() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let dir = add_directory(&state, &repository, ROOT_NODE, "dir").await;
+    let other = add_directory(&state, &repository, ROOT_NODE, "other").await;
+    let held = add_directory(&state, &repository, dir, "held").await;
+    let block = state
+        .block(repository.clone(), NodeBlock::index(dir))
+        .await
+        .expect("the directories' block");
+    assert_eq!(NodeBlock::index(other), NodeBlock::index(dir));
+    // Installed after `held` was attached, so `dir`'s log names no patch for it.
+    let (dir_mark, _) = block.watch_chain(Node::index(dir), None);
+    let (other_mark, _) = block.watch_chain(Node::index(other), None);
+    let held_hash = hash::hash_string("held");
+    for absent in [
+        Absent::new(&state, other_mark.seq, block.clone(), other, held_hash),
+        Absent::new(
+            &state,
+            dir_mark.seq,
+            block.clone(),
+            dir,
+            hash::hash_string("free"),
+        ),
+    ] {
+        let before = counted_steps();
+        let attached = state
+            .node_attach_absent(
+                repository.clone(),
+                dir,
+                directory("held"),
+                "held",
+                Some(&absent),
+            )
+            .await
+            .expect("the attach");
+        assert_eq!(attached, AttachOutcome::Exists(held), "{absent:?}");
+        assert!(
+            step_counting::thread_chain_steps() > before,
+            "{absent:?}: the attach walked the chain"
+        );
+    }
+}
+
+/// A reattach onto a name the mover itself has taken since the absence moves it in place: the
+/// log's attach of the name is the mover's own, not a holder's.
+#[tokio::test]
+async fn a_reattach_onto_a_name_the_mover_took_since_the_absence_moves_it() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let (dir, mover, block, at) = watched_directory(&state, &repository).await;
+    let absent = Absent::new(&state, at, block, dir, hash::hash_string("target"));
+    state
+        .node_reattach(repository.clone(), mover, dir, "target")
+        .await
+        .expect("the mover takes the name");
+    let before = counted_steps();
+    let moved = state
+        .node_reattach_absent(repository.clone(), mover, dir, "TARGET", Some(&absent))
+        .await
+        .expect("the respelling");
+    assert_eq!(moved, AttachOutcome::Attached(mover));
+    assert_eq!(step_counting::thread_chain_steps(), before, "no walk");
+    assert_eq!(
+        state
+            .node_children(repository.clone(), dir)
+            .await
+            .expect("the directory's children"),
+        vec![mover]
+    );
+}
+
+/// A node met misparented under two different parents whose change counts happen to be
+/// equal is two moves, not a broken chain; met twice under one parent with one count, it
+/// is broken.
+#[test]
+fn chain_attempts_judge_a_misparented_node_per_parent() {
+    let misparented = |actual_parent| ChainPosition::Misparented {
+        node: 7,
+        actual_parent,
+        changes: 2,
+    };
+    let mut attempts = ChainAttempts::default();
+    assert!(matches!(attempts.found(10, misparented(20)), Ok(None)));
+    assert!(
+        matches!(attempts.found(11, misparented(21)), Ok(None)),
+        "the same node and count under another parent must be tried again"
+    );
+    assert!(
+        attempts
+            .found(11, misparented(21))
+            .is_err_and(|error| error.is_invalid_node_hierarchy()),
+        "the same node and count under the same parent twice running is broken"
+    );
+}
+
+/// Attempts that all missed their node under one parent judge it missing from that chain, a
+/// broken hierarchy; attempts that did not all miss it there ran out to churn, `SlowDown`.
+#[tokio::test]
+async fn chain_attempts_out_of_tries_tell_a_node_missing_from_its_chain_from_churn() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let dir = add_directory(&state, &repository, ROOT_NODE, "dir").await;
+    let other = add_directory(&state, &repository, ROOT_NODE, "other").await;
+    let run = async |positions: &dyn Fn(u32) -> (NodeID, ChainPosition)| {
+        let mut attempts = ChainAttempts::default();
+        for attempt in 0..CHAIN_CHANGE_ATTEMPTS {
+            let (parent, position) = positions(attempt);
+            assert!(matches!(attempts.found(parent, position), Ok(None)));
+        }
+        attempts.exhausted(&state, &repository, 7).await
+    };
+
+    let missing = run(&|_| (dir, ChainPosition::Missing)).await;
+    assert!(
+        missing.is_internal(),
+        "a node every attempt missed under one parent is missing from its chain, got \
+         {missing:?}"
+    );
+    let moved = run(&|attempt| {
+        let parent = if attempt == 0 { other } else { dir };
+        (parent, ChainPosition::Missing)
+    })
+    .await;
+    assert!(
+        moved.is_slow_down(),
+        "a node missed under two parents is churn, got {moved:?}"
+    );
+    let moving = run(&|attempt| {
+        let position = if attempt == CHAIN_CHANGE_ATTEMPTS - 1 {
+            ChainPosition::Moving
+        } else {
+            ChainPosition::Missing
+        };
+        (dir, position)
+    })
+    .await;
+    assert!(
+        moving.is_slow_down(),
+        "a node met moving on the last attempt is churn, got {moving:?}"
+    );
+}
+
+/// Keeping the last copy in walk order leaves each node once, at its highest index, in
+/// the order of those indices.
+#[test]
+fn keeping_the_last_copy_in_walk_order_restores_walk_order() {
+    let mut items: Vec<(NodeID, u32, char)> = vec![
+        (7, 0, 'a'),
+        (3, 1, 'b'),
+        (9, 2, 'c'),
+        (3, 3, 'd'),
+        (5, 4, 'e'),
+        (7, 5, 'f'),
+        (9, 6, 'g'),
+        (5, 7, 'h'),
+    ];
+    keep_last_in_walk_order(&mut items, |&(id, index, _)| (id, index));
+    assert_eq!(
+        items,
+        vec![(3, 3, 'd'), (7, 5, 'f'), (9, 6, 'g'), (5, 7, 'h')]
+    );
+}
+
+/// A find through blocks in memory that meets a node chained in its directory but naming
+/// another as its parent, twice with no change between, answers a broken hierarchy, as a find
+/// reading blocks does, rather than walking on past it.
+#[tokio::test]
+async fn a_resident_find_meeting_a_broken_chain_answers_as_a_find_reading_blocks() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let dir = add_directory(&state, &repository, ROOT_NODE, "dir").await;
+    let other = add_directory(&state, &repository, ROOT_NODE, "other").await;
+    add_directory(&state, &repository, dir, "b").await;
+    let broken = add_directory(&state, &repository, dir, "x").await;
+    let block = state
+        .block(repository.clone(), NodeBlock::index(dir))
+        .await
+        .expect("the directory's block");
+    assert_eq!(
+        block.node_with_chain_changes(Node::index(dir)).0.child(),
+        Some(broken),
+        "x heads the chain, before b"
+    );
+    block.write_for_tests().node(Node::index(broken)).parent = other;
+
+    let read = state
+        .find_subnode(repository.clone(), dir, hash::hash_string("b"))
+        .await;
+    let resident = state.find_subnode_resident(dir, hash::hash_string("b"));
+
+    assert!(
+        read.is_err_and(|error| error.is_invalid_node_hierarchy()),
+        "a find reading blocks answers a broken hierarchy"
+    );
+    assert!(
+        resident.is_err_and(|error| error.is_invalid_node_hierarchy()),
+        "a resident find answers a broken hierarchy"
+    );
+}
+
+/// A walk that meets a node moved out of its directory, moved back in and moved out
+/// again, one move per pass, restarts each time rather than taking the node for a
+/// broken chain: the move back in counts as a change between the two passes.
+#[tokio::test]
+async fn a_walk_meeting_a_node_moved_out_back_in_and_out_again_restarts() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let dir = add_directory(&state, &repository, ROOT_NODE, "dir").await;
+    let other = add_directory(&state, &repository, ROOT_NODE, "other").await;
+    add_directory(&state, &repository, dir, "a").await;
+    let y = add_directory(&state, &repository, dir, "y").await;
+    let block = state
+        .block(repository.clone(), NodeBlock::index(dir))
+        .await
+        .expect("the parent's block");
+    let (parent, changes) = block.node_with_chain_changes(Node::index(dir));
+    assert_eq!(parent.child(), Some(y));
+    let mut walk = ChainWalk::new(dir, block, changes);
+
+    let move_y = async |into: NodeID| {
+        state
+            .node_reattach(repository.clone(), y, into, "y")
+            .await
+            .expect("the move must succeed");
+        state.node(repository.clone(), y).await.expect("y")
+    };
+    let moved_out = move_y(other).await;
+    assert_eq!(
+        walk.step(y, &moved_out).expect("first pass"),
+        ChainStep::Restart
+    );
+    move_y(dir).await;
+    assert_eq!(walk.head_again(), Some(y));
+    let moved_out_again = move_y(other).await;
+    assert_eq!(
+        walk.step(y, &moved_out_again)
+            .expect("a node moved back in between two passes is no broken chain"),
+        ChainStep::Restart
+    );
+}
+
+/// A walk from a parent read before its head moved to another directory restarts from
+/// the current head and visits every remaining child.
+#[tokio::test]
+async fn walk_children_restarts_past_a_child_moved_away() {
+    let repository = null_repository().await;
+    let state = State::new();
+    let elsewhere = add_directory(&state, &repository, ROOT_NODE, "elsewhere").await;
+    let dir = add_directory(&state, &repository, ROOT_NODE, "dir").await;
+    let a = add_directory(&state, &repository, dir, "a").await;
+    let head = add_directory(&state, &repository, dir, "head").await;
+    let block = state
+        .block(repository.clone(), NodeBlock::index(dir))
+        .await
+        .expect("the parent's block");
+    let (stale, changes) = block.node_with_chain_changes(Node::index(dir));
+    state
+        .node_reattach(repository.clone(), head, elsewhere, "head")
+        .await
+        .expect("the head moves away");
+
+    let mut visited = Vec::new();
+    let walked = state
+        .walk_children(
+            repository.clone(),
+            stale.child(),
+            ChainWalk::new(dir, block, changes),
+            None,
+            |id, _| {
+                visited.push(id);
+                None::<()>
+            },
+        )
+        .await
+        .expect("the walk must restart, not fail");
+    assert_eq!(visited, vec![a]);
+    assert!(walked.may_repeat, "a restarted walk may repeat");
+}
+
+/// Realizes the sync from `from` to `to` over the working tree `repository` reads, listing a
+/// directory deleted as a whole as one change, without verifying it first.
+async fn realize_with_subtrees(
+    repository: Arc<RepositoryContext>,
+    from: Arc<State>,
+    to: Arc<State>,
+) -> Result<(), lore_revision::revision::sync::SyncError> {
+    let (changes, subtrees) = diff_collect_subtrees(
+        repository.clone(),
+        from,
+        repository.clone(),
+        to,
+        lore_revision::state::diff::DiffFlags::empty(),
+        FilterMode::Full,
+    )
+    .await
+    .expect("the diff listing subtrees");
+    let operation = repository
+        .file_system()
+        .begin_operation()
+        .await
+        .expect("an operation over the working tree");
+    lore_revision::fs::realize::realize_changes(
+        repository,
+        operation,
+        Arc::new(changes),
+        &[],
+        Some(subtrees),
+        None,
+        false,
+        None, /* Not a merge */
+        Some(&lore_revision::fs::realize::EmptiedDirectories::Excluded),
+        Arc::default(),
+    )
+    .await
+}
+
+/// Of two files below a deleted directory sharing a file identity with an add, the delete phase
+/// removes the one no move pairs with the add, though the expansion skips it as listed on its own,
+/// and leaves the move's source and the directory holding it for the move.
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
+async fn a_listed_file_below_a_deleted_directory_that_no_move_pairs_is_deleted() {
+    let temp = lore_base::test_util::TempDir::new("lore-unpaired-claimed-delete-");
+    let repository = crate::repository::test_helpers::working_tree_repository(temp.path()).await;
+    let from = State::new();
+    let to = State::new();
+    let directory = NodeFlags::NoFlags;
+    let new = add_dirty_node(&to, repository.clone(), ROOT_NODE, "new", directory).await;
+    add_identified_file(&to, repository.clone(), new, "arrived.txt", 7).await;
+    let gone = add_dirty_node(&from, repository.clone(), ROOT_NODE, "gone", directory).await;
+    add_identified_file(&from, repository.clone(), gone, "one.txt", 7).await;
+    add_identified_file(&from, repository.clone(), gone, "two.txt", 7).await;
+    std::fs::create_dir_all(temp.child("gone")).expect("create the directory");
+    for name in ["one.txt", "two.txt"] {
+        std::fs::write(temp.child("gone").join(name), b"twin").expect("write a twin");
+    }
+
+    let deletes = async {
+        let (changes, subtrees) = diff_collect_subtrees(
+            repository.clone(),
+            from,
+            repository.clone(),
+            to,
+            lore_revision::state::diff::DiffFlags::empty(),
+            FilterMode::Full,
+        )
+        .await
+        .expect("the diff listing subtrees");
+        let source = changes
+            .iter()
+            .find_map(|change| {
+                change
+                    .move_source()
+                    .map(|source| source.as_str().to_string())
+            })
+            .expect("one twin is the move");
+        let context = Arc::new(lore_revision::fs::realize::DeleteContext {
+            repository: repository.clone(),
+            operation: repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("an operation over the working tree"),
+            state_stage: None,
+            dry_run: false,
+            merge_current: None,
+            stats: Arc::default(),
+        });
+        let deleted = lore_revision::fs::realize::realize_changes_delete(
+            &context,
+            &changes,
+            &[],
+            Some(&subtrees),
+        )
+        .await;
+        (source, deleted)
+    };
+    let (source, deleted) = LORE_CONTEXT.scope(setup_test_execution(), deletes).await;
+
+    let kept = deleted.expect("the deletes");
+    let unpaired = if source == "gone/one.txt" {
+        "gone/two.txt"
+    } else {
+        "gone/one.txt"
+    };
+    assert!(
+        !temp.child(unpaired).exists(),
+        "the twin no move pairs is deleted"
+    );
+    assert!(
+        temp.child(&source).exists(),
+        "the move's source stays for the move"
+    );
+    assert_eq!(
+        kept.iter()
+            .map(|change| change.path().as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["gone".to_string()],
+        "the directory holding the move's source is kept for the move"
+    );
+}
+
+/// A revision of `repository` tracking `files` and the directories leading to them, stored, which
+/// a link can pin.
+async fn linked_revision(repository: &Arc<RepositoryContext>, files: &[&str]) -> Hash {
+    let linked = State::new();
+    let mut directories: std::collections::HashMap<String, NodeID> =
+        std::collections::HashMap::new();
+    for file in files {
+        let (parents, name) = file.rsplit_once('/').unwrap_or(("", file));
+        let mut parent = ROOT_NODE;
+        let mut walked = String::new();
+        for directory in parents.split('/').filter(|part| !part.is_empty()) {
+            walked.push_str(directory);
+            walked.push('/');
+            if let Some(&node) = directories.get(&walked) {
+                parent = node;
+                continue;
+            }
+            parent = add_dirty_node(
+                &linked,
+                repository.clone(),
+                parent,
+                directory,
+                NodeFlags::NoFlags,
+            )
+            .await;
+            directories.insert(walked.clone(), parent);
+        }
+        add_dirty_node(&linked, repository.clone(), parent, name, NodeFlags::File).await;
+    }
+    linked.set_revision_number(1);
+    let token = repository
+        .try_write_token()
+        .expect("a working tree repository carries a write token");
+    linked
+        .serialize(repository.clone(), token)
+        .await
+        .expect("storing the linked revision")
+}
+
+/// Realizes the delete of `gone/sub/mounted`, a link below the directory `gone` deleted as a
+/// whole, over a working tree holding `files` below the mount. Where `opens`, the link pins a
+/// revision of the repository tracking `files`, mounted at its root; otherwise its revision cannot
+/// be opened.
+#[allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
+async fn realize_link_below_deleted_directory(
+    temp: &lore_base::test_util::TempDir,
+    files: &[&str],
+    opens: bool,
+) {
+    let repository = crate::repository::test_helpers::working_tree_repository(temp.path()).await;
+    let from = State::new();
+    let to = State::new();
+    let gone = add_dirty_node(
+        &from,
         repository.clone(),
         ROOT_NODE,
-        "fill",
+        "gone",
         NodeFlags::NoFlags,
     )
     .await;
-    for index in 0..FILL_NODES {
-        let name = format!("f{index}");
-        add_dirty_node(&state, repository.clone(), fill, &name, NodeFlags::File).await;
+    let sub = add_dirty_node(&from, repository.clone(), gone, "sub", NodeFlags::NoFlags).await;
+    let mut link = dirty_node("mounted", NodeFlags::Link);
+    if opens {
+        link.address = Address {
+            hash: linked_revision(&repository, files).await,
+            context: repository.id.into(),
+        };
     }
-    let token = repository
-        .try_write_token()
-        .expect("a null context carries a write token");
-    state
-        .serialize(repository.clone(), token)
+    from.node_add(repository.clone(), sub, link, "mounted")
         .await
-        .expect("the State serializes")
+        .expect("adding the link");
+    std::fs::create_dir_all(temp.child("gone/sub/mounted")).expect("create the mount");
+    for file in files {
+        let path = temp.child("gone/sub/mounted").join(file);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("create its directory");
+        std::fs::write(path, b"linked").expect("write a file in the mount");
+    }
+
+    LORE_CONTEXT
+        .scope(
+            setup_test_execution(),
+            realize_with_subtrees(repository, from, to),
+        )
+        .await
+        .expect("the realize");
 }
 
-/// A State with no node block in memory puts a fresh block past the tree's blocks, its block
-/// count grows by one rather than shrinking to the fresh block's, and serializing it keeps the
-/// blocks it never loaded.
+/// An empty mount of a link below a deleted directory goes, and the directories above it with it.
 #[tokio::test]
-async fn a_fresh_block_of_a_state_with_no_block_in_memory_goes_past_the_trees_blocks() {
-    let repository = null_repository().await;
-    let stored = stored_with_two_blocks(&repository).await;
-    let state = State::deserialize(repository.clone(), stored)
-        .await
-        .expect("the State loads");
-    let tree = state.tree(repository.clone()).await.expect("the tree");
-    let count = state.block_count();
-    assert_eq!(count, tree.block_count as usize);
-    assert_eq!(count, 2, "the tree holds two blocks");
+async fn a_link_below_a_deleted_directory_goes_with_its_mount() {
+    let temp = lore_base::test_util::TempDir::new("lore-link-below-deleted-");
 
-    let (index, block) = state.allocate_fresh_block().expect("a fresh block");
-    assert_eq!(index, count, "the fresh block goes past the tree's blocks");
-    assert_eq!(
-        state.block_count(),
-        count + 1,
-        "the block count grows by one"
-    );
-    let found = state
-        .block(repository.clone(), index)
-        .await
-        .expect("the fresh block");
+    realize_link_below_deleted_directory(&temp, &[], false).await;
+
     assert!(
-        Arc::ptr_eq(&found, &block),
-        "the fresh block is found at its index"
+        !temp.child("gone").exists(),
+        "the mount and the directories above it are gone"
+    );
+}
+
+/// The mount of a link below a deleted directory whose revision opens goes with every file and
+/// directory the link tracks there, and the directories above it with it.
+#[tokio::test]
+async fn a_link_below_a_deleted_directory_goes_with_all_its_mount_tracks() {
+    let temp = lore_base::test_util::TempDir::new("lore-link-below-deleted-");
+
+    realize_link_below_deleted_directory(
+        &temp,
+        &["inner/file.txt", "inner/deeper/other.txt"],
+        true,
+    )
+    .await;
+
+    assert!(
+        !temp.child("gone").exists(),
+        "the mount, what it held, and the directories above it are gone"
+    );
+}
+
+/// The mount of a link below a deleted directory whose revision cannot be opened keeps what it
+/// holds, as removing the mount of any such link does, and so do the directories leading to it.
+#[tokio::test]
+async fn a_link_below_a_deleted_directory_keeps_what_an_unopened_mount_holds() {
+    let temp = lore_base::test_util::TempDir::new("lore-link-below-deleted-");
+
+    realize_link_below_deleted_directory(&temp, &["inner/file.txt"], false).await;
+
+    assert!(
+        temp.child("gone/sub/mounted/inner/file.txt").exists(),
+        "the file the mount holds stays"
+    );
+}
+
+#[tokio::test]
+async fn a_node_link_crosses_a_link_where_its_repository_or_revision_differs() {
+    with_state(|repository, state| async move {
+        state.set_revision(Hash::from([1; 32]));
+        let link = |node, repository, revision: u8| NodeLink {
+            node,
+            repository,
+            revision: Hash::from([revision; 32]),
+        };
+        let own = repository.id;
+        let other = RepositoryId::from([9; 16]);
+
+        assert!(!link(1, own, 1).crosses_link(&repository, &state));
+        assert!(!link(ROOT_NODE, own, 1).crosses_link(&repository, &state));
+        assert!(link(1, other, 1).crosses_link(&repository, &state));
+        assert!(link(1, own, 2).crosses_link(&repository, &state));
+        assert!(link(ROOT_NODE, other, 1).crosses_link(&repository, &state));
+        assert!(!NodeLink::invalid().crosses_link(&repository, &state));
+    })
+    .await;
+}
+
+/// A merge an earlier build started wrote rollback rows only, and has to stay finishable or
+/// abortable after an upgrade.
+#[test]
+fn link_merge_state_written_by_an_earlier_build_reads_as_rollback_rows() {
+    use lore_revision::state::LinkMergeEntryV0;
+    use lore_revision::state::LinkMergeState;
+    use lore_revision::state::LinkReference;
+    use lore_revision::state::parse_link_merge_state;
+    use zerocopy::IntoBytes;
+
+    let base = LinkReference {
+        signature: Hash::from([7u8; 32]),
+        local_node: 3,
+        ..Default::default()
+    };
+    let mut raw = LinkMergeState {
+        count: 1,
+        version: 0,
+    }
+    .as_bytes()
+    .to_vec();
+    raw.extend_from_slice(
+        LinkMergeEntryV0 {
+            local_node: 3,
+            reserved: 0,
+            base,
+        }
+        .as_bytes(),
     );
 
-    state.mark_dirty();
-    let token = repository
-        .try_write_token()
-        .expect("a null context carries a write token");
-    let reserialized = state
-        .serialize(repository.clone(), token)
-        .await
-        .expect("the State serializes");
-    let reloaded = State::deserialize(repository.clone(), reserialized)
-        .await
-        .expect("the State reloads");
-    let fill = reloaded
-        .find_subnode(repository.clone(), ROOT_NODE, hash::hash_string("fill"))
-        .await
-        .expect("the root still holds fill");
-    assert_eq!(
-        reloaded
-            .node_children(repository, fill)
-            .await
-            .expect("fill's children")
-            .len(),
-        FILL_NODES,
-        "fill still holds its files"
+    let entries = parse_link_merge_state(&raw).expect("an earlier layout should be readable");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].local_node, 3);
+    assert_eq!(entries[0].base.signature(), Hash::from([7u8; 32]));
+    assert!(
+        !entries[0].is_conflict(),
+        "an earlier layout holds rollback rows only"
     );
+}
+
+/// Builds before link merge state was written refuse any format above `LowerCaseHash`, so a
+/// staged state holding it has to be written above that, and a committed one must not be.
+#[test]
+fn only_a_state_holding_link_merge_state_is_written_in_a_format_earlier_builds_refuse() {
+    use lore_revision::state::StateData;
+    use lore_revision::state::StateFormat;
+
+    let committed = StateData::default();
+    assert_eq!(
+        committed.format_to_write(),
+        StateFormat::LowerCaseHash as u32
+    );
+
+    let staged = StateData::default().with_link_merge_hash(Hash::from([1u8; 32]));
+    assert_eq!(staged.format_to_write(), StateFormat::LinkMergeState as u32);
+}
+
+/// Writing no link merge rows clears the link merge state, so the state holds no merge rather than
+/// an empty list of rows.
+#[tokio::test]
+async fn writing_no_link_merge_rows_clears_the_link_merge_state() {
+    let repository = null_repository().await;
+    let state = State::new();
+    state
+        .serialize_link_merge_state(repository.clone(), &[LinkMergeEntry::default()])
+        .await
+        .expect("a row is written");
+    assert!(!state.link_merge_hash().is_zero());
+
+    state
+        .serialize_link_merge_state(repository.clone(), &[])
+        .await
+        .expect("no rows are written");
+    assert!(
+        state.link_merge_hash().is_zero(),
+        "no rows leave no link merge state"
+    );
+    assert!(
+        state
+            .deserialize_link_merge_state(repository)
+            .await
+            .expect("the rows read")
+            .is_empty()
+    );
+}
+
+/// A row is compared and carried by the branch it resolves to, read under its own parent's branch:
+/// an auto-following row on its parent's branch names that branch whether it stores it or zero,
+/// and a fixed row names its branch on any parent.
+#[test]
+fn link_rows_compare_and_carry_under_their_own_parent_branch() {
+    use lore_revision::state::LinkReference;
+
+    let main = BranchId::from([1; 16]);
+    let feature = BranchId::from([2; 16]);
+    let other = BranchId::from([3; 16]);
+    let row = |branch, flags: LinkFlags| LinkReference {
+        branch,
+        signature: Hash::from([9u8; 32]),
+        flags: flags.into(),
+        ..Default::default()
+    };
+
+    let tracking = row(BranchId::default(), LinkFlags::NoFlags);
+    assert!(row(main, LinkFlags::NoFlags).same_row(main, &tracking, feature));
+    assert!(row(feature, LinkFlags::NoFlags).same_row(
+        feature,
+        &row(main, LinkFlags::NoFlags),
+        main
+    ));
+    assert!(!row(other, LinkFlags::NoFlags).same_row(feature, &tracking, main));
+
+    let fixed = row(main, LinkFlags::DisableAutoFollow);
+    assert!(fixed.same_row(main, &fixed, feature));
+    assert!(!fixed.same_row(main, &row(main, LinkFlags::NoFlags), main));
+
+    assert_eq!(
+        row(feature, LinkFlags::NoFlags)
+            .carried(feature, main)
+            .branch(),
+        BranchId::default()
+    );
+    assert_eq!(
+        row(other, LinkFlags::NoFlags)
+            .carried(feature, main)
+            .branch(),
+        other
+    );
+    assert_eq!(fixed.carried(main, feature).branch(), main);
+}
+
+/// A link merge state that is short of the rows its header counts, or of a layout or a resolution
+/// this build doesn't know, is refused rather than read as fewer rows, which would let a commit through.
+#[test]
+fn link_merge_state_short_of_its_rows_or_of_an_unknown_layout_is_refused() {
+    use lore_revision::state::LinkMergeEntry;
+    use lore_revision::state::LinkMergeState;
+    use lore_revision::state::parse_link_merge_state;
+    use zerocopy::IntoBytes;
+
+    let header = |count, version| LinkMergeState { count, version }.as_bytes().to_vec();
+    let mut one_row = header(2, 1);
+    one_row.extend_from_slice(LinkMergeEntry::default().as_bytes());
+    assert!(parse_link_merge_state(&one_row).is_err());
+
+    assert!(parse_link_merge_state(&header(0, 2)).is_err());
+    assert!(parse_link_merge_state(&[0u8; 4]).is_err());
+
+    let mut unknown_resolution = header(1, 1);
+    unknown_resolution.extend_from_slice(
+        LinkMergeEntry {
+            resolution: 4,
+            ..Default::default()
+        }
+        .as_bytes(),
+    );
+    assert!(parse_link_merge_state(&unknown_resolution).is_err());
+
+    let mut two_rows = header(2, 1);
+    two_rows.extend_from_slice(LinkMergeEntry::default().as_bytes());
+    two_rows.extend_from_slice(LinkMergeEntry::default().as_bytes());
+    assert_eq!(
+        parse_link_merge_state(&two_rows)
+            .map(|rows| rows.len())
+            .ok(),
+        Some(2)
+    );
+}
+
+/// A recovery that asks the remote whether it holds an address as a list writes the fragment the
+/// remote describes to the local store as an entry without its payload, marked durable, so a later
+/// write of the list uploads nothing.
+#[tokio::test]
+async fn a_remote_list_check_writes_the_fragment_as_an_entry_without_its_payload() {
+    use lore_base::error::Disconnected;
+    use lore_revision::repository::RemoteState;
+    use lore_revision::test_util::context_with_state;
+    use lore_revision::util::request_tracker::StoreRequestTracker;
+    use lore_storage::Fragment;
+    use lore_storage::FragmentFlags;
+    use lore_storage::FragmentReference;
+    use lore_storage::store_types::StoreMatch;
+    use lore_transport::ProtocolError;
+
+    use crate::immutable::session_tests::under_execution_context;
+
+    let repository =
+        context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+    let size_payload = 2 * size_of::<FragmentReference>();
+    let payload = Bytes::from(vec![0x5au8; size_payload]);
+    let address = Address {
+        hash: hash::hash_slice(&payload),
+        context: Context::from([0x5au8; 16]),
+    };
+    let fragment = Fragment {
+        flags: FragmentFlags::PayloadFragmented.bits(),
+        size_payload: size_payload as u32,
+        size_content: 2 * 4096,
+    };
+    lore_storage::test_util::serve_remote(address, fragment, payload);
+
+    let tracker = StoreRequestTracker::default();
+    let lists = under_execution_context(|| {
+        lore_revision::state::remote_lists_fragments(&repository, address, &tracker)
+    })
+    .await;
+    let held = repository
+        .immutable_store()
+        .get_metadata(repository.id, address)
+        .await
+        .expect("the local metadata");
+
+    assert!(lists, "the remote lists the address");
+    assert_eq!(
+        (
+            held.match_made,
+            held.fragment.flags & FragmentFlags::PayloadStored.bits()
+        ),
+        (
+            StoreMatch::MatchFull,
+            FragmentFlags::PayloadStoredDurable.bits()
+        )
+    );
+}
+
+/// A link whose revision cannot be opened answers for nothing in its mount, so a mount holding a
+/// file, or a file standing in its place, holds what cannot be told from local work, and an
+/// absent or empty one holds nothing.
+#[tokio::test]
+async fn a_mount_whose_linked_revision_cannot_be_opened_holds_unknown_work() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let repository = working_tree_repository(dir.path()).await;
+    let mount = RelativePathBuf::new().push_and_freeze("vendor");
+    let mount_work = async || {
+        let operation = working_operation(&repository).await;
+        LORE_CONTEXT
+            .scope(
+                setup_test_execution(),
+                link_mount_work(&operation, None, &mount, false, |_| false),
+            )
+            .await
+            .expect("an unopened link still answers for its mount")
+    };
+
+    assert_eq!(
+        mount_work().await.unknown,
+        None,
+        "an absent mount holds nothing"
+    );
+
+    let file = write_working_file(&repository, "vendor", b"local").await;
+    assert_eq!(
+        mount_work()
+            .await
+            .unknown
+            .as_ref()
+            .map(RelativePath::as_str),
+        Some("vendor"),
+        "a file in place of the mount holds unknown work"
+    );
+    lore_io::IoDriver::global()
+        .remove_file(
+            file.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
+        )
+        .await
+        .expect("remove working file");
+
+    std::fs::create_dir_all(dir.path().join("vendor")).expect("create the mount");
+    assert_eq!(
+        mount_work().await.unknown,
+        None,
+        "an empty mount holds nothing"
+    );
+    write_working_file(&repository, "vendor/linked.txt", b"linked").await;
+    assert_eq!(
+        mount_work()
+            .await
+            .unknown
+            .as_ref()
+            .map(RelativePath::as_str),
+        Some("vendor"),
+        "a mount holding a file holds unknown work"
+    );
+}
+
+/// The files a refusal names are the first in path order, however the walk meets them, and a
+/// caller keeping every modified file has them all in that order.
+#[tokio::test]
+async fn a_mount_names_its_modified_files_in_path_order() {
+    let dir = lore_base::test_util::TempDir::new("lore-state-test-");
+    let repository = working_tree_repository(dir.path()).await;
+    let mount = RelativePathBuf::new().push_and_freeze("vendor");
+    let names = ["e.txt", "b.txt", "d.txt", "a.txt", "c.txt"];
+    let linked = State::new();
+    let vendor = add(
+        &linked,
+        &repository,
+        ROOT_NODE,
+        directory("vendor"),
+        "vendor",
+    )
+    .await;
+    std::fs::create_dir_all(dir.path().join("vendor")).expect("create the mount");
+    for name in names {
+        let node = Node {
+            flags: NodeFlags::File.bits(),
+            name_hash: hash::hash_string(name),
+            ..content_node(b"linked")
+        };
+        add(&linked, &repository, vendor, node, name).await;
+        write_working_file(&repository, &format!("vendor/{name}"), b"edited locally").await;
+    }
+    let mount_work = async |names_all| {
+        let operation = working_operation(&repository).await;
+        let work = LORE_CONTEXT
+            .scope(
+                setup_test_execution(),
+                link_mount_work(
+                    &operation,
+                    Some((vendor, (repository.clone(), linked.clone()))),
+                    &mount,
+                    names_all,
+                    |_| false,
+                ),
+            )
+            .await
+            .expect("the mount compares with its link");
+        let named: Vec<String> = work
+            .modified
+            .iter()
+            .map(|path| path.as_str().to_string())
+            .collect();
+        (named, work.modified_count)
+    };
+
+    assert_eq!(
+        mount_work(false).await,
+        (
+            vec![
+                "vendor/a.txt".to_string(),
+                "vendor/b.txt".to_string(),
+                "vendor/c.txt".to_string(),
+            ],
+            names.len()
+        ),
+        "a refusal holds only the first files by path"
+    );
+    let mut all: Vec<String> = names.iter().map(|name| format!("vendor/{name}")).collect();
+    all.sort();
+    assert_eq!(mount_work(true).await, (all, names.len()));
+}
+
+/// A committed save refuses the mounts of a repository it changed pinning different revisions.
+#[tokio::test]
+async fn a_committed_save_refuses_a_changed_repository_whose_mounts_disagree() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            use crate::helper::in_memory;
+
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            state
+                .link_update(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    Hash::from_u64(2),
+                    a,
+                )
+                .await
+                .expect("moving one mount");
+
+            let refused = state
+                .serialize_committed(repository, &in_memory::token())
+                .await
+                .expect_err("the mounts pin different revisions");
+
+            assert!(refused.is_link_pins_diverge(), "{refused:?}");
+        })
+        .await;
+}
+
+/// A committed save keeps a revision whose mounts of a repository it doesn't change disagree.
+#[tokio::test]
+async fn a_committed_save_keeps_the_disagreeing_mounts_of_a_repository_it_leaves() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            use crate::helper::in_memory;
+
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            state
+                .link_update(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    Hash::from_u64(2),
+                    a,
+                )
+                .await
+                .expect("moving one mount");
+            let diverged = state
+                .serialize(repository.clone(), &in_memory::token())
+                .await
+                .expect("a staged save takes mounts at different revisions");
+            let state = in_memory::revision_state(&repository, diverged).await;
+            let other = RepositoryId::from(uuid::Uuid::now_v7());
+            let node = in_memory::add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                in_memory::link_node("c", other, Hash::from_u64(3)),
+                "c",
+            )
+            .await;
+            state
+                .link_add(
+                    repository.clone(),
+                    other,
+                    BranchId::default(),
+                    Hash::from_u64(3),
+                    node,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering another repository");
+
+            let committed = state
+                .serialize_committed(repository.clone(), &in_memory::token())
+                .await
+                .expect("the disagreeing repository is not one the save changed");
+
+            let pins: Vec<_> = in_memory::revision_state(&repository, committed)
+                .await
+                .link_list(repository)
+                .await
+                .expect("reading the registry")
+                .into_iter()
+                .filter(|row| row.repository() == linked)
+                .map(|row| row.signature())
+                .collect();
+            assert_eq!(pins, [Hash::from_u64(2), Hash::from_u64(1)]);
+        })
+        .await;
+}
+
+/// A committed save keeps the disagreeing mounts of a repository it only removes a mount of.
+#[tokio::test]
+async fn a_committed_save_keeps_the_disagreeing_mounts_of_a_repository_it_removes_a_mount_of() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            use crate::helper::in_memory;
+
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            let c = in_memory::add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                in_memory::link_node("c", linked, Hash::from_u64(1)),
+                "c",
+            )
+            .await;
+            state
+                .link_add(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    Hash::from_u64(1),
+                    c,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering a third mount");
+            state
+                .link_update(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    Hash::from_u64(2),
+                    a,
+                )
+                .await
+                .expect("moving one mount");
+            let diverged = state
+                .serialize(repository.clone(), &in_memory::token())
+                .await
+                .expect("a staged save takes mounts at different revisions");
+            let state = in_memory::revision_state(&repository, diverged).await;
+            state
+                .link_remove(repository.clone(), linked, c)
+                .await
+                .expect("removing the third mount");
+            in_memory::add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                in_memory::file("x.txt"),
+                "x.txt",
+            )
+            .await;
+
+            let committed = state
+                .serialize_committed(repository.clone(), &in_memory::token())
+                .await
+                .expect("removing a mount changes none of the others");
+
+            let pins: Vec<_> = in_memory::revision_state(&repository, committed)
+                .await
+                .link_list(repository)
+                .await
+                .expect("reading the registry")
+                .into_iter()
+                .map(|row| row.signature())
+                .collect();
+            assert_eq!(pins, [Hash::from_u64(2), Hash::from_u64(1)]);
+        })
+        .await;
+}
+
+/// A staged save takes the mounts of a repository at different revisions, and refuses them on
+/// different branches or with different flags.
+#[tokio::test]
+async fn a_staged_save_refuses_mounts_of_a_repository_on_different_branches_or_flags() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            use crate::helper::in_memory;
+
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let save = async |state: &Arc<State>| {
+                state
+                    .serialize(repository.clone(), &in_memory::token())
+                    .await
+            };
+
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            state
+                .link_update(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    Hash::from_u64(2),
+                    a,
+                )
+                .await
+                .expect("moving one mount");
+            save(&state)
+                .await
+                .expect("a staged save takes mounts at different revisions");
+
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            state
+                .link_update(
+                    repository.clone(),
+                    linked,
+                    Context::from(uuid::Uuid::now_v7()),
+                    Hash::from_u64(1),
+                    a,
+                )
+                .await
+                .expect("moving one mount to another branch");
+            let refused = save(&state)
+                .await
+                .expect_err("the mounts follow other branches");
+            assert!(refused.is_link_pins_diverge(), "{refused:?}");
+
+            let (state, linked, a, _) =
+                in_memory::linking_twice(&repository, Hash::from_u64(1)).await;
+            let row = state
+                .link_find(repository.clone(), linked, a)
+                .await
+                .expect("finding the mount's row");
+            state
+                .link_replace(
+                    repository.clone(),
+                    LinkReference {
+                        flags: LinkFlags::DisableAutoFollow.bits(),
+                        ..row
+                    },
+                )
+                .await
+                .expect("changing one mount's flags");
+            let refused = save(&state)
+                .await
+                .expect_err("the mounts carry other flags");
+            assert!(refused.is_link_pins_diverge(), "{refused:?}");
+        })
+        .await;
 }

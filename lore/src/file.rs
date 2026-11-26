@@ -7,6 +7,9 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::file;
+use lore_revision::file::audit::AuditOptions;
+pub use lore_revision::file::audit::DEFAULT_MAX_REVISIONS;
+use lore_revision::file::audit::Whitespace;
 pub use lore_revision::file::diff::DEFAULT_CONTEXT_LINES;
 use lore_revision::file::dump::DumpError;
 use lore_revision::file::hash::HashError;
@@ -42,7 +45,9 @@ use crate::util::convert_user_paths;
 
 /// Arguments for retrieving file information (size, hash, staged status).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(info_local)]
 pub struct LoreFileInfoArgs {
     /// Array of paths
@@ -75,12 +80,12 @@ pub struct LoreFileInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::FileInfo`](crate::interface::LoreEvent::FileInfo) | Emitted for each file with its metadata (size, hash, staged status, etc.), including local/filtered info when requested |
-pub async fn info(
+pub fn info(
     globals: LoreGlobalArgs,
     args: LoreFileInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, info_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, info_local)
 }
 
 fn info_local(
@@ -111,7 +116,9 @@ async fn info_impl(
 
 /// Arguments for diffing files between two revisions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(diff_local)]
 pub struct LoreFileDiffArgs {
     /// An array of paths
@@ -150,12 +157,12 @@ pub struct LoreFileDiffArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::FileDiff`](crate::interface::LoreEvent::FileDiff) | Emitted for each file that differs between the two revisions |
-pub async fn diff(
+pub fn diff(
     globals: LoreGlobalArgs,
     args: LoreFileDiffArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, diff_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, diff_local)
 }
 
 fn diff_local(
@@ -194,7 +201,9 @@ async fn diff_impl(
 
 /// Arguments for clearing all metadata associated with a file.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(metadata_clear_local)]
 pub struct LoreFileMetadataClearArgs {
     /// Which file to clear metadata for
@@ -221,12 +230,12 @@ pub struct LoreFileMetadataClearArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::MetadataClearFile`](crate::interface::LoreEvent::MetadataClearFile) | Emitted when metadata has been cleared for the file |
-pub async fn metadata_clear(
+pub fn metadata_clear(
     globals: LoreGlobalArgs,
     args: LoreFileMetadataClearArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_clear_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_clear_local)
 }
 
 fn metadata_clear_local(
@@ -247,7 +256,9 @@ fn metadata_clear_local(
 
 /// Arguments for retrieving a single metadata value for a file by key and revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(metadata_get_local)]
 pub struct LoreFileMetadataGetArgs {
     /// Revision to get metadata for
@@ -278,12 +289,12 @@ pub struct LoreFileMetadataGetArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for the requested metadata key/value pair |
-pub async fn metadata_get(
+pub fn metadata_get(
     globals: LoreGlobalArgs,
     args: LoreFileMetadataGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_get_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_get_local)
 }
 
 fn metadata_get_local(
@@ -309,7 +320,9 @@ fn metadata_get_local(
 
 /// Arguments for listing all metadata key/value pairs for a file at a revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(metadata_list_local)]
 pub struct LoreFileMetadataListArgs {
     /// What to list metadata for
@@ -338,12 +351,12 @@ pub struct LoreFileMetadataListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata key/value pair associated with the file |
-pub async fn metadata_list(
+pub fn metadata_list(
     globals: LoreGlobalArgs,
     args: LoreFileMetadataListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_list_local)
 }
 
 fn metadata_list_local(
@@ -364,7 +377,9 @@ fn metadata_list_local(
 
 /// Arguments for setting metadata key/value pairs on one or more files.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(metadata_set_local)]
 pub struct LoreFileMetadataSetArgs {
     /// An array of paths
@@ -393,12 +408,12 @@ pub struct LoreFileMetadataSetArgs {
 /// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
-pub async fn metadata_set(
+pub fn metadata_set(
     globals: LoreGlobalArgs,
     args: LoreFileMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_set_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_set_local)
 }
 
 fn metadata_set_local(
@@ -471,14 +486,17 @@ async fn metadata_set_impl(
 
 /// Arguments for staging one or more files for the next commit.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(stage_local)]
 pub struct LoreFileStageArgs {
     /// An array of paths
     pub paths: LoreArray<LoreString>,
     /// Case change handling, 0 = error, 1 = update filesystem (keep), 2 = update repository (rename)
     pub case_change: u32,
-    /// Force a recursive filesystem scan of directory paths (no effect on file paths)
+    /// Walk directory paths recursively on the filesystem, as the global `force` argument also
+    /// does (no effect on file paths)
     pub scan: u8,
 }
 
@@ -501,6 +519,11 @@ pub struct LoreFileStageArgs {
 ///   and the dirty flags are disregarded. Use this when you need a full
 ///   reconciliation (e.g. after operations that may have changed files
 ///   without going through the dirty-tracking path).
+/// - **Forced directory paths**, with the global `force` argument, are walked
+///   as with [`scan`](LoreFileStageArgs::scan), past the ignore file and the
+///   view: everything in the directory but Lore's own entries is staged,
+///   unchanged files included, with the deletion of what the working tree no
+///   longer holds, except what the view leaves out.
 ///
 /// # Events
 ///
@@ -525,12 +548,12 @@ pub struct LoreFileStageArgs {
 /// | [`LoreEvent::FileStageRevision`](crate::interface::LoreEvent::FileStageRevision) | Emitted with the resulting staged revision, or when no changes are found |
 /// | [`LoreEvent::FileStageFile`](crate::interface::LoreEvent::FileStageFile) | Emitted for each file staged or staged for deletion |
 /// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by filters |
-pub async fn stage(
+pub fn stage(
     globals: LoreGlobalArgs,
     args: LoreFileStageArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, stage_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, stage_local)
 }
 
 fn stage_local(
@@ -559,7 +582,9 @@ fn stage_local(
 
 /// Arguments for staging one or more files as merge resolutions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(stage_merge_local)]
 pub struct LoreFileStageMergeArgs {
     /// Paths to files to stage as merge
@@ -589,12 +614,12 @@ pub struct LoreFileStageMergeArgs {
 /// | [`LoreEvent::FileStageProgress`](crate::interface::LoreEvent::FileStageProgress) | Emitted periodically during merge-staging |
 /// | [`LoreEvent::FileStageRevision`](crate::interface::LoreEvent::FileStageRevision) | Emitted with the resulting staged revision |
 /// | [`LoreEvent::FileStageFile`](crate::interface::LoreEvent::FileStageFile) | Emitted for each file staged |
-pub async fn stage_merge(
+pub fn stage_merge(
     globals: LoreGlobalArgs,
     args: LoreFileStageMergeArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, stage_merge_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, stage_merge_local)
 }
 
 fn stage_merge_local(
@@ -615,7 +640,9 @@ fn stage_merge_local(
 
 /// Arguments for staging a file move from one path to another.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(stage_move_local)]
 pub struct LoreFileStageMoveArgs {
     /// Original path of file
@@ -647,12 +674,12 @@ pub struct LoreFileStageMoveArgs {
 /// | [`LoreEvent::FileStageEnd`](crate::interface::LoreEvent::FileStageEnd) | Emitted when move staging completes |
 /// | [`LoreEvent::FileStageRevision`](crate::interface::LoreEvent::FileStageRevision) | Emitted with the resulting staged revision |
 /// | [`LoreEvent::FileStageFile`](crate::interface::LoreEvent::FileStageFile) | Emitted for deletion of the original path and for the new path being staged |
-pub async fn stage_move(
+pub fn stage_move(
     globals: LoreGlobalArgs,
     args: LoreFileStageMoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, stage_move_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, stage_move_local)
 }
 
 fn stage_move_local(
@@ -685,19 +712,21 @@ fn stage_move_local(
 
 /// Arguments for marking files dirty in the staged state (add/modify/delete inferred from filesystem).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(dirty_local)]
 pub struct LoreFileDirtyArgs {
     /// An array of paths
     pub paths: LoreArray<LoreString>,
 }
 
-pub async fn dirty(
+pub fn dirty(
     globals: LoreGlobalArgs,
     args: LoreFileDirtyArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, dirty_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, dirty_local)
 }
 
 fn dirty_local(
@@ -716,7 +745,9 @@ fn dirty_local(
 
 /// Arguments for marking a file dirty-moved (relocates the staged node, no filesystem checks).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(dirty_move_local)]
 pub struct LoreFileDirtyMoveArgs {
     /// Original path of file
@@ -725,12 +756,12 @@ pub struct LoreFileDirtyMoveArgs {
     pub to_path: LoreString,
 }
 
-pub async fn dirty_move(
+pub fn dirty_move(
     globals: LoreGlobalArgs,
     args: LoreFileDirtyMoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, dirty_move_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, dirty_move_local)
 }
 
 fn dirty_move_local(
@@ -753,7 +784,9 @@ fn dirty_move_local(
 
 /// Arguments for marking a file dirty-copied (creates a new staged destination node, no filesystem checks).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(dirty_copy_local)]
 pub struct LoreFileDirtyCopyArgs {
     /// Source path of file
@@ -762,12 +795,12 @@ pub struct LoreFileDirtyCopyArgs {
     pub to_path: LoreString,
 }
 
-pub async fn dirty_copy(
+pub fn dirty_copy(
     globals: LoreGlobalArgs,
     args: LoreFileDirtyCopyArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, dirty_copy_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, dirty_copy_local)
 }
 
 fn dirty_copy_local(
@@ -792,7 +825,9 @@ fn dirty_copy_local(
 
 /// Arguments for removing one or more files from the staged changeset.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(unstage_local)]
 pub struct LoreFileUnstageArgs {
     /// An array of paths
@@ -823,12 +858,12 @@ pub struct LoreFileUnstageArgs {
 /// | [`LoreEvent::FileUnstageEnd`](crate::interface::LoreEvent::FileUnstageEnd) | Emitted when unstaging completes |
 /// | [`LoreEvent::FileUnstageRevision`](crate::interface::LoreEvent::FileUnstageRevision) | Emitted with the resulting staged revision |
 /// | [`LoreEvent::FileUnstageFile`](crate::interface::LoreEvent::FileUnstageFile) | Emitted for each file that was unstaged |
-pub async fn unstage(
+pub fn unstage(
     globals: LoreGlobalArgs,
     args: LoreFileUnstageArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, unstage_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, unstage_local)
 }
 
 fn unstage_local(
@@ -842,26 +877,31 @@ fn unstage_local(
         args,
         unstage,
         move |repository, token, args| async move {
-            let options = UnstageOptions { single_node: false };
+            let options = UnstageOptions::default();
             file::unstage::unstage(repository, &token, args.paths, options).await
         },
     )
 }
 
-/// Arguments for resetting files to a revision, optionally purging untracked files.
+/// Arguments for resetting files to a revision, optionally deleting what the revision does not
+/// hold.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(reset_local)]
 pub struct LoreFileResetArgs {
     /// Pointer to an array of paths
     pub paths: LoreArray<LoreString>,
     /// Revision to reset files into
     pub revision: LoreString,
-    /// Purge untracked files
+    /// Delete what the revision does not hold within the view: untracked files, whatever the
+    /// ignore file says, and files the view excludes. Nested repositories stay
     pub purge: u8,
 }
 
-/// Resets one or more files to a specified revision, optionally purging untracked files.
+/// Resets one or more files to a specified revision, optionally deleting what the revision does
+/// not hold.
 ///
 /// # Events
 ///
@@ -887,12 +927,12 @@ pub struct LoreFileResetArgs {
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted during file realization |
 /// | [`LoreEvent::RevisionSyncFile`](crate::interface::LoreEvent::RevisionSyncFile) | Emitted for each file materialized |
 /// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by filters |
-pub async fn reset(
+pub fn reset(
     globals: LoreGlobalArgs,
     args: LoreFileResetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, reset_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, reset_local)
 }
 
 fn reset_local(
@@ -918,14 +958,17 @@ fn reset_local(
 
 /// Arguments for resetting files to the last merged revision on a branch.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(reset_to_last_merged_local)]
 pub struct LoreFileResetToLastMergedArgs {
     /// Pointer to an array of paths
     pub paths: LoreArray<LoreString>,
     /// Branch whose last merged revision to reset to
     pub branch: LoreString,
-    /// Purge untracked files
+    /// Delete what the revision does not hold within the view: untracked files, whatever the
+    /// ignore file says, and files the view excludes. Nested repositories stay
     pub purge: u8,
     /// Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
     pub merge_side: u32,
@@ -956,12 +999,12 @@ pub struct LoreFileResetToLastMergedArgs {
 /// | [`LoreEvent::FileResetFile`](crate::interface::LoreEvent::FileResetFile) | Emitted for each file that was reset |
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted during file realization |
 /// | [`LoreEvent::RevisionSyncFile`](crate::interface::LoreEvent::RevisionSyncFile) | Emitted for each file materialized |
-pub async fn reset_to_last_merged(
+pub fn reset_to_last_merged(
     globals: LoreGlobalArgs,
     args: LoreFileResetToLastMergedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, reset_to_last_merged_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, reset_to_last_merged_local)
 }
 
 fn reset_to_last_merged_local(
@@ -993,7 +1036,9 @@ fn reset_to_last_merged_local(
 
 /// Arguments for writing a file to a destination by path/revision or by address.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(write_local)]
 pub struct LoreFileWriteArgs {
     /// Address of data to write; takes precedence over `path` when non-empty
@@ -1027,12 +1072,12 @@ pub struct LoreFileWriteArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::FileWrite`](crate::interface::LoreEvent::FileWrite) | Emitted when the file has been successfully written to the repository |
 /// | [`LoreEvent::FileWrite`](crate::interface::LoreEvent::FileWrite) | Emitted when writing an address-based file |
-pub async fn write(
+pub fn write(
     globals: LoreGlobalArgs,
     args: LoreFileWriteArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, write_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, write_local)
 }
 
 async fn write_local(
@@ -1105,7 +1150,9 @@ async fn write_impl(
 
 /// Arguments for permanently removing a file or address from repository history.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(obliterate_local)]
 pub struct LoreFileObliterateArgs {
     /// Address of data to obliterate; takes precedence over `path` when non-empty
@@ -1134,12 +1181,12 @@ pub struct LoreFileObliterateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::FileObliterate`](crate::interface::LoreEvent::FileObliterate) | Emitted for each file permanently removed from repository history |
-pub async fn obliterate(
+pub fn obliterate(
     globals: LoreGlobalArgs,
     args: LoreFileObliterateArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, obliterate_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, obliterate_local)
 }
 
 fn obliterate_local(
@@ -1180,7 +1227,9 @@ async fn obliterate_impl(
 
 /// Arguments for dumping the binary content of a file by path or address.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(dump_local)]
 pub struct LoreFileDumpArgs {
     /// Address of data to dump; takes precedence over `path` when non-empty
@@ -1209,12 +1258,12 @@ pub struct LoreFileDumpArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::FileDump`](crate::interface::LoreEvent::FileDump) | Emitted with binary content of the requested file |
-pub async fn dump(
+pub fn dump(
     globals: LoreGlobalArgs,
     args: LoreFileDumpArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, dump_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, dump_local)
 }
 
 fn dump_local(
@@ -1245,7 +1294,9 @@ async fn dump_impl(
 
 /// Arguments for computing the hash and size of one or more files.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(hash_local)]
 pub struct LoreFileHashArgs {
     /// An array of paths
@@ -1272,12 +1323,12 @@ pub struct LoreFileHashArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::FileHash`](crate::interface::LoreEvent::FileHash) | Emitted with the computed hash and size of the specified file |
-pub async fn hash(
+pub fn hash(
     globals: LoreGlobalArgs,
     args: LoreFileHashArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, hash_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, hash_local)
 }
 
 fn hash_local(
@@ -1300,7 +1351,9 @@ async fn hash_impl(
 
 /// Arguments for retrieving the revision history of a specific file.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(history_local)]
 pub struct LoreFileHistoryArgs {
     /// A path to a file
@@ -1338,12 +1391,12 @@ pub struct LoreFileHistoryArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::FileHistory`](crate::interface::LoreEvent::FileHistory) | Emitted for each revision in which the file was modified |
-pub async fn history(
+pub fn history(
     globals: LoreGlobalArgs,
     args: LoreFileHistoryArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, history_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, history_local)
 }
 
 fn history_local(
@@ -1363,4 +1416,97 @@ fn history_local(
 
         file::history::history(repository, path, options)
     })
+}
+
+/// Arguments for attributing the lines of a file to the revisions that last changed them.
+#[repr(C)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
+#[handler(audit_local)]
+pub struct LoreFileAuditArgs {
+    /// A path to a file
+    pub path: LoreString,
+
+    /// Revision to read the file at, in any form a revision specifier takes: a
+    /// whole hash signature, `[branch]@<number>`, `[branch]@LATEST` or
+    /// `<branch>@<hash>`, optionally followed by `~<count>` to step back that many
+    /// parents. Empty reads the revision the instance is synced to and accounts for
+    /// the file on disk
+    pub revision: LoreString,
+
+    /// Revisions of the file's predecessor chain to walk, `0` for the default of
+    /// 100 and `UINT32_MAX` for the whole chain. Zero means the default rather
+    /// than no limit, as `lore_file_history_args_t::length` does, so a
+    /// zero-initialized value is bounded
+    pub max_revisions: u32,
+
+    /// Count a line that differs only in trailing whitespace as changed.
+    /// Trailing whitespace is ignored by default, so the field is stated as the
+    /// refusal and a zero-initialized value carries the default
+    pub no_ignore_space_at_eol: u8,
+
+    /// Collapse runs of internal whitespace to a single space before comparing,
+    /// which leaves a reindented line with the revision that wrote its text
+    pub ignore_space_change: u8,
+}
+
+/// Attributes each line of a file to the revision that last changed it.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## File Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::FileAudit`](crate::interface::LoreEvent::FileAudit) | Emitted for each range of consecutive lines sharing an attribution |
+pub fn audit(
+    globals: LoreGlobalArgs,
+    args: LoreFileAuditArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, audit_local)
+}
+
+fn audit_local(
+    globals: LoreGlobalArgs,
+    args: LoreFileAuditArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, audit, move |repository, args| {
+        let path = args.path.to_string();
+
+        let options = AuditOptions {
+            revision: args.revision.into(),
+            max_revisions: audit_bound(args.max_revisions),
+            whitespace: Whitespace {
+                ignore_space_at_eol: args.no_ignore_space_at_eol == 0,
+                ignore_space_change: args.ignore_space_change != 0,
+            },
+        };
+
+        file::audit::audit(repository, path, options)
+    })
+}
+
+/// The bound an audit walk runs under: none where the largest bound asks for
+/// the whole chain, and the default where the caller named no number.
+#[lore_macro::test_pub]
+fn audit_bound(max_revisions: u32) -> Option<u32> {
+    match max_revisions {
+        0 => Some(DEFAULT_MAX_REVISIONS),
+        u32::MAX => None,
+        _ => Some(max_revisions),
+    }
 }

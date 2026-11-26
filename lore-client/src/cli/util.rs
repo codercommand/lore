@@ -21,11 +21,13 @@ use lore::interface::LoreRevisionResolveEventData;
 use lore::interface::LoreRevisionResolveTarget;
 use lore::interface::LoreRevisionSyncProgressEventData;
 use lore::interface::LoreString;
+use lore_base::timestamp;
 use parking_lot::Mutex;
 
 use crate::eprintln;
 use crate::println;
 use crate::styling::CommonStyles;
+use crate::styling::LogStyles;
 
 /// Discover the repository root by walking up from the process working
 /// directory, when `--repository` named none.
@@ -151,6 +153,15 @@ pub fn convert_to_lore_string_vec(paths: &[String]) -> Vec<LoreString> {
     paths.iter().map(LoreString::from).collect()
 }
 
+pub fn split_path_messages(values: &[String]) -> (Vec<LoreString>, Vec<LoreString>) {
+    values
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[path, message]| (LoreString::from(path), LoreString::from(message)))
+        .unzip()
+}
+
 pub fn convert_paths_and_targets(
     paths: &Option<Vec<String>>,
     targets: &Option<String>,
@@ -253,28 +264,7 @@ pub fn handle_revision_resolve_event(event: &LoreRevisionResolveEventData) {
     }
 }
 
-/// A byte count in the largest unit that leaves it above one.
-///
-/// A raw byte count renders as an integer, a fraction of a byte saying nothing.
-/// Only the scaled units carry decimals, the remainder there distinguishing
-/// 1.02 MiB from 1.98 MiB.
-pub fn format_bytes_to_string(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-
-    let (converted, unit) = if bytes > GIB {
-        ((bytes / MIB) as f64 / 1024.0, "GiB")
-    } else if bytes > MIB {
-        ((bytes / KIB) as f64 / 1024.0, "MiB")
-    } else if bytes > KIB {
-        (bytes as f64 / 1024.0, "KiB")
-    } else {
-        return format!("{bytes} bytes");
-    };
-
-    format!("{converted:.2} {unit}")
-}
+pub use lore_base::units::format_bytes_to_string;
 
 pub fn progress_info_display(progress: &LoreRevisionSyncProgressEventData) -> String {
     let bytes_info = if progress.bytes_update_total > 0 {
@@ -327,6 +317,13 @@ pub fn merge_result_display(progress: &LoreRevisionSyncProgressEventData) -> Str
     )
 }
 
+/// `millis`, read as signed milliseconds from the Unix epoch, as an RFC 2822 date and time in
+/// UTC, such as `Sun, 22 Nov 2026 12:45:20 +0000`, or `None` for a time outside the years 0 to
+/// 9999.
+pub fn rfc2822_display(millis: u64) -> Option<String> {
+    timestamp::from_unix_millis(millis as i64).and_then(timestamp::rfc2822)
+}
+
 /// The termination signals, registered separately from the wait on them.
 ///
 /// A signal ends the process outright until a handler is in place, so a caller
@@ -340,6 +337,11 @@ pub struct TerminationSignals {
     terminate: tokio::signal::unix::Signal,
     #[cfg(windows)]
     ctrl_c: tokio::signal::windows::CtrlC,
+    // What a process started in a group of its own can be sent: a console delivers
+    // Ctrl-C to a group only when it is the one the console runs, so Ctrl-Break is
+    // the signal a supervisor can use to ask such a process to stop.
+    #[cfg(windows)]
+    ctrl_break: tokio::signal::windows::CtrlBreak,
 }
 
 impl TerminationSignals {
@@ -359,6 +361,7 @@ impl TerminationSignals {
         {
             Ok(Self {
                 ctrl_c: tokio::signal::windows::ctrl_c()?,
+                ctrl_break: tokio::signal::windows::ctrl_break()?,
             })
         }
         // No signals to register, matching `remote::network::stub`, which reports
@@ -381,7 +384,10 @@ impl TerminationSignals {
 
         #[cfg(windows)]
         {
-            self.ctrl_c.recv().await;
+            tokio::select! {
+                _ = self.ctrl_c.recv() => {},
+                _ = self.ctrl_break.recv() => {},
+            }
             println!();
         }
 
@@ -448,5 +454,22 @@ pub fn read_line_with_editing(buf: &mut String) -> std::io::Result<usize> {
     #[cfg(not(unix))]
     {
         std::io::stdin().read_line(buf)
+    }
+}
+
+/// Prints why the remote latest revision could not be read, followed by `consequence`.
+pub fn print_remote_unread(unauthenticated: bool, consequence: &str) {
+    let reason = if unauthenticated {
+        "Not logged in to the remote"
+    } else {
+        "Could not read the remote revision (not authorized or unavailable)"
+    };
+    println!(
+        "{}{reason}{consequence}{}",
+        LogStyles::WARNING,
+        anstyle::Reset
+    );
+    if unauthenticated {
+        println!("Log in with `lore auth login`");
     }
 }

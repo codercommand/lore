@@ -12,6 +12,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::no_link_traversal;
 use lore_revision::util;
 use lore_telemetry::InstrumentProvider;
 use tonic::Request;
@@ -24,17 +25,20 @@ use tracing::warn;
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use super::repository_get::repository_load_name;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::check_request_cancelled;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_is_service_account;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
-use crate::grpc::handlers::repository_create::repository_create_auth_resource;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::none_or_status;
+use crate::grpc::requested_repository_id;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -56,7 +60,7 @@ use crate::util::setup_execution;
 )]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
@@ -64,12 +68,14 @@ pub async fn handler(
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
     let user_id = get_user_id(request.extensions());
+    let is_service_account = get_is_service_account(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
     let caller_context = CallerContext {
         repository_id: RepositoryId::default(), // RepositoryCreate has no pre-existing repository
         user_id,
+        is_service_account,
         correlation_id,
         authorization,
     };
@@ -82,7 +88,7 @@ pub async fn handler(
         repository_create_implementation(
             req,
             caller_context,
-            auth_url,
+            registry,
             immutable_store,
             mutable_store,
             hook_dispatcher,
@@ -116,7 +122,7 @@ async fn forward_repository_create(
 pub async fn repository_create_implementation(
     req: RepositoryCreateRequest,
     caller_context: CallerContext,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
@@ -126,7 +132,7 @@ pub async fn repository_create_implementation(
     let correlation_id = caller_context.correlation_id;
     let authorization = caller_context.authorization;
 
-    let id: RepositoryId = Context::from(req.id).into();
+    let id = requested_repository_id(&req.id)?;
     let name = req.name;
     let description = req.description;
     let default_branch_id: Context = req.default_branch_id.into();
@@ -143,6 +149,7 @@ pub async fn repository_create_implementation(
         immutable_store,
         mutable_store,
         id,
+        no_link_traversal(),
     ));
     Span::current().record("requested_repo_id", id.to_string());
 
@@ -157,6 +164,7 @@ pub async fn repository_create_implementation(
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::RepositoryCreate, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
 
             let (created_metadata, metadata_hash) = repository_create_inner(
@@ -167,7 +175,7 @@ pub async fn repository_create_implementation(
                 &default_branch_name,
                 &creator,
                 created,
-                auth_url,
+                registry,
                 authorization,
             )
             .await
@@ -230,7 +238,7 @@ async fn repository_create_inner(
     default_branch_name: &str,
     creator: &str,
     created: u64,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     authorization: Option<String>,
 ) -> Result<(RepositoryMetadata, lore_storage::Hash), Status> {
     validate_create_input(name, description, default_branch_name, creator)?;
@@ -301,10 +309,8 @@ async fn repository_create_inner(
         };
     }
 
-    if let Some(auth_url) = auth_url {
-        let client = Box::new(crate::authnz::rebac::grpc_get_rebac_client(auth_url).await?);
-        repository_create_auth_resource(client, authorization, repository.id, name).await?;
-    }
+    check_request_cancelled()?;
+    registry.add(authorization, repository.id, name).await?;
 
     let metadata = RepositoryMetadata {
         name: name.to_string(),

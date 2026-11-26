@@ -17,6 +17,7 @@ use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::store::event::LoreStorageMutableListEntryEventData;
@@ -28,13 +29,20 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
-use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One `mutable_list` item — the `(partition, key_type)` to list.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageMutableListItem {
     /// Caller-chosen id echoed back on every entry and the terminal event
@@ -47,7 +55,16 @@ pub struct LoreStorageMutableListItem {
 
 /// Arguments for `lore_storage_mutable_list`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(mutable_list_local)]
 pub struct LoreStorageMutableListArgs {
     /// Open storage handle
@@ -57,12 +74,12 @@ pub struct LoreStorageMutableListArgs {
 }
 
 /// List one or more partitions' mutable key-value pairs.
-pub async fn mutable_list(
+pub fn mutable_list(
     globals: LoreGlobalArgs,
     args: LoreStorageMutableListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, mutable_list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, mutable_list_local)
 }
 
 async fn mutable_list_local(
@@ -139,7 +156,7 @@ fn emit_complete(
 ) -> Result<(), StorageError> {
     LoreEvent::StorageMutableListItemComplete(LoreStorageMutableListItemCompleteEventData {
         id: item.id,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result

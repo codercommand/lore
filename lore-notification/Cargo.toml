@@ -5,7 +5,6 @@ version.workspace = true
 publish = false
 
 [lib]
-# The crate holds no unit tests. Set this back to build a harness for them.
 test = false
 
 [dependencies]
@@ -14,11 +13,17 @@ tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 lore-base = { workspace = true }
-lore-storage = { workspace = true }
 lore-revision = { workspace = true }
 lore-transport = { workspace = true }
 lore-error-set = { workspace = true }
+lore-macro = { workspace = true }
 lore-proto = { workspace = true }
+
+[features]
+test-util = []
+
+[dev-dependencies]
+lore-notification = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

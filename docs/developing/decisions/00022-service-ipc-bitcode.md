@@ -48,6 +48,23 @@ it in place of its own, so a call finds the configuration and credentials it wou
 the caller's process. What the service caches from a token store, the tokens and the connections
 and authorizations obtained with them, it keys by that store.
 
+**Amended 2026-11-09:** a call also carries `LORE_AUTH_STORE`, unset included, so a call whose caller
+chose no store uses the secure store rather than the one the service's own environment names. The
+service keys a cached encryption key by the token store and the store that keeps the key.
+
+**Amended 2026-11-13:** [ADR-00025](00025-service-version-compatibility.md) replaces message protocol
+version 2 with version 3, under which a client and the service compare the schemas of their messages
+before a call, so two builds whose messages differ refuse each other.
+
+**Amended 2026-11-23:** an event crosses as its variant's position in the declaration of
+`LoreEvent`, followed by its data, encoded with the encoder of the data's own type
+(`lore_base::encoding`, derived by `lore_macro::PositionBitcode`). The position takes one byte below
+128 and more above it, so an event enum of fewer than 2^32 variants encodes, where bitcode's derive
+allows 256, and encoding or decoding an event builds no encoder or decoder for the data of the other
+variants. A variant added last keeps every other variant's encoding. The derive gives the enum a
+schema ([ADR-00025](00025-service-version-compatibility.md)) that names this encoding, so a build
+that encodes events by position and one that encodes them by bitcode's derive refuse each other.
+
 ### Consequences
 
 - Good, because every call relays, including the storage calls that carry buffers.

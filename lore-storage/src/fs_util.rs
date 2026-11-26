@@ -2,29 +2,19 @@
 // SPDX-License-Identifier: MIT
 use std::path::Path;
 
-#[cfg(not(target_family = "windows"))]
-pub fn sync_dir<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let dir = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY)
-        .open(path.as_ref())?;
-    let fd = dir.as_raw_fd();
-    // SAFETY: Safe to call libc function to flush directory changes
-    let result = unsafe { libc::fsync(fd) };
-    if result == -1 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+/// Whether something is at `path`. Only its absence says no: a stat that fails for another
+/// reason, as on a transient I/O error, is reported, so that a directory that cannot be read is
+/// never taken for one never written.
+pub(crate) async fn exists(path: &Path) -> std::io::Result<bool> {
+    #[cfg(feature = "test-util")]
+    if crate::test_util::take_directory_stat_failure() {
+        return Err(std::io::Error::other("directory stat failed as asked"));
     }
-}
-
-#[cfg(target_family = "windows")]
-pub fn sync_dir<P: AsRef<Path>>(_path: P) -> std::io::Result<()> {
-    // No-op on Windows, there is no API to flush a directory
-    Ok(())
+    match lore_io::IoDriver::global().stat(path).await {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {

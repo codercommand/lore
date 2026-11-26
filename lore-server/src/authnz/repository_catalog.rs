@@ -13,9 +13,12 @@ use lore_base::types::Context;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::LookupUserPermissionsRequest;
 use lore_proto::auth::LookupUserPermissionsResponse;
+use lore_proto::lore::user::v1::RepositoryListRequest;
+use lore_proto::lore::user::v1::RepositoryListResponse;
 use lore_revision::lore_debug;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use tokio_stream::StreamExt;
@@ -25,6 +28,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::auth::grpc_get_auth_client;
+use super::auth::grpc_get_repository_registry_client;
 use super::common::create_request_with_authorization;
 use super::repository_authorizer::VerifiedToken;
 use super::repository_authorizer::bearer_header;
@@ -50,6 +54,17 @@ pub trait RepositoryCatalog: Send + Sync {
         page_size: Option<u32>,
         page_token: Option<&str>,
     ) -> Result<(Vec<RepositoryId>, Option<String>), Status>;
+}
+
+/// The most partitions one listing collects. The remote catalogs' answers
+/// are sized by the upstream alone, so this bounds the memory a listing
+/// holds; a larger answer fails with `ResourceExhausted`.
+pub const MAX_LISTED_REPOSITORIES: usize = 100_000;
+
+fn too_many_repositories() -> Status {
+    Status::resource_exhausted(format!(
+        "Repository catalog listed more than {MAX_LISTED_REPOSITORIES} repositories"
+    ))
 }
 
 impl dyn RepositoryCatalog {
@@ -85,6 +100,9 @@ impl dyn RepositoryCatalog {
                 )
             })??;
             repositories.extend(page);
+            if repositories.len() > MAX_LISTED_REPOSITORIES {
+                return Err(too_many_repositories());
+            }
             match next {
                 Some(next) => {
                     if !seen.insert(next.clone()) {
@@ -127,6 +145,7 @@ impl BaselineRepositoryCatalog {
             self.immutable_store.clone(),
             self.mutable_store.clone(),
             Context::default().into(),
+            no_link_traversal(),
         ));
         let mut stream = repository::list_local(repository)
             .await
@@ -265,6 +284,77 @@ fn repositories_from_response(
     (repositories, next_page_token)
 }
 
+/// A `RepositoryCatalog` implementation using
+/// `lore.user.v1.RepositoryRegistryService`. Collects the `RepositoryList`
+/// stream and pages it as the baseline catalog pages the store.
+pub struct RepositoryRegistryCatalog {
+    user_url: String,
+    limit: usize,
+}
+
+impl RepositoryRegistryCatalog {
+    pub fn new(user_url: String) -> Self {
+        Self::with_limit(user_url, MAX_LISTED_REPOSITORIES)
+    }
+
+    #[lore_macro::test_pub]
+    fn with_limit(user_url: String, limit: usize) -> Self {
+        Self { user_url, limit }
+    }
+}
+
+#[async_trait]
+impl RepositoryCatalog for RepositoryRegistryCatalog {
+    async fn list_repositories(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        page_size: Option<u32>,
+        page_token: Option<&str>,
+    ) -> Result<(Vec<RepositoryId>, Option<String>), Status> {
+        lore_debug!("Repository fetch repositories from the repository registry");
+
+        let mut client = grpc_get_repository_registry_client(&self.user_url).await?;
+        let request =
+            create_request_with_authorization(RepositoryListRequest {}, bearer_header(token))?;
+        let mut stream = client
+            .repository_list(request)
+            .await
+            .warn_map_err(repository_list_error)?
+            .into_inner();
+        let mut held = Vec::new();
+        while let Some(response) = stream.next().await {
+            if held.len() == self.limit {
+                return Err(too_many_repositories());
+            }
+            held.extend(repository_from_response(
+                response.warn_map_err(repository_list_error)?,
+            ));
+        }
+        page(held, page_size, page_token)
+    }
+}
+
+fn repository_list_error(err: &Status) -> Status {
+    match err.code() {
+        Code::PermissionDenied => Status::permission_denied("List repositories denied"),
+        Code::Unauthenticated => {
+            Status::unauthenticated("List repositories failed - unauthenticated")
+        }
+        _ => Status::internal(format!(
+            "Failed to call repository registry RepositoryList: {err}"
+        )),
+    }
+}
+
+/// The repository a `RepositoryList` message names. A value that is not a
+/// 16-byte repository id is skipped.
+#[lore_macro::test_pub]
+fn repository_from_response(response: RepositoryListResponse) -> Option<RepositoryId> {
+    <[u8; 16]>::try_from(response.id.as_ref())
+        .ok()
+        .map(RepositoryId::from)
+}
+
 /// Which implementation [`repository_catalog`] selects for a
 /// configuration, named in the startup log beside the authorizer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,6 +365,9 @@ pub enum CatalogSelection {
     /// `LookupUserPermissions` at this `UrcAuthApi` endpoint, forwarding the
     /// caller's token.
     AuthClient(String),
+    /// `RepositoryList` at this `lore.user.v1.RepositoryRegistryService`
+    /// endpoint, forwarding the caller's token.
+    UserService(String),
 }
 
 impl fmt::Display for CatalogSelection {
@@ -287,32 +380,50 @@ impl fmt::Display for CatalogSelection {
                 f.write_str("BaselineRepositoryCatalog(reachable)")
             }
             Self::AuthClient(url) => write!(f, "AuthClientRepositoryCatalog({url})"),
+            Self::UserService(url) => write!(f, "RepositoryRegistryCatalog({url})"),
         }
     }
 }
 
 /// Selects the `RepositoryCatalog` implementation. The rules:
 /// - `repository_catalog` config can be used to select the mode
-/// - if unset, uses `AuthService` if `auth_url` is defined,
-///   `Baseline` otherwise
+/// - if unset, uses `UserService` if `user_url` is defined, else
+///   `AuthService` if `auth_url` is defined, `Baseline` otherwise
+/// - the `UserService` catalog asks `user_url`, the endpoint clients
+///   resolve users at
 /// - if using `AuthService` catalog, the gRPC server url is
 ///   read primarily from `repository_catalog_url`, or from
 ///   `auth_url` if unset
 pub fn select_repository_catalog(
     auth: Option<&AuthSettings>,
     auth_url: Option<&str>,
+    user_url: Option<&str>,
 ) -> anyhow::Result<CatalogSelection> {
     select_repository_authorizer(auth, auth_url)?;
     let Some(auth) = auth else {
         return Ok(CatalogSelection::Baseline(BaselineAccess::Reachable));
     };
-    let mode = auth.repository_catalog.unwrap_or(if auth_url.is_some() {
+    // Clients treat an empty `user_url` as unset, since the environment
+    // service advertises unset as empty.
+    let user_url = user_url.filter(|url| !url.is_empty());
+    let mode = auth.repository_catalog.unwrap_or(if user_url.is_some() {
+        RepositoryCatalogMode::UserService
+    } else if auth_url.is_some() {
         RepositoryCatalogMode::AuthService
     } else {
         RepositoryCatalogMode::Baseline
     });
     Ok(match mode {
         RepositoryCatalogMode::Baseline => CatalogSelection::Baseline(auth.baseline_access),
+        RepositoryCatalogMode::UserService => {
+            let url = user_url.ok_or_else(|| {
+                anyhow!(
+                    "[server.auth] repository_catalog = \"user_service\" needs a directory to \
+                     ask: set [environment.endpoint] user_url."
+                )
+            })?;
+            CatalogSelection::UserService(url.to_string())
+        }
         RepositoryCatalogMode::AuthService => {
             let url = auth
                 .repository_catalog_url
@@ -334,11 +445,14 @@ pub fn select_repository_catalog(
 pub fn repository_catalog(
     auth: Option<&AuthSettings>,
     auth_url: Option<&str>,
+    user_url: Option<&str>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
 ) -> anyhow::Result<Arc<dyn RepositoryCatalog>> {
-    let selection = select_repository_catalog(auth, auth_url)?;
+    let selection = select_repository_catalog(auth, auth_url, user_url)?;
     info!("Repository catalog: {selection}");
+    let baseline_reachable =
+        auth.is_some_and(|auth| auth.baseline_access == BaselineAccess::Reachable);
     Ok(match selection {
         CatalogSelection::Baseline(baseline) => Arc::new(BaselineRepositoryCatalog::new(
             baseline,
@@ -346,10 +460,16 @@ pub fn repository_catalog(
             mutable_store,
         )),
         CatalogSelection::AuthClient(url) => {
-            if auth.is_some_and(|auth| auth.baseline_access == BaselineAccess::Reachable) {
+            if baseline_reachable {
                 warn!("[server.auth] baseline_access is not consulted by the auth_service catalog");
             }
             Arc::new(AuthClientRepositoryCatalog::new(url))
+        }
+        CatalogSelection::UserService(url) => {
+            if baseline_reachable {
+                warn!("[server.auth] baseline_access is not consulted by the user_service catalog");
+            }
+            Arc::new(RepositoryRegistryCatalog::new(url))
         }
     })
 }

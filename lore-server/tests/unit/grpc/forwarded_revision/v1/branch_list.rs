@@ -6,9 +6,11 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_proto::lore::revision::v1::BranchListRequest;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::forwarded_requests::CallerContext;
 use lore_server::grpc::forwarded_revision::v1::branch_list::*;
 use lore_server::grpc::revision::v1::branch_list::BranchListStream;
+use lore_server::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
 use tokio_stream::StreamExt;
@@ -21,6 +23,7 @@ fn make_forwarded_request(repository: RepositoryId) -> Request<BranchListRequest
     CallerContext {
         repository_id: repository,
         user_id: "lily".into(),
+        is_service_account: false,
         correlation_id: String::new(),
         authorization: None,
     }
@@ -48,10 +51,15 @@ async fn missing_user_id_returns_internal_error() {
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
 
-        let err = handler(request, immutable_store, mutable_store)
-            .await
-            .map(|_| ())
-            .expect_err("missing user id should fail");
+        let err = handler(
+            request,
+            immutable_store,
+            mutable_store,
+            DEFAULT_BRANCH_LIST_CONCURRENCY,
+        )
+        .await
+        .map(|_| ())
+        .expect_err("missing user id should fail");
 
         assert_eq!(err.code(), tonic::Code::Internal);
         assert!(err.message().contains("on-behalf-of-user-id"));
@@ -87,6 +95,7 @@ mod base_branch_list_handler {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_root_branch(&repository_context, "main", "lily").await;
             create_root_branch(&repository_context, "feature", "james").await;
@@ -95,6 +104,7 @@ mod base_branch_list_handler {
                 make_forwarded_request(repository),
                 immutable_store,
                 mutable_store,
+                DEFAULT_BRANCH_LIST_CONCURRENCY,
             )
             .await
             .expect("Request failed");
@@ -118,6 +128,7 @@ mod base_branch_list_handler {
                 make_forwarded_request(repository),
                 immutable_store,
                 mutable_store,
+                DEFAULT_BRANCH_LIST_CONCURRENCY,
             )
             .await
             .expect("Request failed");

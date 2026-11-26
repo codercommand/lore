@@ -214,6 +214,7 @@ mod tests {
                     feature_branch,
                     branch::merge::MergeStartOptions {
                         message: "merge feature into main".to_string(),
+                        link_messages: std::collections::HashMap::new(),
                         no_commit: true,
                         scope: branch::merge::MergeScope::MainOnly,
                         inherit_metadata: MetadataInherit::default(),
@@ -226,15 +227,15 @@ mod tests {
                     "the merge brought the feature branch's files into the working tree"
                 );
 
-                stage::resolve_tasks::reset();
-                stage::resolve_tasks::set_budget(BUDGET);
-                stage::resolve_tasks::hold();
+                stage::RESOLVE_TASKS.reset();
+                stage::RESOLVE_TASKS.set_budget(BUDGET);
+                stage::RESOLVE_TASKS.hold();
                 let settled = tokio::spawn(async {
                     let deadline = Instant::now() + Duration::from_secs(60);
                     let (mut last, mut since) = (0, Instant::now());
                     loop {
                         tokio::time::sleep(Duration::from_millis(50)).await;
-                        let live = stage::resolve_tasks::live();
+                        let live = stage::RESOLVE_TASKS.live();
                         if live != last {
                             (last, since) = (live, Instant::now());
                         } else if live > 0 && since.elapsed() > Duration::from_millis(500) {
@@ -245,8 +246,8 @@ mod tests {
                             "the resolution never settled, {live} tasks live"
                         );
                     }
-                    let peak = stage::resolve_tasks::peak();
-                    stage::resolve_tasks::release();
+                    let peak = stage::RESOLVE_TASKS.peak();
+                    stage::RESOLVE_TASKS.release();
                     peak
                 });
                 let directories = (0..DIRECTORIES)
@@ -264,7 +265,7 @@ mod tests {
                 .expect("merge_resolve_mine failed");
 
                 let peak = settled.await.expect("the observer completes");
-                let spawned = stage::resolve_tasks::spawned();
+                let spawned = stage::RESOLVE_TASKS.spawned();
                 assert!(
                     peak <= BUDGET,
                     "at most the budget is live at once: peak {peak}, spawned {spawned}"

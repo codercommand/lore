@@ -10,7 +10,7 @@
 //!
 //! # Cost
 //!
-//! Between two and thirteen relaxed `fetch_add`s per fragment, on counters that
+//! Between two and fourteen relaxed `fetch_add`s per fragment, on counters that
 //! share cache lines, against a hash, a compression pass and at least one store
 //! write. Reading is a snapshot of plain loads. Nothing here allocates, and
 //! nothing is retained per fragment.
@@ -92,13 +92,21 @@ pub struct FragmentWriteStats {
     /// Fragments written with no remote consulted, the caller having asked for a
     /// local-only write.
     local_only_writes: AtomicU64,
-    /// Fragments whose upload did not land, leaving them stored only locally.
+    /// Fragments stored only locally because the upload did not succeed, or the
+    /// peer throttled the copy and no upload was attempted.
     ///
     /// Not an error: the remote leg is best-effort and the write succeeds with the
     /// payload retained, for a later push to offer again. The payload is therefore
     /// counted under `local_payload_writes` as well, indistinguishably from one
     /// kept because the caller asked for it.
     remote_upload_failed: AtomicU64,
+
+    /// Fragments the remote was asked about before their payload was prepared.
+    remote_queries: AtomicU64,
+    /// Of `remote_queries`, those the remote held, so no payload was sent for them.
+    remote_query_hits: AtomicU64,
+    /// Payload bytes the remote holds for `remote_query_hits`, which the write did not send.
+    remote_query_unsent_bytes: AtomicU64,
 }
 
 /// A fragment's `size_content`, counted only where counting it does not count the
@@ -150,7 +158,7 @@ impl FragmentWriteStats {
         self.local_only_writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A remote was consulted and the upload did not land.
+    /// A remote was consulted and did not take the fragment.
     pub fn remote_upload_failed(&self) {
         self.remote_upload_failed.fetch_add(1, Ordering::Relaxed);
     }
@@ -159,8 +167,8 @@ impl FragmentWriteStats {
     /// compressed from the caller's buffer. `fragment` carries that payload, so
     /// `size_payload` is the compressed size where compression applied.
     ///
-    /// A fragment the peer duplicates an association for, and which is not also
-    /// cached locally, needs no payload and prepares none.
+    /// A fragment the peer duplicates an association for or already holds, and
+    /// which is not also cached locally, needs no payload and prepares none.
     pub fn payload_prepared(&self, fragment: &Fragment) {
         if (fragment.flags & FragmentFlags::PayloadFragmented) != 0 {
             self.fragmentlists.fetch_add(1, Ordering::Relaxed);
@@ -211,6 +219,18 @@ impl FragmentWriteStats {
             .fetch_add(payload_bytes, Ordering::Relaxed);
     }
 
+    /// The remote was asked whether it holds this fragment before its payload was
+    /// prepared. `held_payload_bytes` is the size of the payload it holds, or `None`
+    /// where it holds none or the query failed.
+    pub fn remote_query(&self, held_payload_bytes: Option<u64>) {
+        self.remote_queries.fetch_add(1, Ordering::Relaxed);
+        if let Some(bytes) = held_payload_bytes {
+            self.remote_query_hits.fetch_add(1, Ordering::Relaxed);
+            self.remote_query_unsent_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
     /// Read every counter. See the module documentation on consistency.
     pub fn snapshot(&self) -> FragmentWriteCounts {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
@@ -239,6 +259,9 @@ impl FragmentWriteStats {
             remote_already_durable: load(&self.remote_already_durable),
             local_only_writes: load(&self.local_only_writes),
             remote_upload_failed: load(&self.remote_upload_failed),
+            remote_queries: load(&self.remote_queries),
+            remote_query_hits: load(&self.remote_query_hits),
+            remote_query_unsent_bytes: load(&self.remote_query_unsent_bytes),
         }
     }
 }
@@ -265,7 +288,16 @@ impl FragmentWriteStats {
 /// - `data_content_bytes + no_payload_content_bytes == processed_content_bytes`.
 #[repr(C)]
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 #[serde(rename_all = "camelCase")]
 pub struct FragmentWriteCounts {
@@ -295,8 +327,8 @@ pub struct FragmentWriteCounts {
     /// Stored payload bytes of `fragmentlists`.
     pub fragmentlist_payload_bytes: u64,
     /// Of `fragments_processed`, those that needed no payload, so none was
-    /// prepared: the remote duplicated an association for them and the write did
-    /// not ask for the payload to be cached locally.
+    /// prepared: the remote duplicated an association for them or already held
+    /// them, and the write did not ask for the payload to be cached locally.
     pub no_payload_fragments: u64,
     /// Content bytes `no_payload_fragments` stand for.
     pub no_payload_content_bytes: u64,
@@ -325,10 +357,21 @@ pub struct FragmentWriteCounts {
     /// asked for. Branch latest history is one such write, which the server does
     /// not store, so a commit against a remote has exactly one.
     pub local_only_writes: u64,
-    /// Fragments whose upload did not land, leaving them stored only locally for
-    /// a later push to offer again. Their payloads are counted under
-    /// `local_payload_writes` too, indistinguishably from those kept by request.
+    /// Fragments stored only locally for a later push to offer again. Either the
+    /// upload failed or the peer throttled the copy and no upload was attempted.
+    /// Their payloads also count toward `local_payload_writes`, which does not
+    /// distinguish them from payloads kept locally by request.
     pub remote_upload_failed: u64,
+    /// Of `fragments_processed`, those the remote was asked about before their
+    /// payload was prepared, the write having asked for that (`remote_query`).
+    pub remote_queries: u64,
+    /// Of `remote_queries`, those the remote already held under this very
+    /// address, so no payload was sent for them. They count toward
+    /// `remote_already_durable` too.
+    pub remote_query_hits: u64,
+    /// Payload bytes the remote holds for `remote_query_hits`, which the write
+    /// did not send.
+    pub remote_query_unsent_bytes: u64,
 }
 
 impl FragmentWriteCounts {
@@ -403,6 +446,13 @@ impl FragmentWriteCounts {
             remote_upload_failed: self
                 .remote_upload_failed
                 .saturating_sub(baseline.remote_upload_failed),
+            remote_queries: self.remote_queries.saturating_sub(baseline.remote_queries),
+            remote_query_hits: self
+                .remote_query_hits
+                .saturating_sub(baseline.remote_query_hits),
+            remote_query_unsent_bytes: self
+                .remote_query_unsent_bytes
+                .saturating_sub(baseline.remote_query_unsent_bytes),
         }
     }
 }

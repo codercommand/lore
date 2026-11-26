@@ -84,15 +84,49 @@ pub async fn write_raw(
     }
 }
 
-// This map holds the set of unique (partition, address) pairs that are currently
-// in flight to be stored locally, and a token to wait for completion
-static STORE_IN_FLIGHT: OnceLock<DashMap<StoreInFlightKey, CancellationToken>> = OnceLock::new();
+/// Writes in flight, keyed by the store object, partition and address: each entry holds the token
+/// cancelled when its guard drops, landed or not, and the store object it writes, so that no other
+/// store object takes the object address its key holds while the entry exists.
+static STORE_IN_FLIGHT: OnceLock<DashMap<StoreInFlightKey, StoreInFlight>> = OnceLock::new();
 
+/// A write in flight: the token cancelled when its guard drops, and the store object it writes.
+struct StoreInFlight {
+    token: CancellationToken,
+    _store: Arc<dyn ImmutableStore>,
+}
+
+/// The store a single-flight writes or reads into, by the address of the store object.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) struct FlightStore(std::num::NonZeroUsize);
+
+impl FlightStore {
+    /// The identity of `store`.
+    #[lore_macro::test_pub]
+    pub(crate) fn of(store: &dyn ImmutableStore) -> Self {
+        Self(std::ptr::NonNull::from(store).cast::<()>().addr())
+    }
+}
+
+/// A store object, partition and address: the key of a write in flight, and the association a
+/// read single-flight reads into.
 #[lore_macro::test_pub]
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct StoreInFlightKey {
+    pub store: FlightStore,
     pub partition: Partition,
     pub address: Address,
+}
+
+impl StoreInFlightKey {
+    /// The key of `address` in `partition` of `store`.
+    fn of(store: &dyn ImmutableStore, partition: Partition, address: Address) -> Self {
+        Self {
+            store: FlightStore::of(store),
+            partition,
+            address,
+        }
+    }
 }
 
 /// Stores that have left [`STORE_IN_FLIGHT`], counted per bucket of addresses before each entry
@@ -128,21 +162,22 @@ impl Drop for StoreInFlightGuard {
                 .is_some_and(|in_flight| in_flight.contains_key(&self.key))
         });
         if let Some(in_flight) = STORE_IN_FLIGHT.get()
-            && let Some((_, token)) = in_flight.remove(&self.key)
+            && let Some((_, flight)) = in_flight.remove(&self.key)
         {
             // Let waiters know we have finished the request that was in flight
-            token.cancel();
+            flight.token.cancel();
         }
     }
 }
 
-// Either returns a new in-flight token if request was not in flight, or waits for the request
-// to finish and then return none if already in-flight
+/// The guard of a write of `address` in `partition` of `store`, where no other write of it is in
+/// flight; otherwise waits for the one in flight to land and answers `None`.
 pub async fn stored_in_flight(
+    store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
 ) -> Option<StoreInFlightGuard> {
-    match try_acquire_in_flight(partition, address) {
+    match try_acquire_in_flight(store, partition, address) {
         Ok(guard) => Some(guard),
         Err(token) => {
             token.cancelled().await;
@@ -151,47 +186,50 @@ pub async fn stored_in_flight(
     }
 }
 
-/// Non-blocking attempt to acquire the in-flight guard for `(partition, address)`.
+/// Non-blocking attempt to acquire the in-flight guard for `address` in `partition` of `store`.
 ///
-/// Returns `Ok(guard)` if no one else is currently writing this address — the
-/// caller becomes the leader and must drop the guard when the terminal store
-/// entry is written.
+/// Returns `Ok(guard)` if no one else is currently writing this address to this store — the
+/// caller becomes the leader and must drop the guard when the terminal store entry is written.
 ///
 /// Returns `Err(token)` if another task already holds the guard. The token is
 /// cancelled when that task drops its guard; callers that want to observe the
 /// leader's outcome should await the token and then query the store.
 pub fn try_acquire_in_flight(
+    store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
 ) -> Result<StoreInFlightGuard, CancellationToken> {
-    let key = StoreInFlightKey { partition, address };
+    let key = StoreInFlightKey::of(store.as_ref(), partition, address);
     let in_flight = STORE_IN_FLIGHT.get_or_init(DashMap::new);
     // `DashMap::entry` is safe here as it is not held across any awaits and no other locks are acquired while held
     #[allow(clippy::disallowed_methods)]
     match in_flight.entry(key.clone()) {
-        Entry::Occupied(entry) => Err(entry.get().clone()),
+        Entry::Occupied(entry) => Err(entry.get().token.clone()),
         Entry::Vacant(entry) => {
-            entry.insert(CancellationToken::new());
+            entry.insert(StoreInFlight {
+                token: CancellationToken::new(),
+                _store: store.clone(),
+            });
             Ok(StoreInFlightGuard { key })
         }
     }
 }
 
-/// If another task is currently writing `(partition, address)` via the tracker
-/// path, wait for its cancellation token so subsequent reads observe the
-/// terminal store entry the leader produces, and answer true. Returns false
-/// immediately when no write is in flight.
-pub async fn wait_if_in_flight(partition: Partition, address: Address) -> bool {
-    let Some(in_flight) = STORE_IN_FLIGHT.get() else {
-        return false;
-    };
-    let key = StoreInFlightKey { partition, address };
-    let token = in_flight.get(&key).map(|entry| entry.value().clone());
-    let Some(token) = token else {
-        return false;
-    };
-    token.cancelled().await;
-    true
+/// If another task is currently writing `address` in `partition` of `store`, wait for its
+/// cancellation token so subsequent reads observe the terminal store entry the leader produces,
+/// and answer true. Returns false immediately when no write is in flight. Looks for the write at
+/// the call, so the future holds none of the arguments.
+pub fn wait_if_in_flight(
+    store: &dyn ImmutableStore,
+    partition: Partition,
+    address: Address,
+) -> impl Future<Output = bool> + use<> {
+    let key = StoreInFlightKey::of(store, partition, address);
+    let token = STORE_IN_FLIGHT
+        .get()
+        .and_then(|in_flight| in_flight.get(&key).map(|entry| entry.value().token.clone()));
+    futures::future::OptionFuture::from(token.map(CancellationToken::cancelled_owned))
+        .map(|waited| waited.is_some())
 }
 
 /// Result of a [`store_fragment`] operation.
@@ -510,10 +548,11 @@ async fn remote_put_retry(
 
 /// Unified fragment store: dedup -> load existing -> compress -> optional remote -> local store.
 ///
-/// When `remote_session` is `Some`, the session is used after compression to
-/// attempt a durable remote write via `session.put()`. The durable status
-/// affects the `PayloadStoredDurable` flag and whether the payload is cached
-/// locally (payload is always cached when not yet durable, as a safety net).
+/// When `remote_session` is `Some`, the fragment is made durable on the peer where
+/// possible, by duplicating an association the peer already holds or else by
+/// uploading the compressed payload. Durability affects the `PayloadStoredDurable`
+/// flag and whether the payload is cached locally. Until the fragment is durable,
+/// the payload is always cached locally so it isn't lost.
 ///
 /// For local-only storage, pass `None` for `remote_session`.
 ///
@@ -530,6 +569,9 @@ async fn remote_put_retry(
 /// `permit` is the caller-held memory permit associated with `buffer`. If a
 /// leader is spawned, the permit moves into the leader task; if the call
 /// becomes a follower or short-circuits, the permit is dropped immediately.
+///
+/// The remote is not asked first whether it holds the address ([`WriteOptions::remote_query`]):
+/// the content writes, such as [`write_content`], are what ask it.
 ///
 /// Returns `store_fragment_publishing`'s future itself: a future of its own would hold the
 /// arguments again beside it.
@@ -551,12 +593,45 @@ pub fn store_fragment(
         address,
         fragment,
         Payload::Shared(buffer),
-        cache_local,
+        FragmentOptions::new(cache_local, false),
         remote_session,
         writes,
         permit,
         None,
     )
+}
+
+/// What [`WriteOptions`] asks of each fragment a write stores, in one byte: keeping its payload
+/// locally ([`WriteOptions::cache_local`]), and asking the remote first
+/// ([`WriteOptions::remote_query`]). One byte rather than a `bool` each, since every future that
+/// stores a fragment holds it for its whole life.
+#[derive(Clone, Copy)]
+pub(crate) struct FragmentOptions(u8);
+
+impl FragmentOptions {
+    const CACHE_LOCAL: u8 = 1;
+    const REMOTE_QUERY: u8 = 2;
+
+    /// Keep the payload locally where `cache_local`, and ask the remote first where
+    /// `remote_query`.
+    pub(crate) fn new(cache_local: bool, remote_query: bool) -> Self {
+        let cache_local = if cache_local { Self::CACHE_LOCAL } else { 0 };
+        let remote_query = if remote_query { Self::REMOTE_QUERY } else { 0 };
+        Self(cache_local | remote_query)
+    }
+
+    /// What `flags` asks of each fragment.
+    pub(crate) fn of(flags: WriteOptions) -> Self {
+        Self::new(flags.cache_local(), flags.remote_query)
+    }
+
+    fn cache_local(self) -> bool {
+        self.0 & Self::CACHE_LOCAL != 0
+    }
+
+    fn remote_query(self) -> bool {
+        self.0 & Self::REMOTE_QUERY != 0
+    }
 }
 
 /// The payload a store writes: a buffer the stores and transports can keep, or content its caller
@@ -651,8 +726,8 @@ impl FusedPublish {
 /// A publishing write is never dispatched into the tracker, whatever the caller's `writes` says. A
 /// dispatched write returns before its leader has uploaded anything, so there would be no upload
 /// for the key to ride on and no placement to report — the two are incompatible by construction
-/// rather than by policy. It does take the in-flight guard, so concurrent writers of one address
-/// collapse onto a single upload; a publishing write whose leader left the content durable reports
+/// rather than by policy. It does take the in-flight guard, so concurrent writers of one address to
+/// one store collapse onto a single upload; a publishing write whose leader left the content durable reports
 /// `published = false` and its key follows as a `mutable_store`, the same round trip its own upload
 /// would have cost and none of the payload. A leader that left the content *not* durable — one
 /// writing locally, or one whose upload failed — cannot satisfy a publish, so this call uploads
@@ -664,6 +739,10 @@ impl FusedPublish {
 ///
 /// A lent payload is stored inline too, as the dispatched leader outlives the call.
 ///
+/// `options` asks for the payload to be kept locally, and for the remote to be asked whether it
+/// holds the address before the payload is prepared, as [`WriteOptions::remote_query`] describes;
+/// see [`leader_body`].
+///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
 pub(crate) fn store_fragment_publishing(
@@ -672,7 +751,7 @@ pub(crate) fn store_fragment_publishing(
     address: Address,
     fragment: Fragment,
     buffer: Payload<'_>,
-    cache_local: bool,
+    options: FragmentOptions,
     remote_session: Option<Arc<StorageSession>>,
     writes: WriteContext,
     permit: Option<OwnedSemaphorePermit>,
@@ -713,7 +792,7 @@ pub(crate) fn store_fragment_publishing(
                 address,
                 fragment,
                 buffer,
-                cache_local,
+                options,
                 remote_session,
                 &tracker,
                 &writes,
@@ -727,7 +806,7 @@ pub(crate) fn store_fragment_publishing(
                 address,
                 fragment,
                 buffer,
-                cache_local,
+                options,
                 remote_session,
                 &writes,
                 permit,
@@ -765,10 +844,10 @@ fn observed_fragment(fragment: Fragment, result: &StoreResult) -> Fragment {
 /// inline, and returns only after the terminal store entry is written.
 ///
 /// When `remote_session` is `None`, the in-flight machinery is bypassed entirely: it exists
-/// to coordinate concurrent uploads to the same address (so duplicate uploads collapse onto
-/// one wire call), which is moot for pure-local writes. Concurrent local writers may briefly
-/// do duplicate compression work, but the bucket-level write is content-addressed and
-/// idempotent. Items with no remote consult must not enter the dedup tracker.
+/// to coordinate concurrent uploads of the same address from one store (so duplicate uploads
+/// collapse onto one wire call), which is moot for pure-local writes. Concurrent local writers
+/// may briefly do duplicate compression work, but the bucket-level write is content-addressed
+/// and idempotent. Items with no remote consult must not enter the dedup tracker.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -778,7 +857,7 @@ fn store_fragment_inline(
     address: Address,
     fragment: Fragment,
     buffer: Payload<'_>,
-    cache_local: bool,
+    options: FragmentOptions,
     remote_session: Option<Arc<StorageSession>>,
     writes: &WriteContext,
     permit: Option<OwnedSemaphorePermit>,
@@ -791,7 +870,7 @@ fn store_fragment_inline(
 
         if is_fully_satisfied(
             &query,
-            cache_local,
+            options.cache_local(),
             stored_local,
             &remote_session,
             stored_durable,
@@ -816,7 +895,7 @@ fn store_fragment_inline(
                 address,
                 fragment,
                 buffer,
-                cache_local,
+                options,
                 remote_session,
                 query,
                 None,
@@ -835,9 +914,9 @@ fn store_fragment_inline(
             });
         }
 
-        // Remote-coupled path: acquire the in-flight guard so a concurrent writer to the same
-        // address dedupes onto one upload.
-        let guard = stored_in_flight(partition, address).await;
+        // Remote-coupled path: acquire the in-flight guard so a concurrent writer of the same
+        // address to this store dedupes onto one upload.
+        let guard = stored_in_flight(&store, partition, address).await;
         if guard.is_none()
             && let Some((stored_local, stored_durable)) =
                 inherited_placement(&store, partition, address, publish).await
@@ -860,7 +939,7 @@ fn store_fragment_inline(
             address,
             fragment,
             buffer,
-            cache_local,
+            options,
             remote_session,
             query,
             guard,
@@ -907,13 +986,14 @@ async fn store_fragment_dispatched(
     address: Address,
     fragment: Fragment,
     buffer: Bytes,
-    cache_local: bool,
+    options: FragmentOptions,
     remote_session: Option<Arc<StorageSession>>,
     tracker: &WriteTracker,
     writes: &WriteContext,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
-    let guard = match try_acquire_in_flight(partition, address) {
+    tracker.claim(&store).await;
+    let guard = match try_acquire_in_flight(&store, partition, address) {
         Ok(guard) => guard,
         Err(token) => {
             // Follower path: drop buffer and permit, register on the tracker.
@@ -937,7 +1017,7 @@ async fn store_fragment_dispatched(
 
     if is_fully_satisfied(
         &query,
-        cache_local,
+        options.cache_local(),
         stored_local,
         &remote_session,
         stored_durable,
@@ -966,7 +1046,7 @@ async fn store_fragment_dispatched(
         address,
         fragment,
         Payload::Shared(buffer),
-        cache_local,
+        options,
         remote_session,
         query,
         Some(guard),
@@ -1039,46 +1119,66 @@ fn copy_source(resolved: &StoreMatchResult, address: Address) -> Option<CopySour
     })
 }
 
-/// Duplicate the association `source` names into `address` on the session's partition, reporting
-/// whether the peer now holds it durably.
-///
-/// A refusal is an outcome rather than an error — the source may be gone, the peer may never have
-/// had it, or the caller may hold no claim to its partition — and the upload the caller falls back
-/// to does everything this would have.
-async fn copy_association(
-    session: &Arc<StorageSession>,
-    source: CopySource,
-    address: Address,
-) -> bool {
-    if !session.can_copy_from(source.partition).await {
-        lore_base::lore_trace!(
-            "No claim to partition {} to copy {} from, uploading instead",
-            source.partition,
-            address.hash
-        );
-        return false;
-    }
+/// The outcome of asking a peer to duplicate an association it already holds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CopyOutcome {
+    /// The peer now holds the association durably.
+    Copied,
+    /// The request failed, the peer answered with something other than `SlowDown`, or the claim to
+    /// the source partition couldn't be confirmed. Uploading the payload has the same effect as
+    /// copying it.
+    Refused,
+    /// The peer was still answering `SlowDown` when the retries ran out.
+    Throttled,
+}
 
-    match session
-        .copy(source.partition, source.address, address.context)
-        .await
-    {
-        Ok(()) => {
-            REMOTE_COPIES.fetch_add(1, Ordering::Relaxed);
+/// Ask the session's peer to duplicate the association `source_address` names in
+/// `source_partition` into `context` on the session's partition, without transferring a payload.
+///
+/// A `SlowDown` is retried with the same back-off as an upload.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn remote_copy_retry(
+    session: &StorageSession,
+    source_partition: Partition,
+    source_address: Address,
+    context: Context,
+) -> impl Future<Output = CopyOutcome> {
+    async move {
+        if !session.can_copy_from(source_partition).await {
             lore_base::lore_trace!(
-                "Copied {} from partition {} instead of uploading its payload",
-                address,
-                source.partition
+                "No claim to partition {source_partition} to copy {} into context {context} from",
+                source_address.hash
             );
-            true
+            return CopyOutcome::Refused;
         }
-        Err(err) => {
-            lore_base::lore_trace!(
-                "Copy of {} from partition {} refused ({err:?}), uploading instead",
-                address,
-                source.partition
-            );
-            false
+
+        let mut retry = crate::store_retry();
+        loop {
+            match session
+                .copy(source_partition, source_address, context)
+                .await
+            {
+                Ok(()) => return CopyOutcome::Copied,
+                Err(ref err) if err.is_slow_down() => {
+                    if !retry.wait().await {
+                        lore_base::lore_debug!(
+                            "Copy of {} into context {context} from partition {source_partition} still throttled after {} retries",
+                            source_address.hash,
+                            retry.counter()
+                        );
+                        return CopyOutcome::Throttled;
+                    }
+                }
+                Err(err) => {
+                    lore_base::lore_debug!(
+                        "Copy of {} into context {context} from partition {source_partition} refused ({err:?})",
+                        source_address.hash
+                    );
+                    return CopyOutcome::Refused;
+                }
+            }
         }
     }
 }
@@ -1113,8 +1213,18 @@ struct Placement {
     published: bool,
 }
 
-/// The "work" portion of [`store_fragment`]: optionally duplicate an association the peer already
-/// holds, else load existing local payload, compress and upload, then write the terminal entry.
+/// Performs the work for [`store_fragment`]. Duplicates an association the peer already holds
+/// where the local store knows one. Where `options` asks the remote first and no copy made the
+/// fragment durable or was throttled, asks the peer whether it holds the address
+/// ([`remote_fragment`]), and a hit makes the fragment durable as an upload would. Prepares a
+/// payload where one is still wanted, by loading an existing local payload whose sizes pass
+/// [`crate::read::check_payload_sizes`], or by compressing the content. Uploads the payload unless
+/// the fragment is durable or the peer throttled the copy, then writes the terminal entry.
+///
+/// A hit on a write that does not keep its payload locally records the peer's fragment as a
+/// header-only entry through the terminal write every durable fragment without a local payload
+/// takes, having loaded, compressed and sent nothing. One that keeps it still prepares and keeps
+/// the payload, and only the upload is spared.
 ///
 /// Returns where the payload ended up.
 ///
@@ -1131,7 +1241,7 @@ fn leader_body(
     address: Address,
     mut fragment: Fragment,
     mut buffer: Payload<'_>,
-    cache_local: bool,
+    options: FragmentOptions,
     remote_session: Option<Arc<StorageSession>>,
     query: StoreMatchResult,
     guard: Option<StoreInFlightGuard>,
@@ -1144,6 +1254,7 @@ fn leader_body(
         let mut published = false;
         let stats = stats.as_deref();
         let mut registered_remotely = false;
+        let mut copy_throttled = false;
 
         if let Some(stats) = stats {
             stats.fragment_processed(&fragment);
@@ -1155,16 +1266,44 @@ fn leader_body(
             && let Some(session) = remote_session.as_ref()
             && let Some(source) = copy_source(&query, address)
         {
-            stored_durable = copy_association(session, source, address).await;
-            if stored_durable {
-                registered_remotely = true;
-                if let Some(stats) = stats {
-                    stats.remote_copy();
+            match remote_copy_retry(session, source.partition, source.address, address.context)
+                .await
+            {
+                CopyOutcome::Copied => {
+                    REMOTE_COPIES.fetch_add(1, Ordering::Relaxed);
+                    stored_durable = true;
+                    registered_remotely = true;
+                    if let Some(stats) = stats {
+                        stats.remote_copy();
+                    }
+                }
+                CopyOutcome::Refused => {}
+                CopyOutcome::Throttled => copy_throttled = true,
+            }
+        }
+
+        // After the copy, which sends no payload either: a fragment it made durable costs no round
+        // trip, and one it refused is still asked about. A peer that throttled the copy is not
+        // asked, and the fragment stays local as below. Before the payload: a hit leaves none to
+        // prepare.
+        if options.remote_query()
+            && !stored_durable
+            && !copy_throttled
+            && let Some(session) = remote_session.as_deref()
+        {
+            let held = remote_fragment(session, &address, &fragment).await;
+            if let Some(stats) = stats {
+                stats.remote_query(held.map(|held| u64::from(held.size_payload)));
+            }
+            if let Some(held) = held {
+                stored_durable = true;
+                if !options.cache_local() {
+                    fragment = held;
                 }
             }
         }
 
-        let payload_wanted = !stored_durable || cache_local;
+        let payload_wanted = !stored_durable || options.cache_local();
 
         // For a partial match try loading the payload from local store instead of recompressing
         if payload_wanted && stored_local {
@@ -1173,19 +1312,10 @@ fn leader_body(
                 .get(partition, address)
                 .await
                 .and_then(StoreGetData::into_payload)
+                && crate::read::check_payload_sizes(&stored_fragment, stored_buffer.len()).is_ok()
             {
-                let loaded_hash = hash::hash_fragment(stored_fragment, stored_buffer.as_ref())
-                    .unwrap_or_default();
-                debug_assert!(
-                    loaded_hash == address.hash,
-                    "Local store had corrupt data when loading previous representation during store_raw"
-                );
-                if address.hash == loaded_hash {
-                    fragment = stored_fragment;
-                    buffer = Payload::Shared(stored_buffer);
-                } else {
-                    stored_local = false;
-                }
+                fragment = stored_fragment;
+                buffer = Payload::Shared(stored_buffer);
             } else {
                 stored_local = false;
             }
@@ -1222,8 +1352,12 @@ fn leader_body(
             }
         }
 
-        // Remote upload if session provided and not already durable
-        if !stored_durable && let Some(session) = remote_session.clone() {
+        // The peer was still asking for back-off when the copy gave up, and an upload would send
+        // it the whole payload. Keep it local and not durable, as after a failed upload.
+        if !stored_durable
+            && !copy_throttled
+            && let Some(session) = remote_session.clone()
+        {
             stored_durable = match publish {
                 Some(key) => {
                     published = remote_put_resolved_retry(
@@ -1267,7 +1401,7 @@ fn leader_body(
             fragment.flags &= !FragmentFlags::PayloadStoredDurable;
         }
 
-        let (payload, permit) = if !stored_durable || cache_local {
+        let (payload, permit) = if !stored_durable || options.cache_local() {
             (Some(buffer.into_shared()), permit)
         } else {
             drop(buffer);
@@ -1290,6 +1424,54 @@ fn leader_body(
             published,
         })
     }
+}
+
+/// The fragment the peer holds for `address`, marked stored durable, where it describes the same
+/// content as `fragment`: the same content size, the same kind of payload, and a header a local
+/// store takes. `None` for a miss, a query that failed, or a header that does not describe the
+/// content, each of which leaves the write to make the fragment durable itself. Logs a failed query
+/// and a header that does not describe the content, but not a miss, the expected answer for content
+/// the peer lacks.
+///
+/// Asks for the exact address. A peer serves its own read scope, which for a server is the exact
+/// association.
+///
+/// Asks [`StorageSession::get_metadata`] directly. [`crate::read::fetch_metadata`] maps each miss
+/// into a [`StorageError`], an allocation per fragment the peer lacks on the write's hot path, and,
+/// unless `no_local_write` is set, records the answer before the write checks it. The write records
+/// a hit only after the check, through its terminal write, which fails the write where the local
+/// store refuses the entry.
+async fn remote_fragment(
+    session: &StorageSession,
+    address: &Address,
+    fragment: &Fragment,
+) -> Option<Fragment> {
+    let mut held = match session.get_metadata(address).await {
+        Ok(held) => held,
+        Err(err) => {
+            if !err.is_not_found() {
+                lore_base::lore_debug!(
+                    "Query for {} in context {} failed ({err:?})",
+                    address.hash,
+                    address.context
+                );
+            }
+            return None;
+        }
+    };
+    held.flags |= FragmentFlags::PayloadStoredDurable;
+    let describes = held.size_content == fragment.size_content
+        && (held.flags ^ fragment.flags) & FragmentFlags::PayloadFragmented == 0
+        && crate::immutable_store::put_is_valid(&held, None);
+    if !describes {
+        lore_base::lore_debug!(
+            "Remote holds {} in context {} as {held:?}, which does not describe content of {} bytes",
+            address.hash,
+            address.context,
+            fragment.size_content
+        );
+    }
+    describes.then_some(held)
 }
 
 /// Store a raw fragment locally (no remote, no event emission).
@@ -1410,7 +1592,7 @@ pub(crate) async fn write_content_publishing(
         address,
         fragment,
         Payload::Shared(buffer),
-        flags.local_cache_priority,
+        FragmentOptions::of(flags),
         remote_session,
         writes,
         permit,
@@ -1526,7 +1708,7 @@ fn write_single_fragment(
             address,
             fragment,
             buffer,
-            flags.local_cache_priority,
+            FragmentOptions::of(flags),
             remote_session,
             writes,
             permit,
@@ -1810,13 +1992,16 @@ pub enum FileMatch {
 ///
 /// A stored object that cannot be read falls back to [`hashed_under_current_chunking`],
 /// which reads nothing but the file. Virtual immutable content is settled by the hash of the
-/// address it names, reading nothing.
+/// address it names, reading nothing. Metadata fetched from the remote is checked on receipt
+/// unless the reader trusts the remote (`trust_remote`).
+#[allow(clippy::too_many_arguments)]
 pub async fn file_matches(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     previous: Address,
     previous_size: Option<usize>,
     remote_session: Option<Arc<StorageSession>>,
+    trust_remote: bool,
     source: &ContentSource<'_>,
     established: &ContentHashes,
 ) -> Result<FileMatch, StorageError> {
@@ -1855,7 +2040,11 @@ pub async fn file_matches(
             .await);
     }
 
-    let options = ReadOptions::default().no_decompress().no_verify();
+    let options = ReadOptions {
+        trust_remote,
+        ..ReadOptions::default()
+    }
+    .no_decompress();
     let Some((fragment, payload)) = load_fragment(
         store.clone(),
         partition,
@@ -1899,6 +2088,7 @@ pub async fn file_matches(
                 partition,
                 context: previous.context,
                 remote_session: &remote_session,
+                trust_remote,
             },
             source,
             &file,
@@ -2021,7 +2211,7 @@ impl<'a> ContentHashMemo<'a> {
     /// the content could not be read.
     ///
     /// The whole content is resident while it is hashed, so the budget for it comes from the
-    /// fragment limiter that bounds every other buffer of a fragment's size.
+    /// fragment limiter.
     async fn whole_content_hash(&self, file_size: usize) -> Option<Hash> {
         if let Some(hash) = self.established.whole.get() {
             return Some(*hash);
@@ -2254,6 +2444,7 @@ struct SublistSource<'a> {
     partition: Partition,
     context: Context,
     remote_session: &'a Option<Arc<StorageSession>>,
+    trust_remote: bool,
 }
 
 /// Measure the file against `previous_fragmentation` chunk for chunk.
@@ -2265,10 +2456,10 @@ struct SublistSource<'a> {
 /// each allocating and filling its own buffer.
 ///
 /// A chunk that no longer matches returns [`FileMatch::Differs`] immediately, and a walk
-/// that cannot proceed at all — a sublist that fails to load or is not a list — returns
-/// [`FileMatch::Indeterminate`]. A list that merely misdescribes the content reads as a
-/// difference rather than as indeterminate, since the list is what defines the ranges being
-/// hashed: wrong offsets simply hash the wrong bytes.
+/// that cannot proceed at all — a sublist that fails to load or is not a list, or a hole,
+/// which this walk does not compare — returns [`FileMatch::Indeterminate`]. A list that
+/// merely misdescribes the content reads as a difference rather than as indeterminate, since
+/// the list is what defines the ranges being hashed: wrong offsets simply hash the wrong bytes.
 ///
 /// The walk stops having read at most one window more than it compared, where reading per
 /// chunk stopped exactly at the mismatch — the cost of not paying a round trip per chunk on
@@ -2303,6 +2494,10 @@ async fn compare_previous_chunks(
 
     while index < chunks.len() {
         let current = chunks[index];
+        if current.is_hole() {
+            lore_base::lore_trace!("Previous chunk {index} is a hole, cannot compare {source}");
+            return Ok(FileMatch::Indeterminate);
+        }
         let start = current.offset_content;
         let Some(end) = chunk_end(&chunks, index, file_size) else {
             lore_base::lore_trace!(
@@ -2320,7 +2515,11 @@ async fn compare_previous_chunks(
 
         if chunk_size > crate::compress::FRAGMENT_SIZE_THRESHOLD as u64 {
             lore_base::lore_trace!("Hash checking recursively fragmented chunks");
-            let sub_options = ReadOptions::default().no_decompress().no_verify();
+            let sub_options = ReadOptions {
+                trust_remote: sublists.trust_remote,
+                ..ReadOptions::default()
+            }
+            .no_decompress();
             let Ok((sub_fragment, sub_payload)) = load_fragment(
                 Arc::clone(sublists.store),
                 sublists.partition,

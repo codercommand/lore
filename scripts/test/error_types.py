@@ -7,7 +7,10 @@ from subprocess import CalledProcessError
 class ServerException(Exception): ...
 
 
-class LoreException(Exception): ...
+class LoreException(Exception):
+    """A failed Lore command. `returncode` is its exit status where the command ran."""
+
+    returncode: int | None = None
 
 
 class ServerConnectionError(LoreException): ...
@@ -37,6 +40,15 @@ class NotFound(LoreException): ...
 class RevisionNotFound(NotFound): ...
 
 
+class FileNotFound(NotFound):
+    """Raised when a command names a path the revision it reads does not hold,
+    whether the path was never added or was deleted."""
+
+
+class AddressNotFound(NotFound):
+    """Raised when the store holds no content for an address, as after an obliterate."""
+
+
 class BranchBehindLatest(LoreException): ...
 
 
@@ -53,6 +65,13 @@ class LocalModificationsError(LocalChanges):
     """Tracked files have been locally modified and the operation refuses to
     proceed without `--force`. Subclass of `LocalChanges` so existing call
     sites that catch `LocalChanges` keep working."""
+
+
+#: The exit status of a command refused by local modifications.
+LOCAL_MODIFICATIONS = 44
+
+#: The exit status of a command refused by a divergent history.
+DIVERGENT = 42
 
 
 class FileAlreadyExist(LoreException): ...
@@ -151,10 +170,15 @@ class NotALinkError(LoreException): ...
 class LinkNotFoundError(LoreException): ...
 
 
-class LinkPinDivergedError(LoreException): ...
+class LinkDivergedError(LoreException):
+    """Raised when a push stops at a link whose branch has newer revisions on
+    the remote than the local history holds."""
 
 
 class OverlappingLinkError(LoreException): ...
+
+
+class OverlappingMountError(LoreException): ...
 
 
 class NotALayerError(LoreException): ...
@@ -180,7 +204,22 @@ class NotSupportedError(LoreException):
     configured."""
 
 
-class SwfsOutsideServiceError(LoreException): ...
+class VfsOutsideServiceError(LoreException):
+    """A virtual-filesystem instance created or loaded by a process that is not
+    the service, which is the only process allowed to serve its mount."""
+
+
+# The refusal carries one message for SWFS and FUSE alike, so both names catch it.
+SwfsOutsideServiceError = VfsOutsideServiceError
+FuseOutsideServiceError = VfsOutsideServiceError
+
+
+class MountsBusyError(LoreException):
+    """A service stop refused because something holds one of its mounts."""
+
+
+class LinkPinsDivergeError(LoreException):
+    """The mounts of one linked repository disagree on their pin."""
 
 
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
@@ -203,6 +242,11 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Repository not found", UninitializedRepositoryError),
     ("Failed to find revision", RevisionNotFound),
     ("revision not found:", RevisionNotFound),
+    # Matched on the reported error line rather than as a bare substring: the
+    # patterns here are tested against the whole output, and `Root file not
+    # found:` from a clone naming a missing root path would otherwise be
+    # reported as this, which it is not.
+    (re.compile(r"\[Error\] file not found:"), FileNotFound),
     ("Not found", NotFound),
     ("Branch behind latest revision", BranchBehindLatest),
     ("Multiple files with case-only differences", CaseVariantConflict),
@@ -241,12 +285,14 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
         "local mutable store but is configured to use a shared store",
         LocalMutableStoreWithSharedStore,
     ),
-    ("Branch has been advanced by another instance", BranchAdvanced),
+    ("The branch's latest revision has moved on", BranchAdvanced),
     ("Nothing staged for commit", NothingStagedError),
     ("Path is not a link", NotALinkError),
     ("Link not found", LinkNotFoundError),
-    ("Link pin conflict at", LinkPinDivergedError),
+    ("Can't push the link at", LinkDivergedError),
     ("overlaps the link already mounted at", OverlappingLinkError),
+    ("overlaps the link mounted at", OverlappingMountError),
+    ("overlaps the layer mounted at", OverlappingMountError),
     ("Path is not a layer", NotALayerError),
     ("Failed to connect to remote URL", BadSharedStoreRemoteUrl),
     ("Local modifications prevent synchronization", LocalModificationsError),
@@ -257,6 +303,15 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
         "Attempting to create an SWFS instance outside the service",
         SwfsOutsideServiceError,
     ),
+    (
+        "Attempting to create a virtual-filesystem instance outside the service",
+        VfsOutsideServiceError,
+    ),
+    ("without using the service", VfsOutsideServiceError),
+    ("Mounts are busy:", MountsBusyError),
+    ("disagree on their revision, branch or flags", LinkPinsDivergeError),
+    ("invalid arguments:", ImproperArgumentsError),
+    ("Address not found", AddressNotFound),
 ]
 
 

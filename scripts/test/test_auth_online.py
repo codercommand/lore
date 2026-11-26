@@ -24,6 +24,7 @@ records reset between tests.
 """
 
 import logging
+import re
 import threading
 import time
 import uuid
@@ -32,7 +33,7 @@ from types import SimpleNamespace
 
 import grpc
 import pytest
-from error_types import LoreException
+from error_types import LoreException, NotAuthenticatedError
 from grpc_probe import REVISION_INFO, STORAGE_QUERY, call, repository_metadata
 from protobuf_wire import (
     encode_bytes_field,
@@ -40,6 +41,7 @@ from protobuf_wire import (
     field_message,
     parse_fields,
 )
+from lore_parsers import parse_jsonl
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -333,7 +335,8 @@ def provision_owner(auth_env, make_actor, label: str, user: MockUser, api_key=No
 def test_interactive_login_authenticates(auth_env, make_actor):
     """`auth login --no-browser` prints the login URL the auth service handed
     out, completes the device-grant flow (StartAuthSession + GetAuthSession
-    polling), and reports success."""
+    polling), and reports success. A login with `--reuse-session` keeps that
+    login; one without starts another."""
     mock = auth_env.mock
     login_token = mock.mint_token(USER1)
     script_interactive_login(mock, USER1, login_token, "session-login-test")
@@ -354,6 +357,25 @@ def test_interactive_login_authenticates(auth_env, make_actor):
     listing = repo.run(urc_args=["auth", "list"])
     assert USER1.user_id in listing
     assert USER1.preferred_username in listing
+
+    output = repo.run(
+        urc_args=[
+            "auth",
+            "login",
+            auth_env.remote_url,
+            "--no-browser",
+            "--reuse-session",
+        ]
+    )
+    assert "Login at:" not in output
+    assert "Authentication successful" in output
+    assert mock.calls["StartAuthSession"] == 1, (
+        "a login reusing a valid session must not start another"
+    )
+
+    output = login_interactive(repo, auth_env.remote_url)
+    assert "Login at:" in output
+    assert mock.calls["StartAuthSession"] == 2
 
 
 @pytest.mark.smoke
@@ -376,20 +398,38 @@ def test_api_key_login_authenticates_second_user(auth_env, make_actor):
 
 @pytest.mark.smoke
 def test_unknown_api_key_is_rejected(auth_env, make_actor):
-    """No rule matches an unknown key, so the exchange is refused."""
+    """No rule matches an unknown key, so the exchange is refused as
+    `NotAuthenticated`."""
     actor = make_actor("intruder")
     repo = actor.make_repo()
 
-    with pytest.raises(LoreException):
+    with pytest.raises(NotAuthenticatedError) as refused:
         login_api_key(repo, auth_env.remote_url, "not-a-real-key")
+    assert refused.value.returncode == 16, refused.value
 
 
 @pytest.mark.smoke
 def test_repository_create_and_delete_manage_the_auth_resource(auth_env, make_actor):
     """Repository create registers the rebac resource under the creator's
-    credential; delete removes it. Asserted from the requests the stub saw."""
+    credential; delete removes it. Asserted from the requests the stub saw.
+    The auth service hands out no refresh token, so the login reports none,
+    and `auth info` reports the login, without its token unless asked, beside
+    the user info it always reports."""
     mock = auth_env.mock
     owner = provision_owner(auth_env, make_actor, "user1", USER1)
+
+    login = owner.repo.auth_user_token_event()
+    assert login["token"] == owner.login_token
+    assert login["refreshExpires"] == 0
+    assert login["refreshable"] is False
+    assert login["sessionValid"] is True
+
+    output = owner.repo.run(["auth", "info"], json=True)
+    [metadata] = parse_jsonl(output, "authUserToken")
+    assert metadata["token"] == ""
+    assert metadata["sessionValid"] is True
+    [user_info] = parse_jsonl(output, "authUserInfo")
+    assert user_info["id"] == USER1.user_id
 
     creations = mock.requests_for("CreateResource")
     assert [c["resource_id"] for c in creations] == [owner.resource_id]
@@ -405,6 +445,7 @@ def test_repository_create_and_delete_manage_the_auth_resource(auth_env, make_ac
     assert deletions[0]["bearer"] == owner.login_token
 
 
+@pytest.mark.own_vfs("counts the token exchanges a push makes, where a virtual clone's mount exchanged its token when it connected")
 @pytest.mark.smoke
 def test_remote_write_uses_token_exchange_and_online_permission_checks(
     auth_env, make_actor
@@ -537,6 +578,29 @@ def test_repository_list_is_the_auth_services_answer(auth_env, make_actor):
     assert len(lookups) == 1
     assert lookups[0]["resource_filter"] == "urc"
     assert lookups[0]["page_token"] == "", "the first page carries no token"
+
+
+@pytest.mark.smoke
+def test_an_access_token_alone_clones_and_pushes(auth_env, make_actor, scratch_dir):
+    """A caller with no login and only an access token for a repository
+    resolves the repository's name, clones it and pushes to it."""
+    owner = provision_owner(auth_env, make_actor, "owner", USER1)
+    commit_file(owner.repo, "owner.txt", "owner content")
+
+    agent = make_actor("agent").make_repo(remote_path=owner.repo.remote_path)
+    clone_path = scratch_dir("access-token-clone")
+    agent.clone(path=str(clone_path), access_token=owner.authz_token)
+    assert (clone_path / "owner.txt").read_text() == "owner content"
+
+    (clone_path / "agent.txt").write_text("agent content")
+    for command in (
+        ["file", "stage", "agent.txt"],
+        ["revision", "commit", "add agent.txt"],
+        ["push"],
+    ):
+        agent.run(command, path=str(clone_path), access_token=owner.authz_token)
+    owner.repo.sync()
+    assert (Path(owner.repo.path) / "agent.txt").read_text() == "agent content"
 
 
 @pytest.mark.smoke
@@ -786,6 +850,162 @@ def test_every_partition_scoped_service_enforces_partition_access(auth_env, make
     )
 
 
+# ---------------------------------------------------------------------------
+# Every partition-scoped RPC asks one action
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The protos of the six partition-scoped services, and the service in each.
+PARTITION_SCOPED_SERVICES = (
+    ("lore-server/src/legacy/proto/storage.proto", "StorageService"),
+    ("lore-proto/proto/lore/storage/v1/storage.proto", "StorageService"),
+    ("lore-server/src/legacy/proto/revision.proto", "RevisionService"),
+    ("lore-proto/proto/lore/revision/v1/revision.proto", "RevisionService"),
+    ("lore-proto/proto/lore/thin_client/v1/thin_client.proto", "ThinClientService"),
+    ("lore-proto/proto/lock.proto", "LockService"),
+)
+
+# The actions that admit each RPC, any one of them sufficing. `("read",)`
+# means any grant on the repository admits it, since a grant implies `read`.
+# `None` for the two that act on no partition data: the liveness ping and the
+# unimplemented ContentDiff. Push takes `push-protected` for a protected branch and unlock
+# takes `owner` or `admin` for another user's locks; the empty probe body
+# names neither, so either passes the check. Protect and unprotect also admit
+# the creator with `write`, which the probe's caller is not.
+RPC_ACTIONS = {
+    "/urc.rpc.StorageService/Get": ("read",),
+    "/urc.rpc.StorageService/Ping": None,
+    "/urc.rpc.StorageService/Put": ("write",),
+    "/urc.rpc.StorageService/Query": ("read",),
+    "/urc.rpc.StorageService/Verify": ("read",),
+    "/urc.rpc.StorageService/Copy": ("write",),
+    "/urc.rpc.StorageService/MutableLoad": ("read",),
+    "/urc.rpc.StorageService/MutableStore": ("write",),
+    "/urc.rpc.StorageService/MutableCompareAndSwap": ("write",),
+    "/lore.storage.v1.StorageService/Get": ("read",),
+    "/lore.storage.v1.StorageService/GetMetadata": ("read",),
+    "/lore.storage.v1.StorageService/GetResolved": ("read",),
+    "/lore.storage.v1.StorageService/PutResolved": ("write",),
+    "/lore.storage.v1.StorageService/Put": ("write",),
+    "/lore.storage.v1.StorageService/Query": ("read",),
+    "/lore.storage.v1.StorageService/Verify": ("read",),
+    "/lore.storage.v1.StorageService/Copy": ("write",),
+    "/lore.storage.v1.StorageService/MutableLoad": ("read",),
+    "/lore.storage.v1.StorageService/MutableStore": ("write",),
+    "/lore.storage.v1.StorageService/MutableCompareAndSwap": ("write",),
+    "/urc.rpc.RevisionService/BranchCreate": ("write",),
+    "/urc.rpc.RevisionService/BranchDelete": ("write",),
+    "/urc.rpc.RevisionService/BranchQuery": ("read",),
+    "/urc.rpc.RevisionService/BranchGet": ("read",),
+    "/urc.rpc.RevisionService/BranchList": ("read",),
+    "/urc.rpc.RevisionService/BranchPush": ("write", "push-protected"),
+    "/urc.rpc.RevisionService/BranchProtect": ("owner", "admin", "set-protected"),
+    "/urc.rpc.RevisionService/BranchUnprotect": ("owner", "admin", "set-protected"),
+    "/urc.rpc.RevisionService/BranchDiff": ("read",),
+    "/urc.rpc.RevisionService/BranchRevisionList": ("read",),
+    "/urc.rpc.RevisionService/BranchMetadataGet": ("read",),
+    "/urc.rpc.RevisionService/BranchMetadataSet": ("write",),
+    "/urc.rpc.RevisionService/RevisionDescribe": ("read",),
+    "/urc.rpc.RevisionService/RevisionDiff": ("read",),
+    "/urc.rpc.RevisionService/RevisionStateHistory": ("read",),
+    "/urc.rpc.RevisionService/RevisionTree": ("read",),
+    "/urc.rpc.RevisionService/RevisionList": ("read",),
+    "/lore.revision.v1.RevisionService/BranchCreate": ("write",),
+    "/lore.revision.v1.RevisionService/BranchDelete": ("write",),
+    "/lore.revision.v1.RevisionService/BranchGet": ("read",),
+    "/lore.revision.v1.RevisionService/BranchList": ("read",),
+    "/lore.revision.v1.RevisionService/BranchPush": ("write", "push-protected"),
+    "/lore.revision.v1.RevisionService/BranchMetadataGet": ("read",),
+    "/lore.revision.v1.RevisionService/BranchMetadataSet": ("write",),
+    "/lore.revision.v1.RevisionService/RevisionList": ("read",),
+    "/lore.thin_client.v1.ThinClientService/ContentDiff": None,
+    "/lore.thin_client.v1.ThinClientService/RevisionInfo": ("read",),
+    "/lore.thin_client.v1.ThinClientService/RevisionDiff": ("read",),
+    "/lore.thin_client.v1.ThinClientService/RevisionTree": ("read",),
+    "/urc.lock.LockService/Lock": ("write",),
+    "/urc.lock.LockService/Query": ("read",),
+    "/urc.lock.LockService/Status": ("read",),
+    "/urc.lock.LockService/Unlock": ("write", "owner", "admin"),
+    "/urc.lock.LockService/AdminLock": ("migrate",),
+}
+
+
+def proto_rpc_paths(proto: Path, service: str) -> set[str]:
+    """`/<package>.<service>/<rpc>` for every rpc of `service` in `proto`."""
+    package = re.search(r"^package\s+([\w.]+);", proto.read_text(), re.M).group(1)
+    body = re.search(
+        rf"^service\s+{service}\s*\{{(.*?)^\}}", proto.read_text(), re.M | re.S
+    ).group(1)
+    return {
+        f"/{package}.{service}/{rpc}"
+        for rpc in re.findall(r"^\s*rpc\s+(\w+)", body, re.M)
+    }
+
+
+def test_every_partition_scoped_rpc_is_classified():
+    """A new RPC on a partition-scoped service fails here until someone
+    decides which action it asks, so none ships unchecked."""
+    declared = set().union(
+        *(
+            proto_rpc_paths(REPO_ROOT / proto, service)
+            for proto, service in PARTITION_SCOPED_SERVICES
+        )
+    )
+    assert declared == set(RPC_ACTIONS), (
+        f"unclassified: {sorted(declared - set(RPC_ACTIONS))}, "
+        f"stale: {sorted(set(RPC_ACTIONS) - declared)}"
+    )
+
+
+@pytest.mark.smoke
+def test_every_partition_scoped_rpc_asks_its_action(auth_env, make_actor):
+    """Each RPC, sent raw with an empty body, is refused for a token lacking
+    its action and passes the check for a token holding only that action.
+    Read RPCs pass for a token holding any grant on the repository.
+    The access tokens carry a `resources` claim, which the legacy authorizer
+    answers in place, so no stub rule is involved. The checks run before
+    the body is used: PERMISSION_DENIED is the check, anything else means
+    it passed and the handler answered for the empty body."""
+    mock = auth_env.mock
+    owner = provision_owner(auth_env, make_actor, "user1", USER1)
+    target = grpc_target(auth_env.remote_url)
+    repo_id_hex = owner.resource_id.removeprefix("urc-")
+
+    def holding(*permissions: str) -> tuple[tuple[str, bytes], ...]:
+        # USER2 created nothing, so a privileged RPC cannot pass on the
+        # creator path.
+        token = mock.mint_token(
+            USER2, resources=authz_resources(owner.resource_id, permissions)
+        )
+        return repository_metadata(repo_id_hex) + (
+            ("authorization", f"Bearer {token}"),
+        )
+
+    tokens = {
+        action: holding(action)
+        for action in (
+            "read",
+            "write",
+            "owner",
+            "admin",
+            "migrate",
+            "push-protected",
+            "set-protected",
+        )
+    }
+    failures = []
+    for method, accepted in RPC_ACTIONS.items():
+        if accepted is None:
+            continue
+        for held, metadata in tokens.items():
+            code, _body, details = call(target, method, metadata=metadata, timeout=5.0)
+            denied = code == grpc.StatusCode.PERMISSION_DENIED
+            if denied != (accepted != ("read",) and held not in accepted):
+                failures.append(f"{method} with only {held}: {code} '{details}'")
+    assert not failures, "\n".join(failures)
+
+
 STORAGE_COPY = "/lore.storage.v1.StorageService/Copy"
 
 # google.rpc.Code values as `ItemStatus.code` carries them.
@@ -863,6 +1083,7 @@ def test_cross_partition_copy_requires_a_source_grant(auth_env):
 LINKER_API_KEY = "linker-api-key"
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_cross_partition_link_read_follows_the_token_claim(auth_env, make_actor):
     """A revision tree walk follows a link into another partition only when
@@ -917,7 +1138,7 @@ def test_cross_partition_link_read_follows_the_token_claim(auth_env, make_actor)
             node.path
             for node in revision_tree(
                 target, repository_id, signature, authorization=token
-            )
+            ).nodes
         }
 
     granted = tree_paths(both)
@@ -1090,8 +1311,8 @@ def test_cli_push_and_sync_follow_the_grant(auth_env, make_actor):
 def test_cli_notification_subscribe_follows_the_grant(auth_env, make_actor):
     """`lore notification subscribe` under the online rules: a granted
     member's subscription is accepted and receives the owner's lock events
-    until its listen window closes; once revoked, the subscribe bails out
-    early with an error instead of holding a stream open."""
+    until its listen window closes; once revoked, the subscribe fails at once
+    as `NotAuthorized` instead of holding a stream open."""
     mock = auth_env.mock
     owner = provision_owner(auth_env, make_actor, "user1", USER1)
     commit_file(owner.repo, "watched.txt", "watched content")
@@ -1125,12 +1346,13 @@ def test_cli_notification_subscribe_follows_the_grant(auth_env, make_actor):
     # its empty `resources` claim, refuses the body-declared partition, and
     # the CLI bails out instead of listening.
     unscoped = mock.mint_token(USER2, resources=[])
-    with pytest.raises(LoreException):
+    with pytest.raises(LoreException) as refused:
         member.repo.run(
             ["notification", "subscribe", "3"],
             identity_token=unscoped,
             access_token=unscoped,
         )
+    assert refused.value.returncode == 17, refused.value
 
 
 # ---------------------------------------------------------------------------
@@ -1139,6 +1361,40 @@ def test_cli_notification_subscribe_follows_the_grant(auth_env, make_actor):
 
 
 @pytest.mark.smoke
+def _config_identity(repo: Lore) -> str | None:
+    for line in (Path(repo.dot_path()) / "config.toml").read_text().splitlines():
+        if line.strip().startswith("identity"):
+            return line.split("=", 1)[1].strip().strip('"')
+    return None
+
+
+@pytest.mark.smoke
+def test_dry_run_does_not_save_the_identity_resolved_from_login(auth_env, make_actor):
+    """A write command run with `--dry-run` on a repository whose config has no identity
+    leaves the config without the identity it resolved from the login, where the same
+    command without it saves it."""
+    owner = provision_owner(auth_env, make_actor, "user1", USER1)
+    config = Path(owner.repo.dot_path()) / "config.toml"
+    config.write_text(
+        "".join(
+            line
+            for line in config.read_text().splitlines(keepends=True)
+            if not line.strip().startswith("identity")
+        )
+    )
+    owner.repo.write_files({"hello.txt": b"hello\n"})
+
+    owner.repo.stage(scan=True, dry_run=True)
+    assert _config_identity(owner.repo) is None, (
+        "stage --dry-run saved the identity to the config"
+    )
+
+    owner.repo.stage(scan=True)
+    assert _config_identity(owner.repo) == USER1.user_id, (
+        "stage did not save the identity resolved from the login"
+    )
+
+
 class TestForwardedRepositoryGetWithAuth:
     """The forwarded repository-get path under authentication.
 

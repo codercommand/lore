@@ -4,6 +4,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_proto::lore::repository::v1::RepositoryCreateRequest;
 use lore_revision::lore::RepositoryId;
+use lore_server::authnz::repository_registry::RepositoryRegistry;
 use lore_server::grpc::forwarded_repository::v1::repository_create::*;
 use lore_server::grpc::forwarded_requests::CallerContext;
 use lore_server::hooks::HookDispatcher;
@@ -40,6 +41,7 @@ fn make_forwarded_request(
     CallerContext {
         repository_id,
         user_id: "alice".into(),
+        is_service_account: false,
         correlation_id: String::new(),
         authorization: None,
     }
@@ -60,7 +62,7 @@ async fn missing_user_id_returns_internal_error() {
         let hook_dispatcher = HookDispatcher::empty();
         let err = handler(
             request,
-            None,
+            &RepositoryRegistry::Unregistered,
             immutable_store,
             mutable_store,
             &hook_dispatcher,
@@ -91,7 +93,7 @@ mod base_repository_create_handler {
 
             let response = handler(
                 make_forwarded_request(repository_id, "my-repo"),
-                None, /* no auth */
+                &RepositoryRegistry::Unregistered,
                 immutable_store,
                 mutable_store,
                 &hook_dispatcher,
@@ -123,7 +125,7 @@ mod base_repository_create_handler {
 
             handler(
                 make_forwarded_request(repository_id, "my-repo"),
-                None,
+                &RepositoryRegistry::Unregistered,
                 immutable_store.clone(),
                 mutable_store.clone(),
                 &hook_dispatcher,
@@ -135,7 +137,7 @@ mod base_repository_create_handler {
             // Same id, different name — should be AlreadyExists
             let err = handler(
                 make_forwarded_request(repository_id, "other-name"),
-                None,
+                &RepositoryRegistry::Unregistered,
                 immutable_store,
                 mutable_store,
                 &hook_dispatcher,

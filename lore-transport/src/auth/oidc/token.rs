@@ -4,9 +4,11 @@
 //! success and error responses it answers with (§5.1, §5.2).
 
 use lore_base::lore_warn;
+use lore_credential::now_ms;
 use serde::Deserialize;
 
 use super::FormResponse;
+use super::PostError;
 use super::body_excerpt;
 use super::on_net_runtime;
 use super::post_form;
@@ -21,6 +23,12 @@ pub struct TokenResponse {
     pub token_type: String,
     pub expires_in: Option<u64>,
     pub refresh_token: Option<String>,
+    /// Seconds until the refresh token stops working. No RFC or discovery metadata names
+    /// the field: GitHub, Azure AD and Google send `refresh_token_expires_in`, Keycloak
+    /// `refresh_expires_in`. Two fields rather than a serde alias, which would refuse a
+    /// response carrying both.
+    pub refresh_token_expires_in: Option<u64>,
+    pub refresh_expires_in: Option<u64>,
     pub scope: Option<String>,
     pub id_token: Option<String>,
 }
@@ -68,16 +76,52 @@ pub(super) async fn request<T>(
 where
     T: for<'de> Deserialize<'de> + Send + 'static,
 {
+    request_authorized(what, endpoint, form, None).await
+}
+
+/// [`request`] with `authorization` as the `Authorization` header, for a client that
+/// authenticates with HTTP Basic (RFC 6749 §2.3.1).
+pub(super) async fn request_authorized<T>(
+    what: &'static str,
+    endpoint: &str,
+    form: Vec<(&'static str, String)>,
+    authorization: Option<String>,
+) -> Result<Outcome<T>, ProtocolError>
+where
+    T: for<'de> Deserialize<'de> + Send + 'static,
+{
+    request_once(what, endpoint, form, authorization)
+        .await
+        .map_err(ProtocolError::from)
+}
+
+/// [`request_authorized`], telling a failure that sent nothing from one after which the
+/// provider may have acted on the request. Everything after a response arrives, a refusal
+/// that cannot be read and an unusable success included, may have been acted on.
+pub(super) async fn request_once<T>(
+    what: &'static str,
+    endpoint: &str,
+    form: Vec<(&'static str, String)>,
+    authorization: Option<String>,
+) -> Result<Outcome<T>, PostError>
+where
+    T: for<'de> Deserialize<'de> + Send + 'static,
+{
     let endpoint = endpoint.to_owned();
     on_net_runtime(async move {
         let form: Vec<(&str, &str)> = form
             .iter()
             .map(|(name, value)| (*name, value.as_str()))
             .collect();
-        let response = post_form(what, &endpoint, &form).await?;
-        parse(what, &response)
+        Ok(
+            match post_form(what, &endpoint, &form, authorization.as_deref()).await {
+                Ok(response) => parse(what, &response).map_err(PostError::MaybeSent),
+                Err(error) => Err(error),
+            },
+        )
     })
     .await
+    .map_err(PostError::MaybeSent)?
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(
@@ -119,8 +163,10 @@ pub fn authentication_token(response: TokenResponse) -> Result<AuthenticationTok
     let TokenResponse {
         access_token,
         token_type,
-        expires_in: _,
+        expires_in,
         refresh_token,
+        refresh_token_expires_in,
+        refresh_expires_in,
         scope,
         id_token,
     } = response;
@@ -130,10 +176,16 @@ pub fn authentication_token(response: TokenResponse) -> Result<AuthenticationTok
             body_excerpt(&token_type)
         )));
     }
-    let Some(access) = lore_credential::user_info_from_token(access_token) else {
+    let Ok(decoded) = lore_credential::insecure_decode_token(&access_token) else {
         return Err(ProtocolError::internal(
             "OIDC access token is not a JWT carrying the standard claims",
         ));
+    };
+    let Some(access) = lore_credential::user_info_from_token(access_token) else {
+        let (claim, _) = decoded.claims.identity_source();
+        return Err(ProtocolError::internal(format!(
+            "OIDC access token names no one: its identity claim '{claim}' is empty, null or not a string"
+        )));
     };
     let identity = id_token.and_then(lore_credential::user_info_from_token);
     let user_name = [identity.as_ref(), Some(&access)]
@@ -148,9 +200,44 @@ pub fn authentication_token(response: TokenResponse) -> Result<AuthenticationTok
         user_id: access.id,
         user_name,
         expires_ms: access.expires,
+        lifetime_ms: lifetime_ms(expires_in),
         // Populated by the orchestration layer from the token's claims.
         acceptable_root_domains: Vec::new(),
+        refresh_expires_ms: refresh_token.as_ref().map_or(0, |_| {
+            refresh_deadline(refresh_token_expires_in.or(refresh_expires_in))
+        }),
         refresh_token,
         scope,
     })
+}
+
+/// Remaining lifetime in milliseconds for `expires_in` seconds, capped where TOML can still hold
+/// it, or `None` when absent or zero.
+pub(super) fn lifetime_ms(expires_in: Option<u64>) -> Option<u64> {
+    expires_in
+        .filter(|&seconds| seconds > 0)
+        .map(|seconds| seconds.saturating_mul(1000).min(i64::MAX as u64))
+}
+
+/// The deadline `expires_in` seconds from now, in milliseconds since the UNIX epoch, or 0 for
+/// none. A `0` is none too: Keycloak sends it for offline tokens. The deadline is capped where
+/// the token store's TOML can still hold it.
+fn refresh_deadline(expires_in: Option<u64>) -> u64 {
+    let Some(expires_in) = expires_in.filter(|&seconds| seconds > 0) else {
+        return 0;
+    };
+    now_ms()
+        .saturating_add(expires_in.saturating_mul(1000))
+        .min(i64::MAX as u64)
+}
+
+/// The `scope` parameter (RFC 6749 §3.3) joining the non-empty entries of `scopes`, or `None`
+/// when there are none.
+pub(crate) fn join_scopes<'a>(scopes: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let scope = scopes
+        .into_iter()
+        .filter(|scope| !scope.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!scope.is_empty()).then_some(scope)
 }

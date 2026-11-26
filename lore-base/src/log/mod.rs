@@ -13,7 +13,16 @@ use serde::Serialize;
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 #[derive(
-    Debug, Copy, Clone, Default, PartialEq, PartialOrd, Serialize, bitcode::Encode, bitcode::Decode,
+    Debug,
+    Copy,
+    Clone,
+    Default,
+    PartialEq,
+    PartialOrd,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 #[serde(rename_all = "camelCase")]
 pub enum LoreLogLevel {
@@ -54,11 +63,23 @@ impl LoreLogLevel {
             _ => LoreLogLevel::None,
         }
     }
+
+    /// The level's name, such as `Debug`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            LoreLogLevel::None => "None",
+            LoreLogLevel::Trace => "Trace",
+            LoreLogLevel::Debug => "Debug",
+            LoreLogLevel::Info => "Info",
+            LoreLogLevel::Warn => "Warn",
+            LoreLogLevel::Error => "Error",
+        }
+    }
 }
 
 impl fmt::Display for LoreLogLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_str(self.name())
     }
 }
 

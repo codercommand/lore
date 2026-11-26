@@ -18,6 +18,71 @@ pub enum PathError {
     InvalidPath,
 }
 
+/// Whether `text` opens with a drive designator, a character and a colon, which Windows reads as
+/// a drive, absolute or relative to that drive's current directory.
+pub fn starts_with_drive(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some() && chars.next() == Some(':')
+}
+
+/// Whether a filesystem on some platform resolves `name` to somewhere other than an entry of its
+/// own: across a separator; to a drive, where it opens with a character and a colon; or, on
+/// Windows, to another entry, where it ends in a dot or a space, which Windows drops, or in a
+/// colon, or names a `$` stream type, as `a.` and `a::$DATA` name the file `a` and `...` the
+/// directory holding it.
+///
+/// Any other colon opens a named stream of a file beside it on NTFS, or a name NTFS refuses.
+pub fn resolves_elsewhere(name: &str) -> bool {
+    let mut scan = NameScan::default();
+    name.bytes().any(|byte| scan.refuses(byte)) || refuses_ends(name)
+}
+
+/// Whether `path`, joined below a directory, reaches anywhere but an entry below it on some
+/// platform: from a root, or through a component no node may be named, one that
+/// [`resolves_elsewhere`] or that is the repository's own directory.
+fn leaves_its_root(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    let mut start = 0;
+    let mut scan = NameScan::default();
+    for (index, byte) in path.bytes().chain(*b"/").enumerate() {
+        if byte == b'/' {
+            let component = &path[start..index];
+            if refuses_ends(component) || is_reserved_node_name(component) {
+                return true;
+            }
+            scan = NameScan::default();
+            start = index + 1;
+        } else if scan.refuses(byte) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the ends of `name` make it resolve elsewhere: a drive at its start, or a dot, a space
+/// or a colon at its end.
+fn refuses_ends(name: &str) -> bool {
+    starts_with_drive(name) || matches!(name.as_bytes().last(), Some(b'.' | b' ' | b':'))
+}
+
+/// One pass over a name's bytes, answering [`resolves_elsewhere`] for what lies between its ends.
+#[derive(Default)]
+struct NameScan {
+    after_colon: bool,
+}
+
+impl NameScan {
+    /// Takes the name's next byte, and answers whether that byte makes the name resolve
+    /// elsewhere: a separator, or a `$` after a colon.
+    fn refuses(&mut self, byte: u8) -> bool {
+        let refused = byte == b'/' || byte == b'\\' || (self.after_colon && byte == b'$');
+        self.after_colon = byte == b':';
+        refused
+    }
+}
+
 /// Resolves `path` against the working directory of the call in progress, or
 /// against this process's own when the call did not name one.
 ///
@@ -81,8 +146,8 @@ pub fn is_path_inside_repository(repository_path: &Path, candidate: &str) -> boo
 /// root, or through a dot directory at any depth, which holds a repository's own state rather
 /// than content the tree tracks.
 ///
-/// The dot directory is matched in any ASCII case, as it is on a filesystem that folds case. A
-/// path that cannot be resolved is held nowhere either. A caller dispatching on this reaches such
+/// The dot directory is matched in every spelling [`is_reserved_node_name`] answers for, such as
+/// `.LORE` on a filesystem that folds case. A path that cannot be resolved is held nowhere either. A caller dispatching on this reaches such
 /// a path directly, which asks nothing of the repository.
 pub fn repository_relative_path(repository_path: &Path, candidate: &str) -> Option<RelativePath> {
     RelativePath::new_from_user_path(repository_path, candidate).ok()
@@ -101,6 +166,62 @@ pub(crate) fn shared_component_depth(left: &str, right: &str) -> usize {
         .zip(right.split('/'))
         .take_while(|(left, right)| left == right)
         .count()
+}
+
+/// `paths` in byte order, the order [`covers_any`] and [`overlaps_any`] search.
+pub(crate) fn sorted_paths<'a>(paths: impl Iterator<Item = &'a RelativePath>) -> Vec<&'a str> {
+    let mut sorted: Vec<&str> = paths.map(RelativePath::as_str).collect();
+    sorted.sort_unstable();
+    sorted
+}
+
+/// Whether `sorted` holds `path` or a path below it. `sorted` must be in byte order
+/// ([`sorted_paths`]); the answer takes a binary search for `path` and one for the paths below it.
+#[lore_macro::test_pub]
+pub(crate) fn covers_any(sorted: &[&str], path: &str) -> bool {
+    if sorted.binary_search(&path).is_ok() {
+        return true;
+    }
+    // The paths below `path` follow `path/` in byte order, ahead of every other path. A sibling
+    // such as `path-x` sorts between `path` and `path/`.
+    let below = sorted.partition_point(|candidate| {
+        candidate
+            .bytes()
+            .lt(path.bytes().chain(std::iter::once(b'/')))
+    });
+    sorted.get(below).is_some_and(|candidate| {
+        candidate.as_bytes().get(path.len()) == Some(&b'/') && candidate.starts_with(path)
+    })
+}
+
+/// Whether a path of `sorted` covers `path`, as [`RelativePath::covers`] answers it: the two are
+/// equal, or the path of `sorted` is a path-ancestor of `path`. `sorted` must be in byte order
+/// ([`sorted_paths`]); the answer takes one binary search for `path` and one for each of its
+/// ancestors, where a scan compares every path.
+#[lore_macro::test_pub]
+pub(crate) fn covered_by_any(sorted: &[&str], path: &str) -> bool {
+    sorted.binary_search(&path).is_ok()
+        || path
+            .match_indices('/')
+            .any(|(at, _)| sorted.binary_search(&&path[..at]).is_ok())
+}
+
+/// Whether a path of `sorted` overlaps `path`, as [`RelativePath::overlaps`] answers it: the two
+/// are equal, one is a path-ancestor of the other, or one is empty. `sorted` must be in byte order
+/// ([`sorted_paths`]); the answer takes the searches of [`covers_any`] and one binary search for
+/// each ancestor of `path`, where a scan compares every path.
+#[lore_macro::test_pub]
+pub(crate) fn overlaps_any(sorted: &[&str], path: &str) -> bool {
+    let Some(first) = sorted.first() else {
+        return false;
+    };
+    // The empty path sorts first.
+    first.is_empty()
+        || path.is_empty()
+        || covers_any(sorted, path)
+        || path
+            .match_indices('/')
+            .any(|(at, _)| sorted.binary_search(&&path[..at]).is_ok())
 }
 
 /// A repository-relative path carrying its own depth.
@@ -440,13 +561,21 @@ pub struct RelativePathData {
 }
 
 /// The COW path type with offset-based views
+///
+/// A walk holds a path for every change it finds, millions for a large tree, so the size of a
+/// path is a large share of what a change costs. 32-bit offsets keep it to 24 bytes.
 #[derive(Clone)]
 pub struct RelativePath {
     data: Arc<RelativePathData>,
-    start: usize,       // View start offset into path
-    end: usize,         // View end offset into path
-    start_lower: usize, // View start offset into path_lower
-    end_lower: usize,   // View end offset into path_lower
+    start: u32,       // View start offset into path
+    end: u32,         // View end offset into path
+    start_lower: u32, // View start offset into path_lower
+    end_lower: u32,   // View end offset into path_lower
+}
+
+/// An offset into a path's data. Paths are bounded far below 4 GiB by every filesystem.
+fn offset(value: usize) -> u32 {
+    u32::try_from(value).expect("a path shorter than 4 GiB")
 }
 
 /// The shared data an empty path views, so naming one costs an atomic rather than an
@@ -472,15 +601,13 @@ impl RelativePath {
 
     pub fn pop(&mut self) -> &mut Self {
         if !self.is_empty() {
-            let view = &self.data.path[self.start..self.end];
-            if let Some(sep) = view.rfind('/') {
+            if let Some(sep) = self.as_str().rfind('/') {
                 // Adjust end to remove the last component
-                self.end = self.start + sep;
+                self.end = self.start + offset(sep);
 
                 // Adjust end_lower similarly
-                let view_lower = &self.data.path_lower[self.start_lower..self.end_lower];
-                if let Some(sep_lower) = view_lower.rfind('/') {
-                    self.end_lower = self.start_lower + sep_lower;
+                if let Some(sep_lower) = self.as_lowercase_str().rfind('/') {
+                    self.end_lower = self.start_lower + offset(sep_lower);
                 }
             } else {
                 // No separator found, clear the view
@@ -492,20 +619,18 @@ impl RelativePath {
     }
 
     pub fn pop_root(&mut self) -> &str {
-        let view = &self.data.path[self.start..self.end];
-        let root = if let Some(sep) = view.find('/') {
-            &self.data.path[self.start..(self.start + sep)]
-        } else {
-            &self.data.path[self.start..self.end]
-        };
+        let start = self.start as usize;
+        let view = &self.data.path[start..self.end as usize];
+        let root_len = view.find('/').unwrap_or(view.len());
+        let root = &self.data.path[start..start + root_len];
 
-        let root_len = root.len();
         if root_len + 1 < self.len() {
-            self.start = self.start + root_len + 1;
+            self.start = self.start + offset(root_len) + 1;
 
-            let view_lower = &self.data.path_lower[self.start_lower..self.end_lower];
+            let view_lower =
+                &self.data.path_lower[self.start_lower as usize..self.end_lower as usize];
             if let Some(sep) = view_lower.find('/') {
-                self.start_lower = self.start_lower + sep + 1;
+                self.start_lower = self.start_lower + offset(sep) + 1;
             }
         } else {
             self.start = self.end;
@@ -539,8 +664,8 @@ impl RelativePath {
         let separator = self.as_str().rfind('/');
         let separator_lower = self.as_lowercase_str().rfind('/');
         if let (Some(separator), Some(separator_lower)) = (separator, separator_lower) {
-            self.end = self.start + separator;
-            self.end_lower = self.start_lower + separator_lower;
+            self.end = self.start + offset(separator);
+            self.end_lower = self.start_lower + offset(separator_lower);
         } else {
             self.end = self.start;
             self.end_lower = self.start_lower;
@@ -583,7 +708,7 @@ impl RelativePath {
     }
 
     pub fn len(&self) -> usize {
-        self.end - self.start
+        (self.end - self.start) as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -591,11 +716,27 @@ impl RelativePath {
     }
 
     pub fn as_str(&self) -> &str {
-        &self.data.path[self.start..self.end]
+        &self.data.path[self.start as usize..self.end as usize]
     }
 
     pub fn as_lowercase_str(&self) -> &str {
-        &self.data.path_lower[self.start_lower..self.end_lower]
+        &self.data.path_lower[self.start_lower as usize..self.end_lower as usize]
+    }
+
+    /// `spelled`, a spelling of this path that differs from it in case alone, as a path. Takes this
+    /// path's lowercase form rather than folding `spelled` again.
+    pub(crate) fn respelled(&self, spelled: String) -> RelativePath {
+        debug_assert!(
+            spelled
+                .parse::<RelativePath>()
+                .is_ok_and(|path| path.as_lowercase_str() == self.as_lowercase_str()),
+            "{spelled} differs from {self} in more than case"
+        );
+        RelativePathBuf {
+            path: spelled,
+            path_lower: self.as_lowercase_str().to_owned(),
+        }
+        .freeze()
     }
 
     pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePath, PathError> {
@@ -626,8 +767,56 @@ impl RelativePath {
         RelativePathBuf::relative_to_root(repository_path, mount_path).map(|p| p.freeze())
     }
 
-    pub fn to_absolute_path(&self, repository_path: impl AsRef<Path>) -> PathBuf {
-        repository_path.as_ref().join(self.as_str())
+    /// Where the path is below `repository_path`.
+    ///
+    /// Refuses a path that reaches anywhere else on some platform, whatever names a tree let in:
+    /// one that starts at a root, and one through a component no node may be named, such as a
+    /// step up, a drive or the repository's own directory.
+    pub fn to_absolute_path(
+        &self,
+        repository_path: impl AsRef<Path>,
+    ) -> Result<PathBuf, PathError> {
+        let path = self.as_str();
+        if leaves_its_root(path) {
+            return Err(InvalidPath {
+                path: path.to_owned(),
+            }
+            .into());
+        }
+        Ok(repository_path.as_ref().join(path))
+    }
+
+    /// [`Self::to_absolute_path`] written into `buffer`, whose allocation it reuses, for a caller
+    /// placing many paths below one directory.
+    pub fn place_below(
+        &self,
+        repository_path: &Path,
+        buffer: &mut PathBuf,
+    ) -> Result<(), PathError> {
+        let path = self.as_str();
+        if leaves_its_root(path) {
+            return Err(InvalidPath {
+                path: path.to_owned(),
+            }
+            .into());
+        }
+        buffer.as_mut_os_string().clear();
+        buffer.push(repository_path);
+        buffer.push(path);
+        Ok(())
+    }
+
+    /// [`Self::to_absolute_path`], held in `cache` and placed there only where `cache` holds
+    /// none, so a walk that never asks for it allocates nothing.
+    pub fn to_absolute_path_cached<'a>(
+        &self,
+        repository_path: &Path,
+        cache: &'a mut Option<PathBuf>,
+    ) -> Result<&'a mut PathBuf, PathError> {
+        match cache {
+            Some(path) => Ok(path),
+            None => Ok(cache.insert(self.to_absolute_path(repository_path)?)),
+        }
     }
 
     pub fn join(&self, suffix: impl AsRef<str>) -> RelativePath {
@@ -644,9 +833,9 @@ impl RelativePath {
                 // We have exclusive ownership
                 // If we're viewing the full string, we can avoid allocation
                 if self.start == 0
-                    && self.end == data.path.len()
+                    && self.end as usize == data.path.len()
                     && self.start_lower == 0
-                    && self.end_lower == data.path_lower.len()
+                    && self.end_lower as usize == data.path_lower.len()
                 {
                     // Full view - take ownership directly
                     RelativePathBuf {
@@ -655,15 +844,18 @@ impl RelativePath {
                     }
                 } else {
                     // Partial view - must extract substring
-                    let path = data.path[self.start..self.end].to_owned();
-                    let path_lower = data.path_lower[self.start_lower..self.end_lower].to_owned();
+                    let path = data.path[self.start as usize..self.end as usize].to_owned();
+                    let path_lower = data.path_lower
+                        [self.start_lower as usize..self.end_lower as usize]
+                        .to_owned();
                     RelativePathBuf { path, path_lower }
                 }
             }
             Err(arc) => {
                 // Shared - must clone the view
-                let path = arc.path[self.start..self.end].to_owned();
-                let path_lower = arc.path_lower[self.start_lower..self.end_lower].to_owned();
+                let path = arc.path[self.start as usize..self.end as usize].to_owned();
+                let path_lower =
+                    arc.path_lower[self.start_lower as usize..self.end_lower as usize].to_owned();
                 RelativePathBuf { path, path_lower }
             }
         }
@@ -698,8 +890,8 @@ impl RelativePath {
     /// More efficient than `into_buf().append()` because it pre-allocates the exact
     /// capacity needed and copies directly without intermediate allocations.
     pub fn append_into_buf(&self, suffix: &str) -> RelativePathBuf {
-        let view = &self.data.path[self.start..self.end];
-        let view_lower = &self.data.path_lower[self.start_lower..self.end_lower];
+        let view = self.as_str();
+        let view_lower = self.as_lowercase_str();
 
         if suffix.is_empty() {
             let mut path = String::with_capacity(view.len());
@@ -726,8 +918,8 @@ impl RelativePath {
     /// More efficient than `into_buf().push()` because it pre-allocates the exact
     /// capacity needed and copies directly without intermediate allocations.
     pub fn push_into_buf(&self, suffix: impl AsRef<str>) -> RelativePathBuf {
-        let view = &self.data.path[self.start..self.end];
-        let view_lower = &self.data.path_lower[self.start_lower..self.end_lower];
+        let view = self.as_str();
+        let view_lower = self.as_lowercase_str();
 
         let suffix = suffix.as_ref();
         if suffix.is_empty() {
@@ -767,11 +959,31 @@ impl RelativePath {
         covers_impl(self.as_str(), child.as_ref())
     }
 
+    /// Whether an entry of `antichain`, ordered as [`Self::dedup_to_supersets`] leaves it, covers
+    /// `self` ([`Self::covers_ignore_case`]); one search, as only the entry ordered last at or
+    /// before `self` can cover it.
+    pub fn covered_in(&self, antichain: &[RelativePath]) -> bool {
+        let at = antichain.partition_point(|entry| {
+            compare_subtree_order(entry.as_lowercase_str(), self.as_lowercase_str())
+                != std::cmp::Ordering::Greater
+        });
+        at > 0 && antichain[at - 1].covers_ignore_case(self)
+    }
+
     /// [`covers`](Self::covers) on the lowercased form. Node lookup hashes
     /// names case-insensitively, so a path the caller resolved a node from can
     /// differ in case from the stored paths it has to be compared against.
     pub fn covers_ignore_case(&self, child: &RelativePath) -> bool {
         covers_impl(self.as_lowercase_str(), child.as_lowercase_str())
+    }
+
+    /// Returns `true` if `self` is strictly below `ancestor`, on the lowercased forms as
+    /// [`covers_ignore_case`](Self::covers_ignore_case) compares them. Unlike
+    /// [`below`](Self::below), `ancestor` itself is not below it, and an empty `ancestor` has
+    /// nothing below it.
+    pub fn is_below_ignore_case(&self, ancestor: &RelativePath) -> bool {
+        let (ancestor, path) = (ancestor.as_lowercase_str(), self.as_lowercase_str());
+        ancestor.len() < path.len() && covers_impl(ancestor, path)
     }
 
     /// The names of this path below `ancestor`, or `None` where `ancestor` does not cover it.
@@ -786,6 +998,12 @@ impl RelativePath {
         }
         covers_impl(ancestor.as_str(), self.as_str())
             .then(|| self.as_str()[ancestor.len()..].trim_start_matches('/'))
+    }
+
+    /// [`below`](Self::below) comparing names case-insensitively, as node lookup does, and
+    /// answering the names as this path spells them.
+    pub fn below_ignore_case(&self, ancestor: &RelativePath) -> Option<&str> {
+        strip_lowercase_prefix(self.as_str(), ancestor.as_lowercase_str())
     }
 
     /// [`overlaps`](Self::overlaps) on the lowercased form, for the same reason
@@ -1025,8 +1243,8 @@ impl FromStr for RelativePath {
     fn from_str(path: &str) -> Result<Self, std::convert::Infallible> {
         let mut path_lower = String::with_capacity(path.len());
         push_lowercase(&mut path_lower, path);
-        let end = path.len();
-        let end_lower = path_lower.len();
+        let end = offset(path.len());
+        let end_lower = offset(path_lower.len());
         Ok(RelativePath {
             data: Arc::new(RelativePathData {
                 path: path.to_owned(),
@@ -1101,14 +1319,13 @@ impl RelativePathBuf {
     /// and the canonical separator are what nearly every path already holds, and
     /// establishing that costs no string of its own.
     pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePathBuf, PathError> {
-        let name = name.as_ref();
-        if name.len() >= 2 && name.as_bytes()[1] == b':' {
+        let name = name.as_ref().trim_matches('/');
+        if starts_with_drive(name) {
             return Err(InvalidPath {
                 path: name.to_string(),
             }
             .into());
         }
-        let name = name.trim_matches('/');
         let name = if name.contains('\\') || name.contains("//") {
             let mut rewritten = name.replace('\\', "/");
             collapse_separators(&mut rewritten);
@@ -1152,15 +1369,20 @@ impl RelativePathBuf {
     /// Construct from a user-provided path relative to a repository path.
     /// Makes the user path absolute if needed, then computes the relative portion.
     ///
-    /// A path through the repository's own directory, in any ASCII case and at any depth, is an
-    /// invalid path: no node carries that name, so the tree holds nothing there, and a lookup by
-    /// it would otherwise reach a node a revision holds under that name.
+    /// A path through the repository's own directory, in any spelling and at any depth, or
+    /// through a name a filesystem resolves elsewhere, such as a drive, is an invalid path: no
+    /// node carries such a name, so the tree holds nothing there, and a lookup by it would
+    /// otherwise reach a node a revision holds under that name.
     pub fn new_from_user_path(
         repository_path: &Path,
         user_path: &str,
     ) -> Result<RelativePathBuf, PathError> {
         let path = Self::relative_to_root(repository_path, user_path)?;
-        if path.path.split('/').any(is_reserved_node_name) {
+        if path
+            .path
+            .split('/')
+            .any(|name| is_reserved_node_name(name) || resolves_elsewhere(name))
+        {
             return Err(InvalidPath { path: path.path }.into());
         }
         Ok(path)
@@ -1344,8 +1566,8 @@ impl RelativePathBuf {
     /// Convert to immutable `RelativePath`.
     /// Creates an Arc-wrapped data structure with the full view.
     pub fn freeze(self) -> RelativePath {
-        let end = self.path.len();
-        let end_lower = self.path_lower.len();
+        let end = offset(self.path.len());
+        let end_lower = offset(self.path_lower.len());
         RelativePath {
             data: Arc::new(RelativePathData {
                 path: self.path,
@@ -1410,4 +1632,18 @@ impl AsRef<str> for RelativePathBuf {
     fn as_ref(&self) -> &str {
         self.path.as_str()
     }
+}
+
+/// Whether a path `path_of` reads from an item of `sorted`, sorted by that path, is below
+/// `directory`.
+pub(crate) fn sorted_holds_below<T>(
+    sorted: &[T],
+    path_of: impl Fn(&T) -> &str,
+    directory: &RelativePath,
+) -> bool {
+    let prefix = format!("{directory}/");
+    let first = sorted.partition_point(|item| path_of(item) < prefix.as_str());
+    sorted
+        .get(first)
+        .is_some_and(|item| path_of(item).starts_with(&prefix))
 }

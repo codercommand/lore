@@ -139,6 +139,7 @@ fn registry() -> Vec<(&'static str, Group, i32)> {
             Group::Connectivity,
             ServiceUnavailable { reason: text() }.ffi_code(),
         ),
+        ("Cancelled", Group::Connectivity, Cancelled.ffi_code()),
         (
             "NothingStaged",
             Group::RepositoryState,
@@ -184,6 +185,29 @@ fn registry() -> Vec<(&'static str, Group, i32)> {
             "DeleteDefault",
             Group::RepositoryState,
             DeleteDefault { branch: text() }.ffi_code(),
+        ),
+        (
+            "MountsBusy",
+            Group::RepositoryState,
+            MountsBusy { paths: text() }.ffi_code(),
+        ),
+        (
+            "LinkDivergent",
+            Group::RepositoryState,
+            LinkDivergent {
+                path: text(),
+                branch: text(),
+            }
+            .ffi_code(),
+        ),
+        (
+            "LinkPinsDiverge",
+            Group::RepositoryState,
+            LinkPinsDiverge {
+                repository: text(),
+                mounts: text(),
+            }
+            .ffi_code(),
         ),
         (
             "AlreadyLinked",
@@ -373,5 +397,59 @@ fn group_blocks_do_not_overlap_each_other() {
                 "the {group:?} block {block:?} and the {other:?} block {other_block:?} overlap at {overlap:?}"
             );
         }
+    }
+}
+
+/// The remote's refusal of the caller, told apart from every other failure and forwarded with its
+/// variant.
+mod refusal {
+    use lore_base::error::*;
+    use lore_error_set::prelude::*;
+
+    #[error_set]
+    enum Remote {
+        NotAuthenticated,
+        NotAuthorized,
+        Disconnected,
+    }
+
+    #[error_set]
+    enum Command {
+        NotAuthenticated,
+        NotAuthorized,
+        FileNotFound,
+    }
+
+    fn file_not_found(error: Remote) -> Command {
+        Command::FileNotFound(
+            FileNotFound {
+                resource: "file".to_string(),
+            }
+            .chain_err_from(error, "resolving the file"),
+        )
+    }
+
+    #[test]
+    fn a_refusal_is_unauthenticated_or_unauthorized() {
+        assert!(is_refusal(&Remote::from(NotAuthenticated)));
+        assert!(is_refusal(&Remote::from(NotAuthorized)));
+        assert!(!is_refusal(&Remote::from(Disconnected)));
+        assert!(!is_refusal(&Remote::internal("failed")));
+    }
+
+    /// A refusal is forwarded with its variant, and every other failure takes the mapping the
+    /// caller gives, here the not-found a lookup reports.
+    #[test]
+    fn a_refusal_is_forwarded_and_any_other_failure_mapped() {
+        let forward = |error| forward_refusal_or(error, "resolving the file", file_not_found);
+
+        let error = forward(Remote::from(NotAuthenticated));
+        assert!(error.is_not_authenticated(), "{error:?}");
+        let error = forward(Remote::from(NotAuthorized));
+        assert!(error.is_not_authorized(), "{error:?}");
+        let error = forward(Remote::from(Disconnected));
+        assert!(error.is_file_not_found(), "{error:?}");
+        let error = forward(Remote::internal("failed"));
+        assert!(error.is_file_not_found(), "{error:?}");
     }
 }

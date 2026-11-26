@@ -16,6 +16,7 @@ use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::FileInfo;
@@ -34,20 +35,23 @@ use crate::node;
 use crate::node::Node;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
+use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
 use crate::revision;
-use crate::state;
 use crate::state::NodeComparison;
 use crate::state::State;
+use crate::state::StateNodeChildrenIterator;
 use crate::util::path::RelativePath;
 use crate::util::serde::u8_as_bool;
 
 #[error_set]
 pub enum InfoError {
+    Cancelled,
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     RevisionNotFound,
@@ -113,7 +117,9 @@ impl EventError for InfoError {
 
 /// Data for the event reporting information about a single file or directory.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileInfoEventData {
     /// Path of the file or directory.
@@ -167,28 +173,7 @@ pub async fn info(
     paths: Vec<RelativePath>,
     options: InfoOptions,
 ) -> Result<(), InfoError> {
-    let signature = if let Some(revision_spec) = options.revision {
-        revision::resolve(
-            repository.clone(),
-            revision_spec.as_str(),
-            execution_context().globals().search_location(),
-        )
-        .await
-        .map_err(|_err| {
-            InfoError::from(RevisionNotFound {
-                revision: revision_spec,
-            })
-        })?
-    } else {
-        let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
-            .await
-            .forward::<InfoError>("Failed deserializing revision state")?;
-        current_revision
-    };
-
-    let state = state::State::deserialize(repository.clone(), signature)
-        .await
-        .forward::<InfoError>("Failed deserializing revision state")?;
+    let (state, tree) = info_trees(&repository, options.revision).await?;
 
     with_operation(repository.file_system(), async |operation| {
         let mut tasks = JoinSet::new();
@@ -198,6 +183,7 @@ pub async fn info(
             let operation = operation.clone();
             let repository = repository.clone();
             let state = state.clone();
+            let tree = tree.clone();
             let path = path.clone();
 
             lore_spawn!(tasks, async move {
@@ -205,9 +191,12 @@ pub async fn info(
                     operation,
                     repository,
                     state,
+                    tree,
                     path,
-                    options.local,
-                    options.filtered,
+                    RequestedSizes {
+                        local: options.local,
+                        filtered: options.filtered,
+                    },
                 )
                 .await
             });
@@ -231,34 +220,139 @@ pub async fn info(
     .await
 }
 
+/// The revision `file info` reports from, and the tree that decides what is tracked and is measured:
+/// `revision` where it names one, both of them; otherwise the current revision, and the staged
+/// tree where something is staged, as [`State::tracks`] decides for status, staging and locks.
+async fn info_trees(
+    repository: &Arc<RepositoryContext>,
+    revision: Option<String>,
+) -> Result<(Arc<State>, InfoTree), InfoError> {
+    if let Some(revision_spec) = revision {
+        let signature = revision::resolve(
+            repository.clone(),
+            revision_spec.as_str(),
+            execution_context().globals().search_location(),
+        )
+        .await
+        .map_err(|err| {
+            forward_refusal_or(err, "resolving the revision", |_err| {
+                InfoError::from(RevisionNotFound {
+                    revision: revision_spec,
+                })
+            })
+        })?;
+        let state = State::deserialize(repository.clone(), signature)
+            .await
+            .forward::<InfoError>("Failed deserializing revision state")?;
+        return Ok((state.clone(), InfoTree::committed(state)));
+    }
+    let (current_revision, _current_branch) = crate::instance::load_current_anchor(repository)
+        .await
+        .forward::<InfoError>("Failed deserializing revision state")?;
+    let state = State::deserialize(repository.clone(), current_revision)
+        .await
+        .forward::<InfoError>("Failed deserializing revision state")?;
+    let Some(staged) = crate::instance::load_staged_revision(repository)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return Ok((state.clone(), InfoTree::committed(state)));
+    };
+    let tree = State::deserialize_staged(repository.clone(), staged, current_revision)
+        .await
+        .forward::<InfoError>("Failed deserializing the staged state")?;
+    tree.hold_current_where_staged_on(&state);
+    Ok((
+        state,
+        InfoTree {
+            state: tree,
+            mode: FilterMode::TRACKED,
+        },
+    ))
+}
+
+/// The tree `file info` measures sizes against, and the mode a walk over its nodes asks the filter
+/// in: the view alone for a revision, which tracks every node it holds, and the view and the ignore
+/// rules for what it does not track for the staged tree.
+#[derive(Clone)]
+struct InfoTree {
+    state: Arc<State>,
+    mode: FilterMode,
+}
+
+impl InfoTree {
+    fn committed(state: Arc<State>) -> Self {
+        Self {
+            state,
+            mode: FilterMode::View,
+        }
+    }
+
+    /// The node this tree holds at `path`, unless the path crosses a link.
+    async fn node(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        path: &RelativePath,
+    ) -> Result<Option<(NodeID, Node)>, InfoError> {
+        let Some(id) = absent_unless_refused::<_, _, InfoError>(
+            self.state
+                .locate_node(repository.clone(), path.as_str())
+                .await,
+            "finding the node in the measured tree",
+        )?
+        .and_then(|found| found.own_node()) else {
+            return Ok(None);
+        };
+        let node = self
+            .state
+            .node(repository.clone(), id)
+            .await
+            .forward::<InfoError>("reading the node in the measured tree")?;
+        Ok(Some((id, node)))
+    }
+}
+
+/// Reports `path` as `state_current` holds it, with the sizes `sizes` asks for measured against
+/// `tree`. A path `state_current` does not hold is reported added, and is measured as `tree` holds
+/// it, or, where `tree` holds nothing there, left out of the local size where the filter leaves
+/// it out.
 async fn info_path(
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
+    tree: InfoTree,
     path: RelativePath,
-    local: bool,
-    filtered: bool,
+    sizes: RequestedSizes,
 ) -> Result<(), InfoError> {
-    if let Ok(node_link) = state_current
-        .find_node_link(repository.clone(), path.as_str())
-        .await
-    {
+    let RequestedSizes { local, filtered } = sizes;
+    if let Some(found) = absent_unless_refused::<_, _, InfoError>(
+        state_current
+            .locate_node(repository.clone(), path.as_str())
+            .await,
+        "finding the node",
+    )? {
         // TODO(vri): UCS-19229 - Links: Handle link nodes in file info lookup
+        let node_id = found.identity().node;
         let node_path = state_current
-            .node_path(repository.clone(), node_link.node)
+            .node_path(repository.clone(), node_id)
             .await
-            .map_err(|_err| {
-                InfoError::from(FileNotFound {
-                    resource: path.to_string(),
+            .map_err(|err| {
+                forward_refusal_or(err, "reading the node path", |_err| {
+                    InfoError::from(FileNotFound {
+                        resource: path.to_string(),
+                    })
                 })
             })?;
 
         let node = state_current
-            .node(repository.clone(), node_link.node)
+            .node(repository.clone(), node_id)
             .await
-            .map_err(|_err| {
-                InfoError::from(FileNotFound {
-                    resource: path.to_string(),
+            .map_err(|err| {
+                forward_refusal_or(err, "reading the node", |_err| {
+                    InfoError::from(FileNotFound {
+                        resource: path.to_string(),
+                    })
                 })
             })?;
 
@@ -270,46 +364,40 @@ async fn info_path(
 
         if filtered {
             // We will be iterating the tree, cache the state fragments
-            let _ = state_current
-                .cache_fragments(repository.clone(), false)
-                .await;
+            let _ = tree.state.cache_fragments(repository.clone(), false).await;
         }
 
         lore_debug!("Info local {local} and filtered {filtered}");
         let mut local_filtered = if local || filtered {
-            // Calculate the local size and hash
-            calculate_local_filtered_size_hash(
-                operation.clone(),
-                repository.clone(),
-                path.clone(),
-                state_current.clone(),
-                node,
-                node_link.node,
-                RequestedSizes { local, filtered },
-            )
-            .await?
+            measure_held(&operation, &repository, &tree, &path, sizes)
+                .await?
+                .unwrap_or_default()
         } else {
             LocalFiltered::default()
         };
 
         let mut is_deleted = false;
         if local_filtered.local_size == 0 {
-            match operation.file_info(&path).await {
-                Ok(info) if info.is_file() => {
+            let described = operation
+                .file_info(&path)
+                .await
+                .forward_any::<InfoError>("Failed to describe a file")?;
+            match described {
+                info if info.is_file() => {
                     let (comparison, local_hash) =
                         compare_to_node(&operation, &repository, &node, info.size(), &path).await?;
                     local_filtered.local_size = info.size();
                     local_filtered.local_hash = local_hash;
                     local_filtered.comparison = Some(comparison);
                 }
-                Ok(info) if info.exists() => {}
+                info if info.exists() => {}
                 _ => is_deleted = true,
             }
         }
 
         let is_modified = matches!(local_filtered.comparison, Some(NodeComparison::Differs));
 
-        let node_size = if node_link.node == ROOT_NODE {
+        let node_size = if node_id == ROOT_NODE {
             let tree = state_current
                 .tree(repository.clone())
                 .await
@@ -336,7 +424,7 @@ async fn info_path(
         })
         .send();
 
-        let metadata_node = node::node_to_file_metadata(node_link.node);
+        let metadata_node = node::node_to_file_metadata(node_id);
         let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
         let metadata_node_index = NodeFileMetadata::index(metadata_node);
 
@@ -363,8 +451,17 @@ async fn info_path(
         let info = operation
             .file_info(&path)
             .await
-            .unwrap_or(FileInfo::NotExist);
+            .forward_any::<InfoError>("Failed to describe a path")?;
         if info.exists() {
+            let held = if local || filtered {
+                measure_held(&operation, &repository, &tree, &path, sizes).await?
+            } else {
+                None
+            };
+            let local_filtered = held.unwrap_or_else(|| LocalFiltered {
+                local_size: untracked_local_size(&repository, &path, info),
+                ..LocalFiltered::default()
+            });
             event::LoreEvent::FileInfo(LoreFileInfoEventData {
                 path: path.into(),
                 context: Context::default(),
@@ -377,15 +474,59 @@ async fn info_path(
                 flag_conflict: 0,
                 size: 0,
                 mode: 0,
-                local_size: info.size(),
-                local_hash: Hash::default(),
-                filter_size: 0,
+                local_size: local_filtered.local_size,
+                local_hash: local_filtered.local_hash,
+                filter_size: local_filtered.filtered_size,
             })
             .send();
         }
     }
 
     Ok(())
+}
+
+/// The sizes of what `tree` holds at `path`, measured as `sizes` asks, or `None` where it holds
+/// nothing there.
+async fn measure_held(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    tree: &InfoTree,
+    path: &RelativePath,
+    sizes: RequestedSizes,
+) -> Result<Option<LocalFiltered>, InfoError> {
+    let Some((node_id, node)) = tree.node(repository, path).await? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        calculate_local_filtered_size_hash(
+            operation.clone(),
+            repository.clone(),
+            path.clone(),
+            tree.clone(),
+            node,
+            node_id,
+            sizes,
+        )
+        .await?,
+    ))
+}
+
+/// What the working tree's entry at `path`, described by `info`, adds to the local size where the
+/// measured tree holds nothing there: nothing where the filter leaves it out, emitting a
+/// `LoreEvent::FilterExclude` there.
+fn untracked_local_size(
+    repository: &RepositoryContext,
+    path: &RelativePath,
+    info: FileInfo,
+) -> u64 {
+    if repository
+        .filter
+        .emit_excludes(path, info.is_dir(), FilterMode::Full)
+    {
+        0
+    } else {
+        info.size()
+    }
 }
 
 /// Which sizes a request asked to be walked for, neither of which is cheap on a directory.
@@ -413,6 +554,7 @@ async fn compare_to_node(
         repository.clone(),
         node,
         file_size,
+        0,
         relative_path,
         operation,
         &lore_storage::ContentHashes::default(),
@@ -453,23 +595,40 @@ struct LocalFiltered {
     filtered_size: u64,
 }
 
+/// The local and filtered sizes of `node`, which `tree` holds at `relative_path` as `node_id`, and
+/// how the working tree's file there compares to it.
+///
+/// The ignore file has no say over what `tree` tracks ([`State::tracks`]): the path, the walk over
+/// `tree` and the walk over the working tree ask it only about what `tree` does not track
+/// ([ADR-00027](../../../docs/developing/decisions/00027-ignore-filter-applies-to-untracked-paths-only.md)).
 async fn calculate_local_filtered_size_hash(
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     relative_path: RelativePath,
-    state: Arc<State>,
+    tree: InfoTree,
     node: Node,
     node_id: NodeID,
     sizes: RequestedSizes,
 ) -> Result<LocalFiltered, InfoError> {
     let parent_states = repository.filter.parent_exclusion_states(&relative_path);
-    let (_, excluded) = repository.filter.child_emit_excludes(
-        parent_states,
-        &relative_path,
-        node.is_directory(),
-        FilterMode::Full,
-    );
-    if excluded {
+    let (_, reason) = repository
+        .filter
+        .child_tracked_reason(
+            parent_states,
+            &relative_path,
+            node.is_directory(),
+            FilterMode::TRACKED,
+            || {
+                tree.state.tracks(
+                    &repository,
+                    node_id,
+                    NodeFlags::from_bits_retain(node.flags),
+                )
+            },
+        )
+        .await
+        .forward_any::<InfoError>("reading the revision the measured tree was built on")?;
+    if Filter::emit(&relative_path, reason) {
         return Ok(LocalFiltered::default());
     }
 
@@ -477,7 +636,7 @@ async fn calculate_local_filtered_size_hash(
         let info = operation
             .file_info(&relative_path)
             .await
-            .unwrap_or(FileInfo::NotExist);
+            .forward_any::<InfoError>("Failed to describe a file")?;
         if !info.is_file() {
             return Ok(LocalFiltered {
                 filtered_size: node.size,
@@ -504,19 +663,26 @@ async fn calculate_local_filtered_size_hash(
         let local_size_repository = repository.clone();
         let local_size_relative_path = relative_path.clone();
         let local_size_operation = operation.clone();
+        let local_size_held = HeldAncestor {
+            repository: repository.clone(),
+            state: tree.state.clone(),
+            node: node_id,
+            path_len: relative_path.as_str().len(),
+        };
         let local_size_task = lore_spawn!(async move {
             if sizes.local {
                 lore_debug!("Calculating local size");
                 let local_info = local_size_operation
                     .file_info(&local_size_relative_path)
                     .await
-                    .unwrap_or(FileInfo::NotExist);
-                calculate_local_size_recurse(
+                    .forward_any::<InfoError>("Failed to describe a path")?;
+                calculate_local_size(
                     local_size_operation,
                     local_size_repository,
                     local_size_relative_path,
                     local_info,
                     parent_states,
+                    Some(local_size_held),
                 )
                 .await
             } else {
@@ -527,14 +693,13 @@ async fn calculate_local_filtered_size_hash(
         // Filter local directory and calculate sizes
         let filtered_size_repository = repository.clone();
         let filtered_size_relative_path = relative_path.clone();
-        let filtered_state = state.clone();
         let filtered_size_task = lore_spawn!(async move {
             if sizes.filtered {
                 lore_debug!("Calculating filtered size");
                 calculate_filtered_size_recurse(
                     filtered_size_repository,
                     filtered_size_relative_path,
-                    filtered_state,
+                    tree,
                     node,
                     node_id,
                     parent_states,
@@ -575,25 +740,253 @@ fn is_dot_directory(path: &RelativePath) -> bool {
     is_reserved_node_name(path.as_str())
 }
 
-/// What the file at `path` adds to the local size, which is nothing where the repository's own
-/// directory stands there or the filter leaves the path out.
+/// What the file at `path`, holding `size` bytes, adds to the local size, which is nothing where
+/// the repository's own directory stands there or the filter, asked in `mode` as
+/// [`Filter::child_tracked_reason`] asks with `tracked`, which is awaited inline, leaves the path
+/// out.
 ///
 /// Measured where it is listed rather than in a walk of its own: the listing carries what the file
 /// holds, so nothing here reads the working tree and a file costs no task and no boxed walk.
-fn local_file_size(
+async fn local_file_size<F>(
     repository: &RepositoryContext,
     path: &RelativePath,
-    info: FileInfo,
+    size: u64,
     parent_states: FilterStates,
-) -> u64 {
+    mode: FilterMode,
+    tracked: impl FnOnce() -> F,
+) -> Result<u64, InfoError>
+where
+    F: Future<Output = Result<bool, InfoError>>,
+{
     if is_dot_directory(path) {
-        return 0;
+        return Ok(0);
     }
-    let (_, excluded) =
+    let (states, mut reason, asks) =
         repository
             .filter
-            .child_emit_excludes(parent_states, path, false, FilterMode::Full);
-    if excluded { 0 } else { info.size() }
+            .child_untracked_reason(parent_states, path, false, mode);
+    if asks && tracked().await? {
+        reason = repository.filter.tracked_reason(states, path, false, mode);
+    }
+    Ok(if Filter::emit(path, reason) { 0 } else { size })
+}
+
+/// The nearest directory at or above where the local walk stands that the walk has found in the
+/// measured tree, and tracks: the repository and state holding it, which are a link's below a
+/// link mount, its node, and the length of its path.
+#[lore_macro::test_pub]
+#[derive(Clone)]
+struct HeldAncestor {
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node: NodeID,
+    path_len: usize,
+}
+
+impl HeldAncestor {
+    /// Whether this is the directory at `path` itself rather than one above it.
+    fn is_at(&self, path: &RelativePath) -> bool {
+        self.path_len == path.as_str().len()
+    }
+}
+
+/// The measured tree's directory a child of the walked one is found in: the repository and state
+/// holding it, its node, and its children by name hash, each with its node and flags.
+struct HeldDirectory {
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node: NodeID,
+    children: Vec<(u64, NodeID, NodeFlags)>,
+}
+
+/// What the measured tree holds in a directory the local walk lists, read the first time an entry
+/// the ignore rules would leave out asks about it.
+enum HeldChildren {
+    /// Not read yet: the nearest directory at or above it the walk has found, `None` where the tree
+    /// tracks nothing there.
+    Unread(Option<HeldAncestor>),
+    /// The tree's directory there, `None` where it holds no directory there.
+    Read(Option<HeldDirectory>),
+}
+
+impl HeldChildren {
+    /// Whether the measured tree is known to track nothing at the directory, or below it.
+    fn holds_nothing(&self) -> bool {
+        matches!(self, Self::Unread(None) | Self::Read(None))
+    }
+
+    /// The node the measured tree holds at the child named `name_hash` of `path`, the directory
+    /// the walk lists, and its flags, of the kind `is_directory` asks for: a directory or a link
+    /// where it is set, and a file otherwise. Of two children sharing a folded name, the one of that
+    /// kind answers.
+    ///
+    /// The directory's read is boxed: a cold path, taken once and only where the ignore rules
+    /// would leave an entry out, which inline would sit in every directory's walk future.
+    async fn find(
+        &mut self,
+        path: &RelativePath,
+        name_hash: u64,
+        is_directory: bool,
+    ) -> Result<Option<(NodeID, NodeFlags)>, InfoError> {
+        if let Self::Unread(ancestor) = self {
+            let ancestor = ancestor.take();
+            *self = Self::Read(Box::pin(read_held_directory(path, ancestor)).await?);
+        }
+        let Self::Read(Some(directory)) = self else {
+            return Ok(None);
+        };
+        let children = &directory.children;
+        let start = children.partition_point(|child| child.0 < name_hash);
+        Ok(children[start..]
+            .iter()
+            .take_while(|child| child.0 == name_hash)
+            .find(|child| child.2.contains(NodeFlags::File) != is_directory)
+            .map(|child| (child.1, child.2)))
+    }
+
+    /// Whether the measured tree tracks the child named `name_hash` of `path` as a file.
+    async fn tracks_file(
+        &mut self,
+        path: &RelativePath,
+        name_hash: u64,
+    ) -> Result<bool, InfoError> {
+        let Some((node, flags)) = self.find(path, name_hash, false).await? else {
+            return Ok(false);
+        };
+        self.tracks(node, flags).await
+    }
+
+    /// The directory the measured tree holds and tracks at the child named `name_hash` of `path`,
+    /// `None` where it holds a file or nothing there, or does not track what it holds.
+    async fn child_directory(
+        &mut self,
+        path: &RelativePath,
+        name_hash: u64,
+        child_path_len: usize,
+    ) -> Result<Option<HeldAncestor>, InfoError> {
+        let Some((node, flags)) = self.find(path, name_hash, true).await? else {
+            return Ok(None);
+        };
+        if !self.tracks(node, flags).await? {
+            return Ok(None);
+        }
+        let Self::Read(Some(directory)) = &*self else {
+            return Ok(None);
+        };
+        Ok(Some(HeldAncestor {
+            repository: directory.repository.clone(),
+            state: directory.state.clone(),
+            node,
+            path_len: child_path_len,
+        }))
+    }
+
+    /// Whether the read directory's tree tracks its child `node`, carrying `flags`.
+    async fn tracks(&self, node: NodeID, flags: NodeFlags) -> Result<bool, InfoError> {
+        let Self::Read(Some(directory)) = self else {
+            return Ok(false);
+        };
+        directory
+            .state
+            .tracks(&directory.repository, node, flags)
+            .await
+            .forward_any::<InfoError>("reading the revision the measured tree was built on")
+    }
+
+    /// The nearest directory the walk has found at or above `path`, the directory it lists, which
+    /// the walk below a child of it starts from.
+    fn ancestor(&self, path: &RelativePath) -> Option<HeldAncestor> {
+        match self {
+            Self::Unread(ancestor) => ancestor.clone(),
+            Self::Read(Some(directory)) => Some(HeldAncestor {
+                repository: directory.repository.clone(),
+                state: directory.state.clone(),
+                node: directory.node,
+                path_len: path.as_str().len(),
+            }),
+            Self::Read(None) => None,
+        }
+    }
+}
+
+/// The directory the measured tree holds at `path`, found below `ancestor` as the lock commands
+/// find a path, through any link on the way, and its children: a link mount there reads as the
+/// directory it mounts. `None` where the tree holds a file or nothing there, or `ancestor` is
+/// `None`.
+async fn read_held_directory(
+    path: &RelativePath,
+    ancestor: Option<HeldAncestor>,
+) -> Result<Option<HeldDirectory>, InfoError> {
+    let Some(ancestor) = ancestor else {
+        return Ok(None);
+    };
+    let (repository, state, node) = if ancestor.is_at(path) {
+        (ancestor.repository, ancestor.state, ancestor.node)
+    } else {
+        let below = path.as_str()[ancestor.path_len..].trim_start_matches('/');
+        let Some(found) = absent_unless_refused::<_, _, InfoError>(
+            ancestor
+                .state
+                .locate_node_below(ancestor.repository.clone(), ancestor.node, below)
+                .await,
+            "finding a directory of the measured tree",
+        )?
+        else {
+            return Ok(None);
+        };
+        let (node, (repository, state)) = found
+            .held((ancestor.repository, ancestor.state))
+            .into_parts();
+        (repository, state, node)
+    };
+    let held = state
+        .node(repository.clone(), node)
+        .await
+        .forward::<InfoError>("reading a directory of the measured tree")?;
+    let (repository, state, node) = if held.is_link() {
+        let mounted = held.linked_node();
+        let (repository, state) = mounted
+            .open(&repository)
+            .await
+            .forward_any::<InfoError>("reading the revision a link mounts")?;
+        (repository, state, mounted.node)
+    } else if held.is_file() {
+        return Ok(None);
+    } else {
+        (repository, state, node)
+    };
+    let children = read_held_children(&state, &repository, node).await?;
+    Ok(Some(HeldDirectory {
+        repository,
+        state,
+        node,
+        children,
+    }))
+}
+
+/// The children `state` holds below the directory `node`, sorted by name hash.
+async fn read_held_children(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node: NodeID,
+) -> Result<Vec<(u64, NodeID, NodeFlags)>, InfoError> {
+    let mut iter = StateNodeChildrenIterator::new(state.clone(), repository.clone(), node)
+        .await
+        .forward::<InfoError>("reading a directory of the revision")?;
+    let mut children = Vec::new();
+    while let Some((id, child)) = iter
+        .next()
+        .await
+        .forward::<InfoError>("reading a directory of the revision")?
+    {
+        children.push((
+            child.name_hash,
+            id,
+            NodeFlags::from_bits_retain(child.flags),
+        ));
+    }
+    children.sort_unstable_by_key(|child| child.0);
+    Ok(children)
 }
 
 /// The subtree walks a directory has in flight, each answering with what it measured.
@@ -608,8 +1001,9 @@ fn local_size_task_semaphore() -> &'static Arc<Semaphore> {
     LOCAL_SIZE_TASK_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TREE_TASKS)))
 }
 
-/// Measures the subtree at `path`, spawned while the budget allows and walked inline once it does
-/// not, answering with what an inline walk measured and zero for one left to a task.
+/// Measures below the directory `path`, whose verdict is `states`, spawned while the budget allows
+/// and walked inline once it does not, answering with what an inline walk measured and zero for one
+/// left to a task.
 ///
 /// Inline rather than a blocking acquire: a parent holds its permit until its children finish, so
 /// waiting on one would wait on a descendant that cannot start.
@@ -617,8 +1011,8 @@ async fn local_size_subtree_dispatch(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
     path: RelativePath,
-    info: FileInfo,
     states: FilterStates,
+    held: Option<HeldAncestor>,
     tasks: &mut LocalSizeTasks,
 ) -> Result<u64, InfoError> {
     if let Ok(permit) = local_size_task_semaphore().clone().try_acquire_owned() {
@@ -626,54 +1020,72 @@ async fn local_size_subtree_dispatch(
         let repository = repository.clone();
         lore_spawn!(tasks, async move {
             let _permit = permit;
-            calculate_local_size_recurse(operation, repository, path, info, states).await
+            local_size_below(operation, repository, path, states, held).await
         });
         return Ok(0);
     }
-    calculate_local_size_recurse(operation.clone(), repository.clone(), path, info, states).await
+    local_size_below(operation.clone(), repository.clone(), path, states, held).await
 }
 
-/// `info` is what the working tree holds at `relative_path`, which the listing a directory is
-/// reached through already measured: a child is not measured again to be walked. A path holding
-/// nothing measures zero without the filter being asked about it.
+/// What the working tree holds at `relative_path` adds to the local size, `info` being what it
+/// holds there. A path holding nothing measures zero without the filter being asked about it.
 ///
-/// `parent_states` is the filter verdict for the directory holding
-/// `relative_path`, which this walk steps once per node rather than folding the
-/// whole path per node.
+/// `parent_states` is the filter verdict for the directory holding `relative_path`.
+///
+/// `held` is the nearest directory at or above `relative_path` the walk has found in the measured
+/// tree, `None` where the tree holds nothing there. An entry the tree holds as the kind it is and
+/// tracks passes the ignore slot. The tree is read only where the ignore rules would leave an entry
+/// out, once for the directory holding it.
 #[lore_macro::test_pub]
-fn calculate_local_size_recurse(
+async fn calculate_local_size(
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     relative_path: RelativePath,
     info: FileInfo,
     parent_states: FilterStates,
+    held: Option<HeldAncestor>,
+) -> Result<u64, InfoError> {
+    if !info.exists() {
+        return Ok(0);
+    }
+    if !info.is_dir() {
+        return local_file_size(
+            &repository,
+            &relative_path,
+            info.size(),
+            parent_states,
+            FilterMode::Full,
+            || std::future::ready(Ok(false)),
+        )
+        .await;
+    }
+    if is_dot_directory(&relative_path) {
+        return Ok(0);
+    }
+    let (states, excluded) = repository.filter.child_emit_excludes(
+        parent_states,
+        &relative_path,
+        true,
+        FilterMode::TRACKED.at(held.as_ref().is_some_and(|held| held.is_at(&relative_path))),
+    );
+    if excluded {
+        return Ok(0);
+    }
+    local_size_below(operation, repository, relative_path, states, held).await
+}
+
+/// What the working tree holds below the directory `relative_path`, which the filter keeps, as
+/// [`calculate_local_size`] measures it, `states` being the filter verdict there. Each entry is
+/// measured by the listing that names it and stepped once from `states`, rather than folding the
+/// whole path per entry.
+fn local_size_below(
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    relative_path: RelativePath,
+    states: FilterStates,
+    held: Option<HeldAncestor>,
 ) -> Pin<Box<dyn Future<Output = Result<u64, InfoError>> + Send>> {
     Box::pin(async move {
-        if !info.exists() {
-            return Ok(0);
-        }
-        if !info.is_dir() {
-            return Ok(local_file_size(
-                &repository,
-                &relative_path,
-                info,
-                parent_states,
-            ));
-        }
-        if is_dot_directory(&relative_path) {
-            return Ok(0);
-        }
-
-        let (states, excluded) = repository.filter.child_emit_excludes(
-            parent_states,
-            &relative_path,
-            true,
-            FilterMode::Full,
-        );
-        if excluded {
-            return Ok(0);
-        }
-
         let mut local_size = 0;
         let mut local_size_tasks = LocalSizeTasks::new();
         let mut list = operation
@@ -683,19 +1095,61 @@ fn calculate_local_size_recurse(
                 format!("Failed to list directory: {relative_path}")
             })?;
 
-        while let Some(item) = list.next().await {
-            let item = item.forward_any::<InfoError>("Unusable directory entry")?;
-            let child_path = relative_path.push_into_buf(item.name.as_str()).freeze();
-            if !item.info.is_dir() {
-                local_size += local_file_size(&repository, &child_path, item.info, states);
+        let mut children = HeldChildren::Unread(held);
+        loop {
+            let Some(entry) = list.next().await else {
+                break;
+            };
+            let (child_path, info, name_hash) = {
+                let item = entry.forward_any::<InfoError>("Unusable directory entry")?;
+                (
+                    relative_path.push_into_buf(item.name.as_str()).freeze(),
+                    item.info,
+                    item.name_hash,
+                )
+            };
+            let mode = FilterMode::TRACKED.at(!children.holds_nothing());
+            if !info.is_dir() {
+                local_size += local_file_size(
+                    &repository,
+                    &child_path,
+                    info.size(),
+                    states,
+                    mode,
+                    async || children.tracks_file(&relative_path, name_hash).await,
+                )
+                .await?;
                 continue;
             }
+            if is_dot_directory(&child_path) {
+                continue;
+            }
+            let (child_states, mut reason, asks) =
+                repository
+                    .filter
+                    .child_untracked_reason(states, &child_path, true, mode);
+            let mut child_held = None;
+            if asks {
+                child_held = children
+                    .child_directory(&relative_path, name_hash, child_path.as_str().len())
+                    .await?;
+                if child_held.is_some() {
+                    reason =
+                        repository
+                            .filter
+                            .tracked_reason(child_states, &child_path, true, mode);
+                }
+            }
+            if Filter::emit(&child_path, reason) {
+                continue;
+            }
+            let child_held = child_held.or_else(|| children.ancestor(&relative_path));
             local_size += local_size_subtree_dispatch(
                 &operation,
                 &repository,
                 child_path,
-                item.info,
-                states,
+                child_states,
+                child_held,
                 &mut local_size_tasks,
             )
             .await?;
@@ -727,23 +1181,39 @@ fn calculate_local_size_recurse(
 
 /// `parent_states` is the filter verdict for the directory holding
 /// `relative_path`, which this walk steps once per node rather than folding the
-/// whole path per node.
+/// whole path per node. A node asks the filter in `tree`'s mode, past the ignore slot where `tree`
+/// tracks it, which is asked only where the ignore rules would leave the node out. A node staged
+/// for delete adds nothing.
 fn calculate_filtered_size_recurse(
     repository: Arc<RepositoryContext>,
     relative_path: RelativePath,
-    state: Arc<State>,
+    tree: InfoTree,
     node: Node,
     node_id: NodeID,
     parent_states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<u64, InfoError>> + Send>> {
     Box::pin(async move {
-        let (states, excluded) = repository.filter.child_emit_excludes(
-            parent_states,
-            &relative_path,
-            node.is_directory(),
-            FilterMode::Full,
-        );
-        if excluded {
+        if node.is_staged_delete() {
+            return Ok(0);
+        }
+        let (states, reason) = repository
+            .filter
+            .child_tracked_reason(
+                parent_states,
+                &relative_path,
+                node.is_directory(),
+                tree.mode,
+                || {
+                    tree.state.tracks(
+                        &repository,
+                        node_id,
+                        NodeFlags::from_bits_retain(node.flags),
+                    )
+                },
+            )
+            .await
+            .forward_any::<InfoError>("reading the revision the measured tree was built on")?;
+        if Filter::emit(&relative_path, reason) {
             return Ok(0);
         }
         if node.is_file() {
@@ -758,13 +1228,19 @@ fn calculate_filtered_size_recurse(
         let mut cycle = SiblingCycleGuard::new(node_id);
         while let Some(child) = child_iter {
             let repository = repository.clone();
-            let state = state.clone();
+            let tree = tree.clone();
             let relative_path = relative_path.clone();
-            let Ok(child_node) = state.node(repository.clone(), child).await else {
-                failure = Some(InfoError::internal(
-                    "Failed to calculate filtered size, encountered an invalid node",
-                ));
-                break;
+            let child_node = match tree.state.node(repository.clone(), child).await {
+                Ok(child_node) => child_node,
+                Err(err) => {
+                    failure = Some(forward_refusal_or(err, "reading a node block", |err| {
+                        InfoError::internal_with_context(
+                            err,
+                            "Failed to calculate filtered size, encountered an invalid node",
+                        )
+                    }));
+                    break;
+                }
             };
             if let Err(err) = child_node
                 .walk_step(child, node_id, &mut cycle)
@@ -775,7 +1251,8 @@ fn calculate_filtered_size_recurse(
             }
             let sibling = child_node.sibling();
             lore_spawn!(filtered_size_tasks, async move {
-                let Some(name) = state
+                let Some(name) = tree
+                    .state
                     .node_name_ref_or_skip(repository.clone(), child)
                     .await
                     .forward::<InfoError>(
@@ -788,7 +1265,7 @@ fn calculate_filtered_size_recurse(
                 calculate_filtered_size_recurse(
                     repository,
                     relative_path,
-                    state,
+                    tree,
                     child_node,
                     child,
                     states,

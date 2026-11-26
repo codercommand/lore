@@ -226,6 +226,7 @@ pub struct ReplicationClientImpl {
 pub use MockReplicationClientImpl as ReplicationClient;
 #[cfg(not(feature = "test-util"))]
 pub use ReplicationClientImpl as ReplicationClient;
+use lore_storage::FlushOptions;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::PARTITION_ID;
 
@@ -542,6 +543,16 @@ impl GrpcReplica {
 
 #[async_trait]
 impl ImmutableStore for GrpcReplica {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     fn isolates_partitions(&self) -> bool {
         true
     }
@@ -636,7 +647,7 @@ impl ImmutableStore for GrpcReplica {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 

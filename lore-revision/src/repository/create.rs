@@ -12,8 +12,8 @@ use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::StoreConfig;
 use super::VfsConfig;
+use super::VfsType;
 use super::get_dot_lore_path;
-use super::load_repository_config_from_dot_dir;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
@@ -24,13 +24,14 @@ use crate::interface::LoreString;
 use crate::lore::Context;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
+use crate::lore_warn;
 use crate::protocol;
 use crate::repository;
 use crate::util;
 
 /// Data for the event emitted when a repository is created.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCreateEventData {
     /// Identifier of the created repository.
@@ -43,6 +44,8 @@ pub struct LoreRepositoryCreateEventData {
 
 #[error_set]
 pub enum CreateError {
+    Cancelled,
+    LinkPinsDiverge,
     RepositoryAlreadyExists,
     InvalidPath,
     Disconnected,
@@ -214,12 +217,20 @@ pub(crate) async fn create_with_metadata(
         }));
     }
 
-    let existing_dot_dir = get_dot_lore_path(path)?;
+    if options.vfs_options.vfs_type == VfsType::Swfs {
+        repository::refuse_instance_nested_at(path)?;
+        repository::refuse_swfs_past_mount_limit()?;
+    } else {
+        repository::refuse_nesting_in_swfs_mount(path)?;
+    }
+    let existing_dot_dir =
+        get_dot_lore_path(path).forward::<CreateError>("finding the Lore directory")?;
     if existing_dot_dir.exists() {
-        let existing_repository_is_swfs =
-            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
-                .is_ok_and(|config| config.is_swfs());
-        if call.force() && !existing_repository_is_swfs {
+        if call.force() && repository::force_may_replace(path, &existing_dot_dir) {
+            if call.dry_run() {
+                dry_run_created(id_or_new(&options), name, path);
+                return Ok(());
+            }
             lore_io::IoDriver::global()
                 .remove_dir_all(existing_dot_dir.as_path())
                 .await
@@ -233,7 +244,14 @@ pub(crate) async fn create_with_metadata(
         }
     }
 
-    let id = options.id.unwrap_or_else(|| uuid::Uuid::now_v7().into());
+    let id = id_or_new(&options);
+
+    // A dry run creates nothing, on the server or on disk: the setup below writes the
+    // repository's files directly, and its store writes would be discarded.
+    if call.dry_run() {
+        dry_run_created(id, name, path);
+        return Ok(());
+    }
 
     // TODO(mjansson): Make this configurable in arguments and command line
     let branch_name = branch::DEFAULT_DEFAULT_NAME;
@@ -321,6 +339,7 @@ pub(crate) async fn create_with_metadata(
         vfs: Some(options.vfs_options),
         store: Some(StoreConfig::client_default()),
         file: Some(FileConfig::default()),
+        sync: None,
     };
     config
         .validate()
@@ -358,12 +377,14 @@ pub(crate) async fn create_with_metadata(
     }
 
     // The create command goes through dispatch_call, not repository_call,
-    // so the normal spawn_flush_stores path that flushes dirty mutable store
-    // buckets after each command does not run. Flush explicitly to ensure
-    // branch creation, instance registration, and metadata are written
-    // before the process exits — synced to disk only under `--sync-data`, as
-    // every other command's flush is.
-    let _ = repository.flush(call.sync_data()).await;
+    // so the post-command flush of the stores and the instance records
+    // (`RepositoryContext::try_spawn_post_command_flush`) does not run. Flush
+    // explicitly to ensure branch creation, instance registration, and
+    // metadata are written before the process exits — synced to disk only
+    // under `--sync-data`, as every other command's flush is.
+    if let Err(err) = repository.flush(call.flush_options()).await {
+        lore_warn!("Failed to flush the created repository's stores: {err}");
+    }
 
     drop(repository);
     drop(connection);
@@ -376,6 +397,19 @@ pub(crate) async fn create_with_metadata(
     .send();
 
     Ok(())
+}
+
+fn id_or_new(options: &CreateOptions) -> RepositoryId {
+    options.id.unwrap_or_else(|| uuid::Uuid::now_v7().into())
+}
+
+fn dry_run_created(id: RepositoryId, name: String, path: &Path) {
+    event::LoreEvent::RepositoryCreate(LoreRepositoryCreateEventData {
+        id,
+        name: name.into(),
+        path: path.into(),
+    })
+    .send();
 }
 
 /// Boxed version of [`create_with_metadata`] for cross-crate use.

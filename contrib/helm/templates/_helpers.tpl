@@ -258,10 +258,83 @@ key and silently drop one. Call with (dict "ctx" . "p" <persistence> "name" "dat
 {{- define "lore.initContainers" -}}
 {{- $hostPath := include "lore.hostPathInit" . -}}
 {{- $caBundle := include "lore.caBundleInit" .ctx -}}
-{{- if or (trim $hostPath) (trim $caBundle) }}
+{{- $identity := include "lore.identityInit" . -}}
+{{- if or (trim $hostPath) (trim $caBundle) (trim $identity) }}
 initContainers:
 {{- $caBundle }}
 {{- $hostPath }}
+{{- $identity }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The Secret seeding a tier's token store at /data/auth, the login its remote stores
+present upstream: backend.edge.identity for an edge's data pods, handler.identity for
+the handlers. Empty when the tier has none. Call with (dict "ctx" . "name" "data|cache").
+*/}}
+{{- define "lore.identitySecret" -}}
+{{- if eq .name "cache" -}}
+{{- .ctx.Values.handler.identity.secretName -}}
+{{- else if eq .ctx.Values.backend.type "edge" -}}
+{{- .ctx.Values.backend.edge.identity.secretName -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The token store directory of a tier: /data/auth when lore.identitySecret seeds it,
+else the /tmp emptyDir. Call with (dict "ctx" . "name" "data|cache").
+*/}}
+{{- define "lore.authPath" -}}
+{{- ternary "/data/auth" "/tmp/lore-auth" (ne (include "lore.identitySecret" .) "") -}}
+{{- end -}}
+
+{{/*
+The pod volume of a tier's identity Secret, read by lore.identityInit. Renders nothing
+without one. Call with (dict "ctx" . "name" "data|cache").
+*/}}
+{{- define "lore.identityVolume" -}}
+{{- with include "lore.identitySecret" . -}}
+- name: identity
+  secret:
+    secretName: {{ . }}
+    defaultMode: 0440  # readable by the pod user through fsGroup
+{{- end -}}
+{{- end -}}
+
+{{/*
+Init container that copies the tier's identity Secret to /data/auth unless a token
+store is already there: the server renews the login in place, so the copy on the
+volume is the newer one. Runs after lore.hostPathInit.
+Call with (dict "ctx" . "p" <persistence> "name" "data|cache").
+*/}}
+{{- define "lore.identityInit" -}}
+{{- $ctx := .ctx -}}
+{{- if include "lore.identitySecret" . }}
+  - name: init-identity
+    image: {{ include "lore.image" $ctx | quote }}
+    imagePullPolicy: {{ $ctx.Values.imagePullPolicy }}
+    command:
+      - sh
+      - -c
+      - 'if [ -e /data/auth/tokenstore.toml ]; then echo "keeping the token store on the volume"; else mkdir -p /data/auth && chmod 700 /data/auth && cp /etc/lore/identity/* /data/auth/ && chmod 600 /data/auth/* && echo "seeded the token store from the identity Secret"; fi'
+    securityContext:
+      {{- toYaml $ctx.Values.securityContext | nindent 6 }}
+    volumeMounts:
+      - name: identity
+        mountPath: /etc/lore/identity
+        readOnly: true
+      - name: {{ .name }}
+        mountPath: /data
+        {{- if eq (include "lore.storageType" .p) "hostPath" }}
+        subPathExpr: $(POD_NAME)
+        {{- end }}
+    {{- if eq (include "lore.storageType" .p) "hostPath" }}
+    env:
+      - name: POD_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+    {{- end }}
 {{- end }}
 {{- end -}}
 
@@ -351,6 +424,66 @@ presigned_url_max_ttl_seconds = {{ $ctx.Values.presignedUrl.maxTtlSeconds }}
 {{- end -}}
 
 {{/*
+The auth tables of the server config, from .Values.auth: [environment.endpoint] when
+authUrl is set, [server.auth], [server.auth.jwk] when jwksEndpoint is set, and
+[server.auth.oidc] when oidc.clientId is set. Callers gate this on
+.Values.auth.enabled. Root context.
+*/}}
+{{- define "lore.authToml" -}}
+{{- $auth := .Values.auth -}}
+{{- $oidc := $auth.oidc | default dict -}}
+{{- with $auth.authUrl -}}
+[environment.endpoint]
+auth_url = {{ . | quote }}
+
+{{ end -}}
+[server.auth]
+jwt_issuer = {{ $auth.issuer | quote }}
+jwt_audience = {{ include "lore.tomlStrings" $auth.audience }}
+{{- with $auth.permissionClaim }}
+permission_claim = {{ . | quote }}
+{{- end }}
+{{- with $auth.resourceClaim }}
+resource_claim = {{ . | quote }}
+{{- end }}
+{{- with $auth.jwksEndpoint }}
+
+[server.auth.jwk]
+endpoint = {{ . | quote }}
+{{- end }}
+{{- if $oidc.clientId }}
+
+[server.auth.oidc]
+client_id = {{ $oidc.clientId | quote }}
+{{- with $oidc.scopes }}
+scopes = {{ include "lore.tomlStrings" . }}
+{{- end }}
+{{- with $oidc.clientCredentialsScopes }}
+client_credentials_scopes = {{ include "lore.tomlStrings" . }}
+{{- end }}
+{{- if $oidc.preferred }}
+preferred = true
+{{- end }}
+{{- with $oidc.resourceTemplate }}
+resource_template = {{ . | quote }}
+{{- end }}
+{{- with $oidc.scopeTemplate }}
+scope_template = {{ . | quote }}
+{{- end }}
+{{- with $oidc.tokenExchangeIssuer }}
+token_exchange_issuer = {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+A list of strings as a TOML array.
+*/}}
+{{- define "lore.tomlStrings" -}}
+[{{ range $idx, $value := . }}{{ if $idx }}, {{ end }}{{ $value | quote }}{{ end }}]
+{{- end -}}
+
+{{/*
 Telemetry (OTLP) TOML block for the server config. Lore exports logs/metrics/traces
 over OTLP/gRPC — there is no Prometheus scrape endpoint — so this configures an OTLP
 exporter. Callers gate this on .Values.telemetry.exporter.endpoint (setting the
@@ -437,11 +570,12 @@ cert_chain = "/etc/lore/replication-tls/{{ $r.tls.caKey }}"
 {{- if ne $r.topology.provider "none" }}
 
 [topology]
-provider = {{ $r.topology.provider | quote }}
-{{- if eq $r.topology.provider "fixed" }}
+{{- /* statefulset is a chart-side provider: the server sees a fixed list. */}}
+provider = {{ ternary "fixed" $r.topology.provider (eq $r.topology.provider "statefulset") | quote }}
+{{- if has $r.topology.provider (list "fixed" "statefulset") }}
 
 [topology.fixed]
-peers = [{{ range $i, $p := $r.topology.fixed.peers }}{{ if $i }}, {{ end }}{ address = {{ $p.address | quote }}, port = {{ $p.port | default $r.port }}, locality = {{ $p.locality | default "SameRegion" | quote }} }{{ end }}]
+peers = {{ include "lore.fixedPeersToml" . }}
 {{- else if eq $r.topology.provider "consul" }}
 {{- with $r.topology.consul }}
 
@@ -450,6 +584,348 @@ peers = [{{ range $i, $p := $r.topology.fixed.peers }}{{ if $i }}, {{ end }}{ ad
 {{ $k }} = {{ $v | quote }}
 {{- end }}
 {{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Render-time checks for combinations the server refuses or would run wrongly.
+Included from configmap.yaml, which every install renders. Root context.
+*/}}
+{{- define "lore.validate" -}}
+{{- $backend := .Values.backend.type | default "local" -}}
+{{- if not (has $backend (list "local" "aws" "edge")) -}}
+{{- fail (printf "backend.type must be local, aws or edge, got %q" $backend) -}}
+{{- end -}}
+{{- $replicas := int .Values.data.replicas -}}
+{{- if lt $replicas 1 -}}
+{{- fail (printf "data.replicas must be at least 1, got %d" $replicas) -}}
+{{- end -}}
+{{- if and (gt $replicas 1) (eq $backend "local") -}}
+{{- fail (printf "data.replicas=%d needs backend.type=aws or edge. With the local backend every data pod would keep its own copy of the store on its own volume, and the copies would diverge as clients write to different pods." $replicas) -}}
+{{- end -}}
+{{- if eq $backend "aws" -}}
+{{- if ne .Values.topology.mode "single" -}}
+{{- fail "backend.type=aws needs topology.mode=single. The tiered topology is a primary/cache split for the local backend; with the AWS backend the store is already shared, so every data pod serves directly." -}}
+{{- end -}}
+{{- range $key := list "s3Bucket" "fragmentsTable" "fragmentStateTable" "mutableTable" "locksTable" -}}
+{{- if not (index $.Values.backend.aws $key) -}}
+{{- fail (printf "backend.aws.%s is required when backend.type=aws" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $backend "edge" -}}
+{{- if ne .Values.topology.mode "single" -}}
+{{- fail "backend.type=edge needs topology.mode=single. An edge's store is its upstream, so every data pod serves directly; the tiered topology's data pod would go unused." -}}
+{{- end -}}
+{{- range $key := list "upstreamInternalAddress" "upstreamURL" -}}
+{{- if not (index $.Values.backend.edge $key) -}}
+{{- fail (printf "backend.edge.%s is required when backend.type=edge" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if regexFind "://" .Values.backend.edge.upstreamInternalAddress -}}
+{{- fail (printf "backend.edge.upstreamInternalAddress is host:port, without a scheme, got %q: the chart adds quics:// for content and https:// for forwarded requests." .Values.backend.edge.upstreamInternalAddress) -}}
+{{- end -}}
+{{- if not .Values.replication.tls.secretName -}}
+{{- fail "backend.type=edge needs replication.tls.secretName: the edge reaches its upstream's replication endpoint with mutual TLS, presenting that Secret's cert." -}}
+{{- end -}}
+{{- end -}}
+{{- if not (has .Values.data.podManagementPolicy (list "OrderedReady" "Parallel")) -}}
+{{- fail (printf "data.podManagementPolicy must be OrderedReady or Parallel, got %q" .Values.data.podManagementPolicy) -}}
+{{- end -}}
+{{- if eq .Values.replication.topology.provider "statefulset" -}}
+{{- if not .Values.replication.enabled -}}
+{{- fail "replication.topology.provider=statefulset needs replication.enabled=true: peers replicate to each other on the replication port." -}}
+{{- end -}}
+{{- if eq $backend "local" -}}
+{{- fail "replication.topology.provider=statefulset needs backend.type=aws or edge. Only their composite store replicates to peers." -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.replication.enabled .Values.replication.verifyClientCerts (not .Values.replication.tls.secretName) -}}
+{{- fail "replication.enabled=true with replication.verifyClientCerts=true needs replication.tls.secretName: the server refuses to start its replication endpoints without a certificate, key and CA chain for mutual TLS. Set replication.verifyClientCerts=false only on an isolated network, to accept unauthenticated replication." -}}
+{{- end -}}
+{{- if .Values.auth.enabled -}}
+{{- if not .Values.auth.issuer -}}
+{{- fail "auth.enabled=true needs auth.issuer: the server refuses [server.auth] without jwt_issuer, since it would accept tokens from any issuer." -}}
+{{- end -}}
+{{- if not .Values.auth.audience -}}
+{{- fail "auth.enabled=true needs auth.audience: the server refuses [server.auth] without jwt_audience, since it would accept tokens minted for any service." -}}
+{{- end -}}
+{{- if not (or .Values.auth.authUrl (.Values.auth.oidc).clientId) -}}
+{{- fail "auth.enabled=true needs auth.authUrl or auth.oidc.clientId: without an authentication service the server requires [server.auth.oidc], since clients have no other way to log in." -}}
+{{- end -}}
+{{- include "lore.validateAuthTier" .Values.auth -}}
+{{- if and (eq .Values.topology.mode "tiered") (not .Values.handler.upstreamURL) (not .Values.handler.identity.secretName) -}}
+{{- fail "topology.mode=tiered with auth.enabled=true needs handler.identity.secretName: the handlers reach the data pod as clients, and it refuses them without a login." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Render-time checks of the auth tier: Tier 2 is auth.resourceClaim with a template,
+auth.authUrl takes no resourceClaim, and a template needs one of the two. With
+oidc.clientId set, which writes [server.auth.oidc], at most one template is set and it
+contains {id}, and oidc.tokenExchangeIssuer needs a template and is an issuer URL.
+auth.issuer is an issuer URL when oidc.clientId is set or auth.jwksEndpoint is empty.
+lore.isIssuerUrl checks issuer URLs. Call with .Values.auth.
+*/}}
+{{- define "lore.validateAuthTier" -}}
+{{- $oidc := .oidc | default dict -}}
+{{- if and .authUrl .resourceClaim -}}
+{{- fail "auth.authUrl and auth.resourceClaim are both set: with an authentication service the server asks it to authorize every request, and refuses resource_claim. Unset one." -}}
+{{- end -}}
+{{- $template := or $oidc.resourceTemplate $oidc.scopeTemplate -}}
+{{- if and .resourceClaim (not $template) -}}
+{{- fail "auth.resourceClaim needs auth.oidc.resourceTemplate or auth.oidc.scopeTemplate: it selects Tier 2, which authorizes each repository from a partition-scoped token, and the server refuses it unless clients ask for one through a template." -}}
+{{- end -}}
+{{- if and $template (not .resourceClaim) (not .authUrl) -}}
+{{- fail "auth.oidc.resourceTemplate and auth.oidc.scopeTemplate need auth.resourceClaim or auth.authUrl: in Tier 1 the server never reads the partition-scoped tokens they ask for, and refuses them." -}}
+{{- end -}}
+{{- if $oidc.clientId -}}
+{{- if and $oidc.resourceTemplate $oidc.scopeTemplate -}}
+{{- fail "auth.oidc.resourceTemplate and auth.oidc.scopeTemplate are both set: the server takes one way to name a partition in a token request. Unset one." -}}
+{{- end -}}
+{{- if and $oidc.tokenExchangeIssuer (not $template) -}}
+{{- fail "auth.oidc.tokenExchangeIssuer needs auth.oidc.resourceTemplate or auth.oidc.scopeTemplate: it issues the partition-scoped tokens clients ask for through a template, and the server refuses it without one." -}}
+{{- end -}}
+{{- range $key := list "resourceTemplate" "scopeTemplate" -}}
+{{- $value := index $oidc $key -}}
+{{- if and $value (not (contains "{id}" $value)) -}}
+{{- fail (printf "auth.oidc.%s must contain {id}, which stands for the partition ID, got %q: the server refuses a template without it." $key $value) -}}
+{{- end -}}
+{{- end -}}
+{{- if and $oidc.tokenExchangeIssuer (not (include "lore.isIssuerUrl" $oidc.tokenExchangeIssuer)) -}}
+{{- fail (printf "auth.oidc.tokenExchangeIssuer must be an http or https URL with a host, got %q: the server refuses any other value." $oidc.tokenExchangeIssuer) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (or $oidc.clientId (not .jwksEndpoint)) (not (include "lore.isIssuerUrl" .issuer)) -}}
+{{- fail (printf "auth.issuer must be an http or https URL with a host when auth.oidc.clientId is set or auth.jwksEndpoint is empty, got %q: the server reads it as the OIDC provider's issuer URL, and refuses any other value." .issuer) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+"true" when a value is an http or https URL with a host, as lore-server's is_issuer_url
+requires, and "" otherwise. Like the URL parser, it takes the scheme in any case, leading
+control characters and spaces, tabs and newlines anywhere, and any number of slashes or
+backslashes before the host. It doesn't check that the host and port are valid, as the
+parser does.
+*/}}
+{{- define "lore.isIssuerUrl" -}}
+{{- if regexMatch `^[\x00-\x20]*[Hh][\t\n\r]*[Tt][\t\n\r]*[Tt][\t\n\r]*[Pp][\t\n\r]*([Ss][\t\n\r]*)?:[\t\n\r/\\]*[^\t\n\r/\\?#]` (toString .) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+DNS domain of the data pods' per-pod records: <pod>.<this domain> resolves to that
+pod through the headless Service. Root context.
+*/}}
+{{- define "lore.dataPodDomain" -}}
+{{- printf "%s-headless.%s.svc.cluster.local" (include "lore.fullname" .) .Release.Namespace -}}
+{{- end -}}
+
+{{/*
+True when the data pods find each other through the StatefulSet's own DNS names
+(replication.topology.provider=statefulset). Root context.
+*/}}
+{{- define "lore.statefulsetTopology" -}}
+{{- if and .Values.replication.enabled (eq .Values.replication.topology.provider "statefulset") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+True when the composite store needs a replica factory: it is what turns topology
+peers into replication targets, and the server rejects every peer refresh without
+one. Root context.
+*/}}
+{{- define "lore.peersActive" -}}
+{{- if and (has .Values.backend.type (list "aws" "edge")) .Values.replication.enabled (ne .Values.replication.topology.provider "none") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+True when the pods mount the replication TLS Secret: for replication, and for an edge's
+connection to its upstream. Root context.
+*/}}
+{{- define "lore.replicationTlsMounted" -}}
+{{- if and .Values.replication.tls.secretName (or .Values.replication.enabled (eq .Values.backend.type "edge")) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The [topology.fixed] peer list as a TOML array. With provider=statefulset it lists
+every data pod by its headless DNS name, then any fixed.peers; each pod drops its
+own entry through LORE__TOPOLOGY__FIXED__SELF_ADDRESS (see data-statefulset.yaml),
+so one list serves every pod. Root context.
+*/}}
+{{- define "lore.fixedPeersToml" -}}
+{{- $r := .Values.replication -}}
+{{- $peers := list -}}
+{{- if include "lore.statefulsetTopology" . -}}
+{{- $fullname := include "lore.fullname" . -}}
+{{- $domain := include "lore.dataPodDomain" . -}}
+{{- range $i := until (int .Values.data.replicas) -}}
+{{- $peers = append $peers (dict "address" (printf "%s-%d.%s" $fullname $i $domain) "port" $r.port "locality" "SameRegion") -}}
+{{- end -}}
+{{- end -}}
+{{- range $p := $r.topology.fixed.peers -}}
+{{- $peers = append $peers (dict "address" $p.address "port" ($p.port | default $r.port) "locality" ($p.locality | default "SameRegion")) -}}
+{{- end -}}
+[{{ range $i, $p := $peers }}{{ if $i }}, {{ end }}{ address = {{ $p.address | quote }}, port = {{ $p.port }}, locality = {{ $p.locality | quote }} }{{ end }}]
+{{- end -}}
+
+{{/*
+Store tables for backend.type=aws: a composite immutable store (the /data cache in
+front of S3), the DynamoDB mutable and lock stores, and their plugin settings.
+Every block here opens its own table, so it can sit anywhere among the other
+table blocks (see the TOML ORDERING INVARIANT on lore.serverHttpToml). Root context.
+*/}}
+{{- define "lore.awsStoreToml" -}}
+{{- $aws := .Values.backend.aws -}}
+[immutable_store]
+mode = "composite"
+
+[immutable_store.composite.local]
+mode = "local"
+
+[immutable_store.composite.local.local]
+path = "/data"
+flush_delay_seconds = {{ int $aws.cacheFlushDelaySeconds }}
+{{- with (include "lore.storeGcToml" .Values.data.store) }}
+{{ . }}
+{{- end }}
+
+[immutable_store.composite.durable]
+mode = "aws"
+{{- include "lore.replicaFactoryToml" . }}
+
+[mutable_store]
+mode = "aws"
+
+[lock_store]
+mode = "aws"
+
+[plugins.aws.immutable_store]
+s3_bucket = {{ $aws.s3Bucket | quote }}
+dynamodb_fragments_table = {{ $aws.fragmentsTable | quote }}
+dynamodb_fragment_state_table = {{ $aws.fragmentStateTable | quote }}
+{{- with $aws.fragmentMetadataTable }}
+dynamodb_fragment_metadata_table = {{ . | quote }}
+{{- end }}
+{{- with $aws.region }}
+s3_region = {{ . | quote }}
+dynamodb_region = {{ . | quote }}
+{{- end }}
+{{- if $aws.forceWrite }}
+force_write = true
+{{- end }}
+
+[plugins.aws.mutable_store]
+dynamodb_table = {{ $aws.mutableTable | quote }}
+{{- with $aws.region }}
+dynamodb_region = {{ . | quote }}
+{{- end }}
+{{- if $aws.forceWrite }}
+force_write = true
+{{- end }}
+
+[plugins.aws.lock_store]
+dynamodb_table = {{ $aws.locksTable | quote }}
+{{- with $aws.region }}
+dynamodb_region = {{ . | quote }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The composite store's replica factory, for peers. Renders nothing without peers.
+Root context.
+*/}}
+{{- define "lore.replicaFactoryToml" -}}
+{{- $r := .Values.replication -}}
+{{- if include "lore.peersActive" . }}
+
+[immutable_store.composite.replica_factory]
+client_message_buffer = {{ int $r.clientMessageBuffer }}
+{{- if $r.tls.secretName }}
+{{- with $r.tls.serverSni }}
+
+[immutable_store.composite.replica_factory.tls]
+server_sni = {{ . | quote }}
+{{- end }}
+
+[immutable_store.composite.replica_factory.tls.client_certs]
+cert_file = "/etc/lore/replication-tls/{{ $r.tls.certKey }}"
+pkey_file = "/etc/lore/replication-tls/{{ $r.tls.keyKey }}"
+cert_chain = "/etc/lore/replication-tls/{{ $r.tls.caKey }}"
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The replication cert as a client cert block. Root context.
+*/}}
+{{- define "lore.replicationClientCertsToml" -}}
+{{- $r := .Values.replication -}}
+cert_file = "/etc/lore/replication-tls/{{ $r.tls.certKey }}"
+pkey_file = "/etc/lore/replication-tls/{{ $r.tls.keyKey }}"
+cert_chain = "/etc/lore/replication-tls/{{ $r.tls.caKey }}"
+{{- end -}}
+
+{{/*
+Store tables for backend.type=edge: /data/cache in front of the upstream's replication
+endpoint, the upstream as the mutable store, a local lock store, and forwarded requests.
+Every block opens its own table (see the TOML ORDERING INVARIANT). Root context.
+*/}}
+{{- define "lore.edgeStoreToml" -}}
+{{- $edge := .Values.backend.edge -}}
+[immutable_store]
+mode = "composite"
+
+[immutable_store.composite.local]
+mode = "local"
+
+[immutable_store.composite.local.local]
+path = "/data/cache"
+flush_delay_seconds = {{ int $edge.cacheFlushDelaySeconds }}
+{{- with (include "lore.storeGcToml" .Values.data.store) }}
+{{ . }}
+{{- end }}
+
+[immutable_store.composite.durable]
+mode = "replicated"
+
+[immutable_store.composite.durable.replicated]
+remote_url = {{ printf "quics://%s" $edge.upstreamInternalAddress | quote }}
+periodic_client_refresh_secs = {{ int $edge.periodicClientRefreshSeconds }}
+{{- with $edge.expectedRttMs }}
+expected_rtt_ms = {{ int . }}
+{{- end }}
+
+[immutable_store.composite.durable.replicated.regenerate_retry]
+initial_backoff_ms = {{ int $edge.regenerateRetry.initialBackoffMs }}
+max_backoff_ms = {{ int $edge.regenerateRetry.maxBackoffMs }}
+max_attempts = {{ int $edge.regenerateRetry.maxAttempts }}
+
+[immutable_store.composite.durable.replicated.certs]
+{{ include "lore.replicationClientCertsToml" . }}
+{{- include "lore.replicaFactoryToml" . }}
+
+[mutable_store]
+mode = "remote"
+
+[mutable_store.remote]
+remote_url = {{ $edge.upstreamURL | quote }}
+
+[lock_store]
+mode = "local"
+
+[server.grpc_public_services.forwarded_requests.client]
+url = {{ printf "https://%s" $edge.upstreamInternalAddress | quote }}
+
+[server.grpc_public_services.forwarded_requests.client.certs]
+{{ include "lore.replicationClientCertsToml" . }}
+{{- with $edge.forwardedRpcs }}
+
+[server.grpc_public_services.forwarded_requests.enabled_rpcs]
+{{- range $rpc := . }}
+{{ $rpc }} = true
 {{- end }}
 {{- end }}
 {{- end -}}

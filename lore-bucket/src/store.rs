@@ -15,6 +15,7 @@ use lore_storage::Address;
 use lore_storage::AddressNotFound;
 use lore_storage::Context;
 use lore_storage::Fragment;
+use lore_storage::FlushOptions;
 use lore_storage::FragmentFlags;
 use lore_storage::Hash;
 use lore_storage::ImmutableStore;
@@ -187,6 +188,13 @@ impl BucketStore {
 
 #[async_trait]
 impl ImmutableStore for BucketStore {
+    /// The bucket has no store directory of its own. The local tier claims the cache directory.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+        Ok(None)
+    }
+
     fn isolates_partitions(&self) -> bool {
         true
     }
@@ -230,6 +238,9 @@ impl ImmutableStore for BucketStore {
             match_made: StoreMatch::MatchFull,
             partition,
             payload: Some(payload),
+            // The hash check expands a compressed payload and drops the bytes.
+            // The reader expands them again.
+            content: None,
         })
     }
 
@@ -378,7 +389,7 @@ impl ImmutableStore for BucketStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         self.snapshot()
             .await
             .map_err(|err| StoreError::internal(err.to_string()))
@@ -709,7 +720,7 @@ mod tests {
             "",
             Some(root.path().to_path_buf()),
         ));
-        store.flush(true).await.unwrap();
+        store.flush(FlushOptions::SYNC_DATA).await.unwrap();
         let keys = client.list("snapshot/").await.unwrap();
         assert!(
             keys.iter()

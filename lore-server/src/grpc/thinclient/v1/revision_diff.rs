@@ -1,10 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
@@ -21,6 +19,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::DiffItem;
+use lore_revision::revision::LinkSettlement;
 use lore_revision::state::State;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
@@ -28,6 +27,7 @@ use lore_telemetry::tracing::fields::REVISION;
 use tokio::sync::mpsc;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::task::AbortOnDropHandle;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -35,12 +35,14 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::warn;
 
+use super::helpers::PartitionTable;
 use super::helpers::diff_conflict_from_pair;
 use super::helpers::identifier_for_signature;
 use super::helpers::link_pin_change_to_diff_change;
 use super::helpers::node_change_to_diff_change;
 use super::helpers::resolve_to_identifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -72,12 +74,13 @@ pub const DEFAULT_REVISION_DIFF_SOURCE_CAP: usize = 100_000;
 /// through `LoreThinClientV1Service` into the per-request handler.
 #[derive(Clone, Copy, Debug)]
 pub struct RevisionDiffConfig {
-    /// Source-side change-count cap. The handler passes this to
-    /// `branch::diff3_with_source_cap` so the producer aborts with
-    /// `BranchError::Oversized` before target's walk runs.
+    /// Source-side change-count cap. A 3-way diff whose source side changes more paths than
+    /// this fails with `BranchError::Oversized` before the target side is walked.
     pub source_cap: usize,
     /// Permit count for the parallel history-walk semaphore inside
-    /// `revision::diff3_with_source_cap`. `None` falls back to
+    /// `revision::diff3_with_source_cap`, and for the revision
+    /// comparisons of its walks of the history lines for deleted paths.
+    /// `None` falls back to
     /// `lore_revision::revision::DEFAULT_HISTORY_WALK_CONCURRENCY`.
     pub history_walk_concurrency: Option<usize>,
 }
@@ -104,7 +107,8 @@ impl Default for RevisionDiffConfig {
 /// * **3-way** otherwise. The common ancestor is found via the
 ///   branches' stacks (then `find_branch_point` as a fallback). When
 ///   no common ancestor exists, the call fails with
-///   `FAILED_PRECONDITION`.
+///   `FAILED_PRECONDITION`. When the common ancestor is one of the two
+///   revisions, the diff falls back to **2-way**.
 ///
 /// Identical revisions short-circuit to an OK header-only stream with
 /// `_base` unset.
@@ -137,10 +141,12 @@ pub async fn handler(
     let autoresolve = req.autoresolve;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
-    let repository = Arc::new(
-        RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(can_read),
-    );
+    let repository = Arc::new(RepositoryContext::new_server_context(
+        immutable_store,
+        mutable_store,
+        repository_id,
+        can_read,
+    ));
 
     LORE_CONTEXT
         .scope(execution, async move {
@@ -326,25 +332,20 @@ async fn run_two_way(
     to_id: model_v1::RevisionIdentifier,
     tx: &mpsc::Sender<Result<RevisionDiffResponse, Status>>,
 ) -> Result<(), Status> {
-    let (from_state, to_state) = load_state_pair(repository, from_sig, to_sig).await?;
+    let (from_state, to_state) = tokio::try_join!(
+        load_state(repository, from_sig),
+        load_state(repository, to_sig),
+    )?;
 
     // Compared before the header goes out so a failure aborts the call rather
     // than truncating a stream that has already started. Streaming the content
     // changes alone would claim no pin moved, which the consumer cannot
     // distinguish from a pin that genuinely did not move.
-    let pin_changes = link::diff_link_pins(repository.clone(), &from_state, &to_state)
-        .await
-        .filter_slow_down()?
-        .map_err(|err| {
-            warn!(
-                {REPOSITORY_ID} = %repository.id,
-                from = %from_sig,
-                to = %to_sig,
-                ?err,
-                "Failed to compare link pins",
-            );
-            Status::internal(err.to_string())
-        })?;
+    let (from_pins, to_pins) = tokio::try_join!(
+        link_pins(repository, &from_state),
+        link_pins(repository, &to_state),
+    )?;
+    let pin_changes = link::link_pin_changes(&from_pins, &to_pins);
 
     // Header first, before opening the producer's sender so a failure in
     // the producer setup surfaces before any header is emitted.
@@ -360,14 +361,22 @@ async fn run_two_way(
 
     // Emitted ahead of the walk so a consumer sees a link before its contents.
     let mut partitions = PartitionTable::new(repository.id);
+    if announce_partitions(
+        &mut partitions,
+        link::touched_link_repositories(&from_pins, &to_pins),
+        tx,
+    )
+    .await
+    .is_err()
+    {
+        return Ok(());
+    }
     for pin_change in &pin_changes {
-        let index = match partitions
+        let Ok(index) = partitions
             .resolve_or_announce(pin_change.link_repository, tx)
             .await
-        {
-            Ok(index) => index,
-            Err(SendOutcome::ReceiverDropped) => return Ok(()),
-            Err(SendOutcome::Sent) => unreachable!("resolve_or_announce returns Sent only via Ok"),
+        else {
+            return Ok(());
         };
         let payload = Payload::Change(link_pin_change_to_diff_change(pin_change, index));
         match send_payload(tx, payload).await {
@@ -389,23 +398,24 @@ async fn run_two_way(
         diff_revision_paths(repo_clone, from_state, to_state, None, producer_tx).await
     });
     while let Some(item) = producer_rx.recv().await {
-        let change = item.filter_slow_down()?.map_err(|err| {
-            warn!(
-                {REPOSITORY_ID} = %repository.id,
-                from = %from_sig_clone,
-                to = %to_sig_clone,
-                ?err,
-                "Failed to calculate 2-way revision diff",
-            );
-            warn_error_to_status(&err, |e| Status::internal(e.to_string()))
-        })?;
-        let index = match partitions
+        let change = item
+            .filter_slow_down()?
+            .filter_cancelled()?
+            .map_err(|err| {
+                warn!(
+                    {REPOSITORY_ID} = %repository.id,
+                    from = %from_sig_clone,
+                    to = %to_sig_clone,
+                    ?err,
+                    "Failed to calculate 2-way revision diff",
+                );
+                warn_error_to_status(&err, |e| Status::internal(e.to_string()))
+            })?;
+        let Ok(index) = partitions
             .resolve_or_announce(change.content_repository_id(), tx)
             .await
-        {
-            Ok(index) => index,
-            Err(SendOutcome::ReceiverDropped) => return Ok(()),
-            Err(SendOutcome::Sent) => unreachable!("resolve_or_announce returns Sent only via Ok"),
+        else {
+            return Ok(());
         };
         let payload = Payload::Change(node_change_to_diff_change(&change, index).await);
         match send_payload(tx, payload).await {
@@ -427,7 +437,7 @@ async fn run_two_way(
         }
     };
 
-    match produced.filter_slow_down()? {
+    match produced.filter_slow_down()?.filter_cancelled()? {
         Ok(()) => Ok(()),
         Err(err) => {
             warn!(
@@ -467,37 +477,76 @@ async fn run_three_way(
     // sets present (see `docs/specs/streaming-revision-diff.md`
     // "Limitations"). We can't change that here, but we can keep the
     // *handler* a pure passthrough.
-    let base =
-        branch::resolve_diff3_base(repository.clone(), from_branch, from_sig, to_branch, to_sig)
-            .await
-            .filter_slow_down()?
-            .map_err(|err| {
-                warn!(
-                    {REPOSITORY_ID} = %repository.id,
-                    from_branch = %from_branch,
-                    to_branch = %to_branch,
-                    ?err,
-                    "Failed to resolve 3-way base revision",
-                );
-                if err.is_divergent() {
-                    Status::failed_precondition(err.to_string())
-                } else if err.is_invalid_arguments() {
-                    Status::invalid_argument(err.to_string())
-                } else if err.is_max_history_search_depth() {
-                    Status::resource_exhausted(err.to_string())
-                } else {
-                    warn_error_to_status(&err, |e| Status::internal(e.to_string()))
-                }
-            })?;
+    let (base, merges) = branch::resolve_diff3_base_and_merges(
+        repository.clone(),
+        from_branch,
+        from_sig,
+        to_branch,
+        to_sig,
+    )
+    .await
+    .filter_slow_down()?
+    .filter_cancelled()?
+    .map_err(|err| {
+        warn!(
+            {REPOSITORY_ID} = %repository.id,
+            from_branch = %from_branch,
+            to_branch = %to_branch,
+            ?err,
+            "Failed to resolve 3-way base revision",
+        );
+        if err.is_divergent() {
+            Status::failed_precondition(err.to_string())
+        } else if err.is_invalid_arguments() {
+            Status::invalid_argument(err.to_string())
+        } else if err.is_max_history_search_depth() {
+            Status::resource_exhausted(err.to_string())
+        } else {
+            warn_error_to_status(&err, |e| Status::internal(e.to_string()))
+        }
+    })?;
 
-    if base.is_zero() {
-        // No common ancestor — disjoint histories.
-        return Err(Status::failed_precondition(
-            "RevisionDiff: no common ancestor between revisions",
-        ));
+    // One side is an ancestor of the other, for example through a merge's
+    // second parent, which the branch checks in `stream_diff` do not see.
+    // The 3-way walk only reports target changes at paths the source changed,
+    // so it would drop them here; the 2-way diff is the correct answer.
+    if base == from_sig || base == to_sig {
+        debug!(
+            {REPOSITORY_ID} = %repository.id,
+            %base,
+            "RevisionDiff: base is one side → 2-way",
+        );
+        return run_two_way(repository, from_sig, from_id, to_sig, to_id, tx).await;
     }
 
-    let base_id = identifier_for_signature(repository, base).await?;
+    // Spawned before the link comparison so the walk overlaps it, and aborted
+    // if the call returns early.
+    let (producer_tx, mut producer_rx) = mpsc::channel::<Result<DiffItem, BranchError>>(256);
+    let repo_clone = repository.clone();
+    let producer = AbortOnDropHandle::new(lore_spawn!(async move {
+        Box::pin(branch::diff3_with_base(
+            repo_clone,
+            base,
+            merges,
+            from_sig,
+            to_sig,
+            None,
+            false,
+            autoresolve,
+            Some(config.source_cap),
+            config.history_walk_concurrency,
+            // The display diff reports every changed path individually.
+            None,
+            LinkSettlement::Tree,
+            producer_tx,
+        ))
+        .await
+    }));
+
+    let (base_id, touched_links) = tokio::try_join!(
+        identifier_for_signature(repository, base),
+        touched_link_repositories(repository, base, from_sig, to_sig),
+    )?;
     let header = thin_client_v1::RevisionDiffHeader {
         identifier_from: Some(from_id),
         signature_from: from_sig.into(),
@@ -508,34 +557,16 @@ async fn run_three_way(
     };
     send_header(tx, header).await?;
 
-    // Spawn the producer and stream items straight to the wire. The
-    // producer re-resolves the base internally (cheap — metadata
-    // lookups), runs the 3-way merge, and emits each finalized DiffItem
-    // on its channel.
-    let (producer_tx, mut producer_rx) = mpsc::channel::<Result<DiffItem, BranchError>>(256);
-    let repo_clone = repository.clone();
-    let producer = lore_spawn!(async move {
-        Box::pin(branch::diff3_with_source_cap(
-            repo_clone,
-            from_branch,
-            from_sig,
-            to_branch,
-            to_sig,
-            None,
-            false,
-            autoresolve,
-            Some(config.source_cap),
-            config.history_walk_concurrency,
-            // The display diff reports every changed path individually.
-            None,
-            producer_tx,
-        ))
-        .await
-    });
-
     let mut partitions = PartitionTable::new(repository.id);
+    if announce_partitions(&mut partitions, touched_links, tx)
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+
     while let Some(item) = producer_rx.recv().await {
-        let item = item.map_err(|err| {
+        let item = item.filter_cancelled()?.map_err(|err| {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
                 from_branch = %from_branch,
@@ -547,38 +578,26 @@ async fn run_three_way(
         })?;
         let payload = match item {
             DiffItem::Change(change) => {
-                let index = match partitions
+                let Ok(index) = partitions
                     .resolve_or_announce(change.content_repository_id(), tx)
                     .await
-                {
-                    Ok(index) => index,
-                    Err(SendOutcome::ReceiverDropped) => return Ok(()),
-                    Err(SendOutcome::Sent) => {
-                        unreachable!("resolve_or_announce returns Sent only via Ok")
-                    }
+                else {
+                    return Ok(());
                 };
                 Payload::Change(node_change_to_diff_change(&change, index).await)
             }
             DiffItem::Conflict(pair) => {
-                let index_from = match partitions
+                let Ok(index_from) = partitions
                     .resolve_or_announce(pair.0.content_repository_id(), tx)
                     .await
-                {
-                    Ok(index) => index,
-                    Err(SendOutcome::ReceiverDropped) => return Ok(()),
-                    Err(SendOutcome::Sent) => {
-                        unreachable!("resolve_or_announce returns Sent only via Ok")
-                    }
+                else {
+                    return Ok(());
                 };
-                let index_to = match partitions
+                let Ok(index_to) = partitions
                     .resolve_or_announce(pair.1.content_repository_id(), tx)
                     .await
-                {
-                    Ok(index) => index,
-                    Err(SendOutcome::ReceiverDropped) => return Ok(()),
-                    Err(SendOutcome::Sent) => {
-                        unreachable!("resolve_or_announce returns Sent only via Ok")
-                    }
+                else {
+                    return Ok(());
                 };
                 Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to).await)
             }
@@ -594,6 +613,7 @@ async fn run_three_way(
     // `target`.
     match producer.await {
         Ok(Ok(_summary)) => Ok(()),
+        Ok(Err(err)) if err.is_cancelled() => Err(Status::cancelled(err.to_string())),
         Ok(Err(err)) => {
             warn!(
                 {REPOSITORY_ID} = %repository.id,
@@ -630,21 +650,66 @@ fn map_branch_error_to_status(err: BranchError) -> Status {
     }
 }
 
-async fn load_state_pair(
+/// Repositories of the links either side changed from `base`, read from the
+/// host's link registries alone so every caller gets the same set.
+async fn touched_link_repositories(
     repository: &Arc<RepositoryContext>,
+    base: Hash,
     from_sig: Hash,
     to_sig: Hash,
-) -> Result<(Arc<State>, Arc<State>), Status> {
-    let from_fut = State::deserialize(repository.clone(), from_sig);
-    let to_fut = State::deserialize(repository.clone(), to_sig);
-    let (from_res, to_res) = tokio::join!(from_fut, to_fut);
-    let from_state = from_res
+) -> Result<Vec<RepositoryId>, Status> {
+    let (base_state, from_state, to_state) = tokio::try_join!(
+        load_state(repository, base),
+        load_state(repository, from_sig),
+        load_state(repository, to_sig),
+    )?;
+    let (base_pins, from_pins, to_pins) = tokio::try_join!(
+        link_pins(repository, &base_state),
+        link_pins(repository, &from_state),
+        link_pins(repository, &to_state),
+    )?;
+    Ok(link::touched_link_repositories(&base_pins, &from_pins)
+        .chain(link::touched_link_repositories(&base_pins, &to_pins))
+        .collect())
+}
+
+async fn announce_partitions(
+    partitions: &mut PartitionTable,
+    link_repositories: impl IntoIterator<Item = RepositoryId>,
+    tx: &mpsc::Sender<Result<RevisionDiffResponse, Status>>,
+) -> Result<(), SendOutcome> {
+    for link_repository in link_repositories {
+        partitions.resolve_or_announce(link_repository, tx).await?;
+    }
+    Ok(())
+}
+
+async fn link_pins(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+) -> Result<Vec<link::LinkAtPath>, Status> {
+    link::link_pins_by_path(state, repository.clone())
+        .await
         .filter_slow_down()?
-        .map_err(|err| state_status(repository, from_sig, err))?;
-    let to_state = to_res
+        .map_err(|err| {
+            warn!(
+                {REPOSITORY_ID} = %repository.id,
+                {REVISION} = %state.revision(),
+                ?err,
+                "Failed to list link pins",
+            );
+            Status::internal(err.to_string())
+        })
+}
+
+async fn load_state(
+    repository: &Arc<RepositoryContext>,
+    signature: Hash,
+) -> Result<Arc<State>, Status> {
+    State::deserialize(repository.clone(), signature)
+        .await
         .filter_slow_down()?
-        .map_err(|err| state_status(repository, to_sig, err))?;
-    Ok((from_state, to_state))
+        .map_err(|err| state_status(repository, signature, err))
 }
 
 fn state_status(
@@ -720,50 +785,24 @@ async fn send_payload(
     SendOutcome::Sent
 }
 
-/// Per-stream map of linked-repository `RepositoryId` to its assigned
-/// index. The parent repository is index 0 and never stored here.
-#[lore_macro::test_pub]
-struct PartitionTable {
-    parent_repository_id: RepositoryId,
-    entries: HashMap<RepositoryId, u32>,
-}
-
 impl PartitionTable {
-    #[lore_macro::test_pub]
-    fn new(parent_repository_id: RepositoryId) -> Self {
-        Self {
-            parent_repository_id,
-            entries: HashMap::new(),
-        }
-    }
-
     /// Resolve `partition` to its index, sending a `DiffPartition` on
     /// first sighting (before the index is returned, so the announcement
     /// always precedes the change that references it). `Err` only when
-    /// the receiver is gone; the table is left unchanged in that case.
+    /// the receiver is gone.
     #[lore_macro::test_pub]
     async fn resolve_or_announce(
         &mut self,
         partition: RepositoryId,
         tx: &mpsc::Sender<Result<RevisionDiffResponse, Status>>,
     ) -> Result<u32, SendOutcome> {
-        if partition == self.parent_repository_id {
-            return Ok(0);
+        let (index, announcement) = self.resolve(partition);
+        if let Some(announcement) = announcement
+            && let SendOutcome::ReceiverDropped =
+                send_payload(tx, Payload::Partition(announcement)).await
+        {
+            return Err(SendOutcome::ReceiverDropped);
         }
-        if let Some(&index) = self.entries.get(&partition) {
-            return Ok(index);
-        }
-        let index = (self.entries.len() as u32) + 1;
-        let announcement = Payload::Partition(thin_client_v1::DiffPartition {
-            index,
-            link_partition: Bytes::from(partition),
-        });
-        match send_payload(tx, announcement).await {
-            SendOutcome::Sent => {
-                self.entries.insert(partition, index);
-                Ok(index)
-            }
-            SendOutcome::ReceiverDropped => Err(SendOutcome::ReceiverDropped),
-        }
+        Ok(index)
     }
 }

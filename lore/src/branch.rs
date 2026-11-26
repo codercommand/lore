@@ -22,7 +22,6 @@ use lore_revision::link;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::execution_context;
 use lore_revision::lore_debug;
-use lore_revision::lore_error;
 use lore_revision::metadata::MetadataInherit;
 use lore_revision::metadata::branch::BranchMetadataError;
 use lore_revision::repository;
@@ -35,9 +34,12 @@ use crate::call::repository_call_write;
 use crate::call_delegation::dispatch_call;
 use crate::interface::Context;
 use crate::interface::LoreString;
+use crate::util::path_messages;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(create_local)]
 /// Arguments for creating a new branch with the given name and category.
 pub struct LoreBranchCreateArgs {
@@ -75,12 +77,12 @@ pub struct LoreBranchCreateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkBranchCreate`](crate::interface::LoreEvent::LinkBranchCreate) | Emitted once per linked repository mount, reporting whether its branch was created or an existing one reused |
-pub async fn create(
+pub fn create(
     globals: LoreGlobalArgs,
     args: LoreBranchCreateArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, create_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, create_local)
 }
 
 fn create_local(
@@ -113,7 +115,9 @@ fn create_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(info_local)]
 /// Arguments for retrieving branch metadata (name, id, category, protection status).
 pub struct LoreBranchInfoArgs {
@@ -143,12 +147,12 @@ pub struct LoreBranchInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::BranchInfo`](crate::interface::LoreEvent::BranchInfo) | Emitted with branch metadata (name, id, category, protection status, etc.) |
-pub async fn info(
+pub fn info(
     globals: LoreGlobalArgs,
     args: LoreBranchInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, info_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, info_local)
 }
 
 fn info_local(
@@ -175,7 +179,9 @@ fn info_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(diff_local)]
 /// Arguments for diffing two branches, reporting changed and conflicting files.
 pub struct LoreBranchDiffArgs {
@@ -216,12 +222,12 @@ pub struct LoreBranchDiffArgs {
 /// | [`LoreEvent::BranchDiffConflict`](crate::interface::LoreEvent::BranchDiffConflict) | Emitted for each file that has a conflict between the two branches |
 /// | [`LoreEvent::BranchDiffConflictEnd`](crate::interface::LoreEvent::BranchDiffConflictEnd) | Emitted after all conflict files have been reported |
 /// | [`LoreEvent::BranchDiffEnd`](crate::interface::LoreEvent::BranchDiffEnd) | Emitted after all diff results have been streamed |
-pub async fn diff(
+pub fn diff(
     globals: LoreGlobalArgs,
     args: LoreBranchDiffArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, diff_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, diff_local)
 }
 
 fn diff_local(
@@ -241,15 +247,18 @@ fn diff_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(list_local)]
-/// Arguments for listing all branches in the repository.
+/// Arguments for listing the branches of the repository.
 pub struct LoreBranchListArgs {
     /// Include archived local branches in listing
     pub archived: u8,
 }
 
-/// Lists all branches in the repository.
+/// Lists the local branches of the repository, or the remote's branches when the `remote` global
+/// option is set.
 ///
 /// # Events
 ///
@@ -269,14 +278,14 @@ pub struct LoreBranchListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::BranchListBegin`](crate::interface::LoreEvent::BranchListBegin) | Emitted before branch list entries begin streaming |
-/// | [`LoreEvent::BranchListEntry`](crate::interface::LoreEvent::BranchListEntry) | Emitted for each branch in the repository |
+/// | [`LoreEvent::BranchListEntry`](crate::interface::LoreEvent::BranchListEntry) | Emitted for each listed branch |
 /// | [`LoreEvent::BranchListEnd`](crate::interface::LoreEvent::BranchListEnd) | Emitted after all branch entries have been streamed |
-pub async fn list(
+pub fn list(
     globals: LoreGlobalArgs,
     args: LoreBranchListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, list_local)
 }
 
 fn list_local(
@@ -287,7 +296,6 @@ fn list_local(
     repository_call_read(globals, callback, args, list, move |repository, args| {
         branch::list_output(
             repository,
-            execution_context().globals().local(),
             execution_context().globals().remote(),
             args.archived != 0,
         )
@@ -295,7 +303,9 @@ fn list_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(merge_start_local)]
 /// Arguments for merging a source branch into the current branch.
 pub struct LoreBranchMergeStartArgs {
@@ -313,6 +323,10 @@ pub struct LoreBranchMergeStartArgs {
     /// revision. Empty carries nothing; the single entry `*` carries every
     /// key that is not reserved to the merge itself.
     pub inherit_metadata: LoreArray<LoreString>,
+    /// Array of link relative paths that have specific auto commit messages
+    pub link_paths: LoreArray<LoreString>,
+    /// Array of messages corresponding to each link path (parallel array with `link_paths`)
+    pub link_messages: LoreArray<LoreString>,
 }
 
 /// Begins merging a source branch into the current branch, auto-committing if there are no conflicts.
@@ -346,12 +360,12 @@ pub struct LoreBranchMergeStartArgs {
 /// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the committed revision details |
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the committed revision |
 /// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each fragment written during auto-commit |
-pub async fn merge_start(
+pub fn merge_start(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeStartArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, merge_start_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, merge_start_local)
 }
 
 fn merge_start_local(
@@ -374,19 +388,21 @@ fn merge_start_local(
                 MergeScope::Link(link_str)
             };
 
-            let options = MergeStartOptions {
-                message: args.message.to_string(),
-                no_commit: args.no_commit != 0,
-                scope,
-                inherit_metadata: MetadataInherit::from_keys(
-                    args.inherit_metadata
-                        .as_slice()
-                        .iter()
-                        .map(LoreString::as_str),
-                ),
-            };
-
             async move {
+                let options = MergeStartOptions {
+                    message: args.message.to_string(),
+                    link_messages: path_messages("link", &args.link_paths, &args.link_messages)
+                        .forward::<MergeError>("Invalid link message path")?,
+                    no_commit: args.no_commit != 0,
+                    scope,
+                    inherit_metadata: MetadataInherit::from_keys(
+                        args.inherit_metadata
+                            .as_slice()
+                            .iter()
+                            .map(LoreString::as_str),
+                    ),
+                };
+
                 let branch = branch::resolve(repository.clone(), args.branch.as_str())
                     .await
                     .forward::<MergeError>("resolving branch")?;
@@ -398,7 +414,9 @@ fn merge_start_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(merge_abort_local)]
 /// Arguments for aborting an in-progress branch merge.
 pub struct LoreBranchMergeAbortArgs {
@@ -430,12 +448,25 @@ pub struct LoreBranchMergeAbortArgs {
 /// | [`LoreEvent::BranchMergeAbortBegin`](crate::interface::LoreEvent::BranchMergeAbortBegin) | Emitted when aborting a branch merge, includes staged and current revision hashes |
 /// | [`LoreEvent::BranchMergeAbortEnd`](crate::interface::LoreEvent::BranchMergeAbortEnd) | Emitted after the merge abort has been completed |
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted during file realization while reverting merge changes |
-pub async fn merge_abort(
+///
+/// ## Unstage Events
+///
+/// A link the abort restores to the pin the current revision holds is unstaged, with the events
+/// of an unstage of its path.
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::FileUnstageBegin`](crate::interface::LoreEvent::FileUnstageBegin) | Emitted when unstaging the link begins |
+/// | [`LoreEvent::FileUnstageProgress`](crate::interface::LoreEvent::FileUnstageProgress) | Emitted periodically during unstaging |
+/// | [`LoreEvent::FileUnstageFile`](crate::interface::LoreEvent::FileUnstageFile) | Emitted for each file that was unstaged |
+/// | [`LoreEvent::FileUnstageEnd`](crate::interface::LoreEvent::FileUnstageEnd) | Emitted when unstaging the link completes |
+/// | [`LoreEvent::FileUnstageRevision`](crate::interface::LoreEvent::FileUnstageRevision) | Emitted with the resulting staged revision, where one remains |
+pub fn merge_abort(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeAbortArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, merge_abort_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, merge_abort_local)
 }
 
 fn merge_abort_local(
@@ -464,7 +495,60 @@ fn merge_abort_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
+#[handler(merge_conflicts_list_local)]
+/// Arguments for listing the conflicts an open merge holds.
+pub struct LoreBranchMergeConflictsListArgs {}
+
+/// Lists every conflict the open merge still holds, files and link rows alike.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Merge Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::BranchMergeConflictFile`](crate::interface::LoreEvent::BranchMergeConflictFile) | Emitted for each file still in conflict |
+/// | [`LoreEvent::BranchMergeLinkPinConflict`](crate::interface::LoreEvent::BranchMergeLinkPinConflict) | Emitted for each link row still awaiting a side |
+pub fn merge_conflicts_list(
+    globals: LoreGlobalArgs,
+    args: LoreBranchMergeConflictsListArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, merge_conflicts_list_local)
+}
+
+fn merge_conflicts_list_local(
+    globals: LoreGlobalArgs,
+    args: LoreBranchMergeConflictsListArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    repository_call_read(
+        globals,
+        callback,
+        args,
+        merge_conflicts_list,
+        move |repository, _args| async move { branch::merge::merge_conflicts_list(repository).await },
+    )
+}
+
+#[repr(C)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(merge_unresolve_local)]
 /// Arguments for marking resolved merge paths as unresolved again.
 pub struct LoreBranchMergeUnresolveArgs {
@@ -493,12 +577,12 @@ pub struct LoreBranchMergeUnresolveArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::BranchMergeUnresolveFile`](crate::interface::LoreEvent::BranchMergeUnresolveFile) | Emitted for each file that was marked as unresolved |
 /// | [`LoreEvent::BranchMergeUnresolveRevision`](crate::interface::LoreEvent::BranchMergeUnresolveRevision) | Emitted with the updated staged revision after unresolve completes |
-pub async fn merge_unresolve(
+pub fn merge_unresolve(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeUnresolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, merge_unresolve_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, merge_unresolve_local)
 }
 
 fn merge_unresolve_local(
@@ -518,7 +602,9 @@ fn merge_unresolve_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(merge_into_local)]
 /// Arguments for merging the current branch's staged changes into a target branch.
 pub struct LoreBranchMergeIntoArgs {
@@ -570,12 +656,12 @@ pub struct LoreBranchMergeIntoArgs {
 /// | [`LoreEvent::RevisionCommitRevision`](crate::interface::LoreEvent::RevisionCommitRevision) | Emitted with the committed revision details |
 /// | [`LoreEvent::Metadata`](crate::interface::LoreEvent::Metadata) | Emitted for each metadata entry of the committed revision |
 /// | [`LoreEvent::FragmentWrite`](crate::interface::LoreEvent::FragmentWrite) | Emitted for each file fragment written or deduplicated during commit |
-pub async fn merge_into(
+pub fn merge_into(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeIntoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, merge_into_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, merge_into_local)
 }
 
 fn merge_into_local(
@@ -619,7 +705,9 @@ fn merge_into_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(merge_restart_local)]
 /// Arguments for re-applying merge conflict resolution for the given paths.
 pub struct LoreBranchMergeRestartArgs {
@@ -649,12 +737,12 @@ pub struct LoreBranchMergeRestartArgs {
 /// | [`LoreEvent::BranchMergeConflictFile`](crate::interface::LoreEvent::BranchMergeConflictFile) | Emitted for each file with a remaining merge conflict |
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted during file realization during restart |
 /// | [`LoreEvent::RevisionSyncFile`](crate::interface::LoreEvent::RevisionSyncFile) | Emitted for each file re-materialized during restart |
-pub async fn merge_restart(
+pub fn merge_restart(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeRestartArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, merge_restart_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, merge_restart_local)
 }
 
 fn merge_restart_local(
@@ -674,7 +762,9 @@ fn merge_restart_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(merge_resolve_local)]
 /// Arguments for marking conflicted paths as resolved.
 pub struct LoreBranchMergeResolveArgs {
@@ -703,12 +793,12 @@ pub struct LoreBranchMergeResolveArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::BranchMergeResolveFile`](crate::interface::LoreEvent::BranchMergeResolveFile) | Emitted for each file that was marked as resolved |
 /// | [`LoreEvent::BranchMergeResolveRevision`](crate::interface::LoreEvent::BranchMergeResolveRevision) | Emitted with the updated staged revision after resolve completes |
-pub async fn merge_resolve(
+pub fn merge_resolve(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeResolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, merge_resolve_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, merge_resolve_local)
 }
 
 fn merge_resolve_local(
@@ -728,7 +818,9 @@ fn merge_resolve_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(merge_resolve_mine_local)]
 /// Arguments for resolving conflicts by accepting the local ("mine") version.
 pub struct LoreBranchMergeResolveMineArgs {
@@ -757,12 +849,12 @@ pub struct LoreBranchMergeResolveMineArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::BranchMergeResolveFile`](crate::interface::LoreEvent::BranchMergeResolveFile) | Emitted for each file resolved by keeping "mine" |
 /// | [`LoreEvent::BranchMergeResolveRevision`](crate::interface::LoreEvent::BranchMergeResolveRevision) | Emitted with the updated staged revision |
-pub async fn merge_resolve_mine(
+pub fn merge_resolve_mine(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeResolveMineArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, merge_resolve_mine_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, merge_resolve_mine_local)
 }
 
 fn merge_resolve_mine_local(
@@ -782,7 +874,9 @@ fn merge_resolve_mine_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(merge_resolve_theirs_local)]
 /// Arguments for resolving conflicts by accepting the incoming ("theirs") version.
 pub struct LoreBranchMergeResolveTheirsArgs {
@@ -811,12 +905,12 @@ pub struct LoreBranchMergeResolveTheirsArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::BranchMergeResolveFile`](crate::interface::LoreEvent::BranchMergeResolveFile) | Emitted for each file resolved by keeping "theirs" |
 /// | [`LoreEvent::BranchMergeResolveRevision`](crate::interface::LoreEvent::BranchMergeResolveRevision) | Emitted with the updated staged revision |
-pub async fn merge_resolve_theirs(
+pub fn merge_resolve_theirs(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeResolveTheirsArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, merge_resolve_theirs_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, merge_resolve_theirs_local)
 }
 
 fn merge_resolve_theirs_local(
@@ -836,7 +930,9 @@ fn merge_resolve_theirs_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(push_local)]
 /// Arguments for pushing a branch and its revisions to the remote.
 pub struct LoreBranchPushArgs {
@@ -877,12 +973,12 @@ pub struct LoreBranchPushArgs {
 /// | [`LoreEvent::BranchPushRevisionPushUpdate`](crate::interface::LoreEvent::BranchPushRevisionPushUpdate) | Emitted with progress updates during revision push |
 /// | [`LoreEvent::BranchPushRevisionPushEnd`](crate::interface::LoreEvent::BranchPushRevisionPushEnd) | Emitted when revision push completes |
 /// | [`LoreEvent::BranchPushStats`](crate::interface::LoreEvent::BranchPushStats) | Emitted once when the push finishes, with fragment dedup/copy/upload totals for the whole push. Requires `stats >= 1` on the global arguments |
-pub async fn push(
+pub fn push(
     globals: LoreGlobalArgs,
     args: LoreBranchPushArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, push_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, push_local)
 }
 
 fn push_local(
@@ -921,7 +1017,9 @@ async fn push_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(switch_local)]
 /// Arguments for switching the working directory to a different branch or revision.
 pub struct LoreBranchSwitchArgs {
@@ -962,12 +1060,12 @@ pub struct LoreBranchSwitchArgs {
 /// | [`LoreEvent::RevisionSyncRevision`](crate::interface::LoreEvent::RevisionSyncRevision) | Emitted with the resulting revision after switch |
 /// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by view or ignore filters |
 /// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision number |
-pub async fn switch(
+pub fn switch(
     globals: LoreGlobalArgs,
     args: LoreBranchSwitchArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, switch_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, switch_local)
 }
 
 fn switch_local(
@@ -999,7 +1097,9 @@ fn switch_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(protect_local)]
 /// Arguments for applying write protection to a branch.
 pub struct LoreBranchProtectArgs {
@@ -1027,12 +1127,12 @@ pub struct LoreBranchProtectArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::BranchProtect`](crate::interface::LoreEvent::BranchProtect) | Emitted when the branch has been successfully protected |
-pub async fn protect(
+pub fn protect(
     globals: LoreGlobalArgs,
     args: LoreBranchProtectArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, protect_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, protect_local)
 }
 
 fn protect_local(
@@ -1054,7 +1154,9 @@ fn protect_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(unprotect_local)]
 /// Arguments for removing write protection from a branch.
 pub struct LoreBranchUnprotectArgs {
@@ -1082,12 +1184,12 @@ pub struct LoreBranchUnprotectArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::BranchUnprotect`](crate::interface::LoreEvent::BranchUnprotect) | Emitted when the branch has been successfully unprotected |
-pub async fn unprotect(
+pub fn unprotect(
     globals: LoreGlobalArgs,
     args: LoreBranchUnprotectArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, unprotect_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, unprotect_local)
 }
 
 fn unprotect_local(
@@ -1109,7 +1211,9 @@ fn unprotect_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(archive_local)]
 /// Arguments for archiving a branch locally and (unless local mode) on the remote.
 pub struct LoreBranchArchiveArgs {
@@ -1149,12 +1253,12 @@ pub struct LoreBranchArchiveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::BranchArchive`](crate::interface::LoreEvent::BranchArchive) | Emitted when the branch has been successfully archived |
-pub async fn archive(
+pub fn archive(
     globals: LoreGlobalArgs,
     args: LoreBranchArchiveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, archive_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, archive_local)
 }
 
 fn archive_local(
@@ -1171,48 +1275,33 @@ fn archive_local(
     )
 }
 
+#[lore_macro::test_pub]
 async fn archive_impl(
     repository: Arc<RepositoryContext>,
     args: LoreBranchArchiveArgs,
 ) -> Result<(), BranchError> {
-    let execution = execution_context();
-
     let branch = branch::resolve(repository.clone(), args.branch.as_str()).await?;
 
     let layer_scope =
         CascadeScope::new(&args.layer, args.include_layers, "layer", "include_layers")?;
     let link_scope = CascadeScope::new(&args.link, args.include_links, "link", "include_links")?;
 
-    let mut local_fail = false;
-
-    // Make sure branch is not current
-    let mut local_current = false;
+    // `branch::delete` refuses the current branch too, but the remote archive and the cascade
+    // would still run after it, so the refusal comes first.
     if let Ok((_revision, current_branch)) =
         lore_revision::instance::load_current_anchor_boxed(&repository).await
         && current_branch == branch.id
     {
-        lore_error!("Cannot archive the current branch");
-        execution
-            .dispatcher
-            .send_error(BranchError::from(lore_base::error::DeleteCurrent {
-                branch: branch.id.to_string(),
-            }));
-        local_fail = true;
-        local_current = true;
+        return Err(BranchError::from(lore_base::error::DeleteCurrent {
+            branch: branch.id.to_string(),
+        }));
     }
 
-    if !local_fail {
-        // Archive branch
-        lore_debug!("Attempt archive of local branch");
-        if let Err(err) = branch::delete(repository.clone(), branch.id).await {
-            execution.dispatcher.send_error(err);
-            local_fail = true;
-        }
-    }
+    lore_debug!("Attempt archive of local branch");
+    // The local failure takes precedence over the remote's, and both over the cascade's.
+    let mut failure = branch::delete(repository.clone(), branch.id).await.err();
 
-    let mut remote_fail = None;
-
-    if !local_current && !execution_context().globals().local() {
+    if !execution_context().globals().local() {
         // Archive remote branch
         lore_debug!("Attempt archive of remote branch");
         let remote_archive = match repository
@@ -1229,26 +1318,23 @@ async fn archive_impl(
             Err(err) if err.is_no_remote() || err.is_branch_not_found() => {
                 lore_debug!("No remote branch to archive: {err}");
             }
-            Err(err) => remote_fail = Some(err),
+            Err(err) => {
+                failure.get_or_insert(err);
+            }
         }
     }
 
     // Runs even when the outer archive failed, so that a repeat of a partially
     // applied archive still converges on the layers and links.
-    if !local_current {
-        archive_layers(repository.clone(), branch.id, layer_scope).await?;
-        archive_links(repository, branch.id, link_scope).await?;
-    }
+    let cascade = match archive_layers(repository.clone(), branch.id, layer_scope).await {
+        Ok(()) => archive_links(repository, branch.id, link_scope).await,
+        Err(err) => Err(err),
+    };
 
-    if local_fail {
-        return Err(BranchError::from(lore_base::error::BranchNotFound {
-            branch: branch.id.to_string(),
-        }));
-    }
-
-    if let Some(err) = remote_fail {
+    if let Some(err) = failure {
         return Err(err);
     }
+    cascade?;
 
     Ok(())
 }
@@ -1368,7 +1454,9 @@ async fn archive_in_repositories(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(reset_local)]
 /// Arguments for resetting a branch's local LATEST pointer to a specific revision.
 pub struct LoreBranchResetArgs {
@@ -1398,12 +1486,12 @@ pub struct LoreBranchResetArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::BranchReset`](crate::interface::LoreEvent::BranchReset) | Emitted when the branch has been reset to the target revision |
-pub async fn reset(
+pub fn reset(
     globals: LoreGlobalArgs,
     args: LoreBranchResetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, reset_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, reset_local)
 }
 
 fn reset_local(
@@ -1435,7 +1523,9 @@ async fn reset_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(latest_list_local)]
 /// Arguments for listing a branch's LATEST revision history.
 pub struct LoreBranchLatestListArgs {
@@ -1465,12 +1555,12 @@ pub struct LoreBranchLatestListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::BranchLatestListEntry`](crate::interface::LoreEvent::BranchLatestListEntry) | Emitted for each revision the branch LATEST has held, most recent first |
-pub async fn latest_list(
+pub fn latest_list(
     globals: LoreGlobalArgs,
     args: LoreBranchLatestListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, latest_list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, latest_list_local)
 }
 
 fn latest_list_local(
@@ -1502,7 +1592,16 @@ async fn latest_list_impl(
 // --- Branch metadata commands ---
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(metadata_get_local)]
 /// Arguments for retrieving branch metadata (one key or all).
 pub struct LoreBranchMetadataGetArgs {
@@ -1529,22 +1628,25 @@ async fn resolve_branch_id_or_current(
         return Ok(current_branch);
     }
 
-    let status = branch::resolve(repository, branch).await.map_err(|_err| {
-        lore_base::error::InvalidArguments {
-            reason: format!("branch '{branch}' not found"),
-        }
-    })?;
-    Ok(status.id)
+    match branch::resolve(repository, branch).await {
+        Ok(status) => Ok(status.id),
+        Err(err) if lore_base::error::is_refusal(&err) => Err(err).forward_any("resolving branch"),
+        Err(_err) => Err(BranchMetadataError::from(
+            lore_base::error::InvalidArguments {
+                reason: format!("branch '{branch}' not found"),
+            },
+        )),
+    }
 }
 
 /// Retrieves branch metadata. If `key` is non-empty, returns that single key's value.
 /// If `key` is empty, returns all metadata entries.
-pub async fn metadata_get(
+pub fn metadata_get(
     globals: LoreGlobalArgs,
     args: LoreBranchMetadataGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_get_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_get_local)
 }
 
 fn metadata_get_local(
@@ -1581,7 +1683,16 @@ fn metadata_get_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(metadata_set_local)]
 /// Arguments for setting one or more key-value pairs on branch metadata.
 pub struct LoreBranchMetadataSetArgs {
@@ -1596,12 +1707,12 @@ pub struct LoreBranchMetadataSetArgs {
 }
 
 /// Sets one or more metadata key-value pairs on the branch metadata.
-pub async fn metadata_set(
+pub fn metadata_set(
     globals: LoreGlobalArgs,
     args: LoreBranchMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_set_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_set_local)
 }
 
 fn metadata_set_local(
@@ -1618,6 +1729,8 @@ fn metadata_set_local(
     )
 }
 
+/// Sets the metadata `args` names on the branch it names, or on the current branch.
+#[lore_macro::test_pub]
 async fn metadata_set_impl(
     repository: Arc<RepositoryContext>,
     args: LoreBranchMetadataSetArgs,
@@ -1659,7 +1772,16 @@ async fn metadata_set_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(metadata_clear_local)]
 /// Arguments for removing keys from branch metadata.
 pub struct LoreBranchMetadataClearArgs {
@@ -1670,12 +1792,12 @@ pub struct LoreBranchMetadataClearArgs {
 }
 
 /// Removes metadata keys from the branch metadata.
-pub async fn metadata_clear(
+pub fn metadata_clear(
     globals: LoreGlobalArgs,
     args: LoreBranchMetadataClearArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_clear_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_clear_local)
 }
 
 fn metadata_clear_local(

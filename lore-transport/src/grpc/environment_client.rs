@@ -66,6 +66,11 @@ impl From<lore_proto::lore::environment::v1::Environment> for EnvironmentConfig 
                 compression_mode: config
                     .compression_mode
                     .map(|mode| ServerCompressionMode::from_u32(mode as u32)),
+                max_lock_batch: if config.max_lock_batch > 0 {
+                    Some(config.max_lock_batch as usize)
+                } else {
+                    None
+                },
             }),
             oidc: value.oidc.and_then(oidc_from_proto),
         }
@@ -86,7 +91,7 @@ fn oidc_from_proto(oidc: lore_proto::lore::environment::v1::Oidc) -> Option<Oidc
         resource_template: non_empty(oidc.resource_template),
         scope_template: non_empty(oidc.scope_template),
         token_exchange_issuer: non_empty(oidc.token_exchange_issuer),
-        identity_claim: non_empty(oidc.identity_claim),
+        client_credentials_scopes: oidc.client_credentials_scopes,
     })
 }
 

@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: MIT
 use std::ffi::OsString;
 use std::path::PathBuf;
+#[cfg(target_family = "unix")]
 use std::process::Command;
+#[cfg(target_family = "unix")]
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+#[cfg(target_family = "unix")]
 use std::time::Duration;
 
 use lore::remote::service_process::*;
-use tokio::sync::Notify;
 
 #[test]
 fn no_executable_set_reports_both_places_to_set_one() {
@@ -43,6 +43,69 @@ fn a_config_value_of_only_space_is_treated_as_unset() {
     assert!(
         error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
         "the failure must name where one can be set: {error}"
+    );
+}
+
+/// What [`executable_to_start`] picks with no executable named: this program's own only for a
+/// start that allows it, in a program that runs the service, and the naming failure otherwise.
+#[test]
+fn with_none_named_only_a_start_that_allows_it_uses_a_program_that_serves() {
+    let own = PathBuf::from("/opt/lore/bin/lore");
+    for (start, serves, starts_own) in [
+        (ServiceStart::NamedOrThisProgram, true, true),
+        (ServiceStart::NamedOrThisProgram, false, false),
+        (ServiceStart::Named, true, false),
+        (ServiceStart::Named, false, false),
+    ] {
+        let none_named = resolve_service_executable(None, None);
+        let picked = executable_to_start(none_named, start, serves, || Ok(own.clone()));
+
+        if starts_own {
+            let picked = picked.unwrap_or_else(|error| panic!("{start:?} starts its own: {error}"));
+            assert_eq!(picked, own);
+        } else {
+            let error = picked.expect_err("no executable to start");
+            assert!(
+                error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
+                "{start:?}, serving {serves}: the naming failure, got {error}"
+            );
+        }
+    }
+}
+
+/// A named executable is the one started, whatever program asks, and this program's own is not
+/// looked up then.
+#[test]
+fn a_named_executable_is_started_in_place_of_this_program() {
+    let named = PathBuf::from("/opt/lore/1.9/bin/lore");
+    for start in [ServiceStart::Named, ServiceStart::NamedOrThisProgram] {
+        let picked = executable_to_start(Ok(named.clone()), start, true, || {
+            panic!("this program's executable is not looked up when one is named")
+        });
+
+        assert_eq!(picked.expect("the named executable"), named);
+    }
+}
+
+/// A program that serves but cannot find its own executable fails as a start does that has none,
+/// naming where one can be set.
+#[test]
+fn a_program_that_cannot_find_its_own_executable_reports_it_as_unavailable() {
+    let picked = executable_to_start(
+        resolve_service_executable(None, None),
+        ServiceStart::NamedOrThisProgram,
+        true,
+        || Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+    );
+
+    let error = picked.expect_err("no executable to start");
+    assert!(
+        error.is_service_unavailable()
+            && error
+                .to_string()
+                .contains("finding this program's executable failed")
+            && error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
+        "the failure and where to name one instead: {error}"
     );
 }
 
@@ -137,26 +200,23 @@ fn an_empty_environment_value_with_no_config_fails() {
 
 #[tokio::test]
 async fn a_stop_requested_before_the_wait_still_ends_it() {
-    let request = Arc::new(StopRequest {
-        requested: AtomicBool::new(false),
-        notify: Notify::new(),
-    });
+    let request = Arc::new(StopRequest::new());
+    assert!(request.begin_start());
+    request.set_running();
     let wait = ServiceStopRequest {
         request: Arc::clone(&request),
     };
 
-    request.requested.store(true, Ordering::Release);
-    request.notify.notify_one();
+    assert!(request.request_stop());
 
     wait.requested().await;
 }
 
 #[tokio::test]
 async fn a_stop_requested_during_the_wait_ends_it() {
-    let request = Arc::new(StopRequest {
-        requested: AtomicBool::new(false),
-        notify: Notify::new(),
-    });
+    let request = Arc::new(StopRequest::new());
+    assert!(request.begin_start());
+    request.set_running();
     let wait = ServiceStopRequest {
         request: Arc::clone(&request),
     };
@@ -164,9 +224,75 @@ async fn a_stop_requested_during_the_wait_ends_it() {
     // Both run on this task: the wait parks first, then the request lands.
     tokio::join!(wait.requested(), async {
         tokio::task::yield_now().await;
-        request.requested.store(true, Ordering::Release);
-        request.notify.notify_one();
+        assert!(request.request_stop());
     });
+}
+
+#[test]
+fn a_stop_asked_of_an_earlier_service_is_cleared_by_the_next_start() {
+    let request = StopRequest::new();
+    assert!(request.begin_start());
+    assert!(request.request_stop());
+    request.end_service();
+
+    assert!(request.begin_start());
+    assert!(
+        !request.is_requested(),
+        "a service started after one has stopped must not be stopped on arrival"
+    );
+}
+
+#[test]
+fn a_stop_after_the_start_began_is_kept() {
+    let request = StopRequest::new();
+    assert!(request.begin_start());
+
+    // The service is starting and not yet running, as while it mounts.
+    assert!(request.request_stop());
+    assert!(request.is_requested());
+}
+
+#[test]
+fn a_second_start_is_refused_and_leaves_the_first_alone() {
+    let request = StopRequest::new();
+    assert!(request.begin_start());
+    request.set_running();
+    assert!(request.request_stop());
+
+    assert!(!request.begin_start(), "one service runs per process");
+    assert!(request.is_running());
+    assert!(
+        request.is_requested(),
+        "a refused start must not clear a stop asked of the running service"
+    );
+}
+
+/// A stop that reports a service to ask is never lost to the start publishing it:
+/// start and stop race, and whichever order they land in, a stop that was
+/// accepted is still requested once the start has finished.
+#[test]
+fn an_accepted_stop_is_never_cleared_by_a_racing_start() {
+    for _ in 0..2000 {
+        let request = Arc::new(StopRequest::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let stopper = {
+            let (request, barrier) = (Arc::clone(&request), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                request.request_stop()
+            })
+        };
+        barrier.wait();
+        assert!(request.begin_start());
+        let accepted = stopper.join().unwrap();
+
+        assert_eq!(
+            request.is_requested(),
+            accepted,
+            "a stop reported as accepted must survive the start"
+        );
+    }
 }
 
 /// The session a process belongs to, read from `/proc`. `comm` can hold
@@ -176,8 +302,7 @@ async fn a_stop_requested_during_the_wait_ends_it() {
 fn session_of(pid: u32) -> i32 {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
     stat.rsplit_once(')')
-        .map(|(_comm, rest)| rest)
-        .unwrap_or_default()
+        .map_or_default(|(_comm, rest)| rest)
         .split_whitespace()
         .nth(3)
         .and_then(|session| session.parse().ok())

@@ -20,9 +20,12 @@ pub mod store;
 pub mod telemetry;
 pub mod tls;
 pub mod topology;
+pub mod uds;
 pub mod util;
 
 #[cfg(not(feature = "test-util"))]
 mod correlation;
 #[cfg(feature = "test-util")]
 pub mod correlation;
+#[cfg(feature = "test-util")]
+pub mod test_util;

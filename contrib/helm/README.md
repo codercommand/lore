@@ -17,7 +17,7 @@ helm install lore .
 The chart defaults to `ghcr.io/epicgames/lore/loreserver` at the chart's `appVersion`, which is public — nothing to configure and no pull secret. That tag is `linux/amd64` only and runs under emulation on arm64. On Graviton3 or newer, use the native arm64 build instead:
 
 ```sh
-helm install lore . --set image.tag=0.9.0-graviton
+helm install lore . --set image.tag=0.14.0-graviton
 ```
 
 The `-graviton` tag is tuned for Graviton3+ and faults with `SIGILL` on older arm64 CPUs, Apple Silicon and Ampere included.
@@ -121,6 +121,73 @@ result, so the handler can verify the data pod even with a self-signed cert. Wit
 that the handler fails with `InvalidCertificate(UnknownIssuer)` and reads through a
 handler return `Not found`.
 
+## Authentication
+
+With `auth.enabled=true` the server verifies every client's JWT. `auth.issuer` and
+`auth.audience` are required: the server refuses to start without them, and so does
+the install. Clients log in at one of two places, and the install fails with neither:
+
+| Tier | Clients log in at | Values beside `issuer` and `audience` |
+|------|-------------------|---------------------------------------|
+| Tier 1 | An OIDC provider | `auth.oidc.clientId`. Every token holder gets `read` and `write` on every repository, plus the actions in the token's `auth.permissionClaim`. `auth.issuer` is the provider's issuer URL. |
+| Tier 2 | An OIDC provider | As Tier 1, plus `auth.resourceClaim`, the claim carrying per-repository grants, and `auth.oidc.resourceTemplate` or `auth.oidc.scopeTemplate`. |
+| Authentication service | `auth.authUrl` | `auth.authUrl`, without `auth.resourceClaim`. The server asks the service to authorize every request. `auth.oidc` is optional. |
+
+The install fails on these values, which the server refuses at startup:
+
+- `auth.authUrl` with `auth.resourceClaim`, `auth.resourceClaim` without a template, or a
+  template without `auth.resourceClaim` or `auth.authUrl`.
+- With `auth.oidc.clientId` set: both templates, a template without `{id}`, or an
+  `auth.oidc.tokenExchangeIssuer` without a template or that isn't an http or https URL with a
+  host.
+- With `auth.oidc.clientId` set or `auth.jwksEndpoint` empty: an `auth.issuer` that isn't an
+  http or https URL with a host.
+
+`auth.jwksEndpoint` is optional: left empty, the server finds the signing keys through
+OIDC discovery against `auth.issuer`, which must then be an http or https issuer URL.
+`values.yaml` maps each value to its server setting, and the
+[server configuration reference](https://epicgames.github.io/lore/reference/lore-server-config/#authentication)
+describes each setting. A Tier 2 example:
+
+```yaml
+auth:
+  enabled: true
+  issuer: "https://auth.example.com/"
+  audience: ["lore"]
+  resourceClaim: "resources"
+  oidc:
+    clientId: "lore-cli"
+    scopes: ["openid", "offline_access"]
+    resourceTemplate: "https://lore.example.com/partitions/{id}"
+```
+
+In tiered mode the handlers reach the data pod as clients, so with auth on they need a login
+there, and the install fails without one unless `handler.upstreamURL` is set:
+
+```yaml
+handler:
+  identity:
+    secretName: lore-handler-identity
+```
+
+Each handler logs in as the first identity in that token store the data pod accepts. The identity
+needs access to every repository the handlers serve, and its login must name the data pod's
+in-cluster host, `<release>-0.<release>-headless.<namespace>.svc.cluster.local`, among the hosts it
+may be sent to, in its `root_domains` claim or else its `aud`. The server renews the login and
+writes it back, so the Secret only seeds `/data/auth` on the cache volume on a pod's first start.
+With auth on, a handler finds no repository by name, since lore-server sends no login with
+the lookup it makes at the data pod, so clone through a handler by repository ID. Make the
+Secret as for an [edge](#edge-servers):
+
+```sh
+LORE_AUTH_PATH=./handler-auth LORE_AUTH_STORE=fallback lore login lores://lore.example.com:41337
+kubectl create secret generic lore-handler-identity --from-file=./handler-auth
+```
+
+`lore push` and `lore repository create` fail through a handler, with or without auth, so run
+them at the data pod, or at the upstream when `handler.upstreamURL` is set. The public Service
+routes only to the data pod unless `handler.servePublic` or `handler.upstreamURL` is set.
+
 ## Common settings
 
 Override with `--set key=value`. See `values.yaml` for the full, commented list and `examples/` for ready-made sample values.yaml files.
@@ -132,14 +199,16 @@ Override with `--set key=value`. See `values.yaml` for the full, commented list 
 | `priorityClassName` | `""` | PriorityClass for the pods. Set it where the server shares nodes and should win or lose preemption. |
 | `terminationGracePeriodSeconds` | `45` | SIGTERM-to-SIGKILL window. Must cover the preStop hook plus shutdown. |
 | `lifecycle` | preStop `sleep 5` | Container lifecycle hooks. The default delay lets endpoint removal land before shutdown starts; `null` removes it (`{}` does not — Helm coalesces it against the default). |
-| `topology.mode` | `tiered` | `tiered` (data + handler cache) or `single` (one self-contained pod). |
+| `topology.mode` | `tiered` | `tiered` (data + handler cache) or `single` (data pods only). |
+| `backend.type` | `local` | `local` (the store on `/data`) or `aws` (shared S3 + DynamoDB, `/data` as a local cache). See [Multiple servers](#multiple-servers-aws-backend). |
+| `data.replicas` | `1` | Number of data pods. Above 1 needs `backend.type: aws`. |
 | `handler.replicas` | `2` | Number of cache pods. |
 | `service.type` | `NodePort` | `NodePort` \| `LoadBalancer` \| `ClusterIP`. |
 | `tls.mode` | `ephemeral` | `ephemeral` (self-signed, zero setup) \| `selfSigned` \| `certManager` \| `secret`. `certManager` requires [cert-manager](https://cert-manager.io) installed in the cluster; the other modes do not. |
 | `data.persistence.size` / `.storageClass` | `500Gi` / cluster default | Durable store size and class. Use fast disk (NVMe / provisioned-IOPS) for real workloads. |
 | `handler.persistence.size` / `.storageClass` / `.type` | `500Gi` / default / `pvc` | Cache size and class; `type: hostPath` puts the cache on node-local NVMe. |
 | `data.store.maxSize` / `handler.store.maxSize` | `""` (off) | Size cap that lets the store reclaim space. Off by default, and off means unbounded — see [Bounding the store](#bounding-the-store). |
-| `auth.enabled` | `false` | JWT auth. Off = open server. |
+| `auth.enabled` | `false` | JWT auth. Off = open server. See [Authentication](#authentication). |
 
 ### Storage
 
@@ -182,12 +251,108 @@ data:
 
 On `handler`, eviction is safe by construction. A handler's `/data` is a cache in front of the durable store on the data pod, so an evicted fragment is re-fetched rather than lost.
 
+## Multiple servers (AWS backend)
+
+With `backend.type: aws`, the store is shared: S3 holds fragment payloads, and DynamoDB holds
+fragment state, the mutable store and locks. No server owns state the others need, so
+`data.replicas` can run several interchangeable servers behind one Service. Each server's
+`/data` becomes a local fragment cache in front of S3 (a composite store); put it on node-local
+NVMe with `data.persistence.type: hostPath`, and bound it with `data.store.maxSize`, which is safe
+here because an evicted fragment is fetched from S3 again.
+
+```yaml
+topology:
+  mode: single
+backend:
+  type: aws
+  aws:
+    region: us-east-2
+    s3Bucket: lore-fragments
+    fragmentsTable: lore-fragments
+    fragmentStateTable: lore-fragment-state
+    mutableTable: lore-mutable
+    locksTable: lore-locks
+data:
+  replicas: 3
+  podManagementPolicy: Parallel
+replication:
+  enabled: true
+  tls:
+    secretName: lore-replication-tls
+  topology:
+    provider: statefulset
+```
+
+`backend.aws.forceWrite: true` writes to the immutable and mutable stores without first checking
+whether the entry exists, which saves a round trip per write.
+
+**Peers.** With `replication.topology.provider: statefulset`, every server replicates fragments
+it receives to the other servers, so a fragment written through one is already cached on the
+rest, and a cache miss asks the other servers before S3. The chart lists every data pod by its
+headless DNS name (`<release>-N.<release>-headless.<namespace>.svc.cluster.local`) as a `fixed`
+peer, adds any `replication.topology.fixed.peers` (servers in other clusters, say), and each pod
+leaves out its own entry with `[topology.fixed] self_address`. That key needs a **loreserver
+newer than v0.14.0**; an older server ignores it and also replicates to itself.
+
+Peering runs over mutual TLS on the replication port, and each server uses the replication cert
+as its client cert too. Servers dial each other by name, so the cert must be valid for
+`*.<release>-headless.<namespace>.svc.cluster.local`, or set `replication.tls.serverSni` to a
+name it does cover.
+
+**Scaling.** Changing `data.replicas` changes the peer list, so every server restarts, one at a
+time, to pick it up. With more than one replica, each data pod must land on its own node
+(`data.spreadAcrossNodes`, on by default), so one node loss takes out one server and each cache
+has its node's disk to itself. A custom `affinity` replaces that rule.
+
+**Pod management.** Set `data.podManagementPolicy: Parallel` before the first install so pods
+start and are replaced together rather than one after another. Kubernetes does not allow
+changing it on an existing StatefulSet.
+
+See [examples/multi-server-aws.values.yaml](examples/multi-server-aws.values.yaml).
+
+## Edge servers
+
+With `backend.type: edge`, the servers are caches in front of a Lore deployment elsewhere, the
+upstream, with no storage of their own. `/data` holds the cached content; misses are fetched from
+the upstream's replication endpoint, and branch and repository state comes from the upstream.
+
+```yaml
+topology:
+  mode: single
+backend:
+  type: edge
+  edge:
+    upstreamInternalAddress: lore-internal.example.com:41340
+    upstreamURL: lores://lore.example.com:41337
+    identity:
+      secretName: lore-edge-identity
+replication:
+  tls:
+    secretName: lore-edge-replication-tls
+```
+
+The edge presents the replication cert to the upstream as a client cert, so the upstream's
+replication CA must have issued it. With `replication.enabled` and `provider: statefulset` the
+edges also peer with each other, as [multiple servers](#multiple-servers-aws-backend) do.
+
+The identity is the login the edge uses at the upstream; it needs access to every repository the
+edge serves. The server renews that login and writes it back, so the Secret only seeds
+`/data/auth` on a pod's first start. Make it from a file-based token store:
+
+```sh
+LORE_AUTH_PATH=./edge-auth LORE_AUTH_STORE=fallback lore login lores://lore.example.com:41337
+kubectl create secret generic lore-edge-identity --from-file=./edge-auth
+```
+
+See [examples/edge.values.yaml](examples/edge.values.yaml).
+
 ## Cross-cluster replication
 
 `replication.enabled=true` turns on the server's two internal replication endpoints on
 port 41340 — `quic_internal` (UDP) and `replication` (gRPC/TCP) — on the data pod only.
 Both require mutual TLS, so you must supply a Secret holding the server cert, key, and
-CA chain (`replication.tls.secretName`).
+CA chain (`replication.tls.secretName`). The render fails without it, unless you set
+`replication.verifyClientCerts=false` to accept unauthenticated replication on an isolated network.
 
 By default those ports are published only on the headless Service, which has **no
 external address** — so they reach in-cluster peers and nothing else. For peers in
@@ -226,7 +391,7 @@ See [examples/replication.values.yaml](examples/replication.values.yaml).
 
 ## Notes
 
-- **Not highly available while configured to use local disk.** The single data instance is the sole authoritative store; while it is down, writes and `repository list` fail. For redundant storage, please use the [AWS S3 + DynamoDB backend](examples/aws-s3-dynamodb.values.yaml).
+- **Not highly available while configured to use local disk.** The single data instance is the sole authoritative store; while it is down, writes and `repository list` fail. For redundant storage and several servers, use the AWS S3 + DynamoDB backend — see [Multiple servers](#multiple-servers-aws-backend).
 - **Fast disk matters.** Lore is IO-heavy — prefer NVMe or provisioned-IOPS storage classes.
 
 ## Uninstall

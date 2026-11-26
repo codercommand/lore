@@ -74,8 +74,10 @@ fn complete() -> PollAnswer {
         user_id: "alice".into(),
         user_name: "Alice".into(),
         expires_ms: 0,
+        lifetime_ms: None,
         acceptable_root_domains: Vec::new(),
         refresh_token: None,
+        refresh_expires_ms: 0,
         scope: None,
     }))
 }
@@ -135,12 +137,31 @@ impl Authentication for ScriptedAuth {
         Err(ProtocolError::internal("the stub only serves polls"))
     }
 
+    async fn authenticate_client(
+        &self,
+        _auth_url: &str,
+        _client_id: &str,
+        _client_secret: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(ProtocolError::internal("the stub only serves polls"))
+    }
+
     async fn refresh_authentication(
         &self,
         _auth_url: &str,
         _refresh_token: &str,
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(ProtocolError::internal("the stub only serves polls"))
+    }
+
+    async fn revoke_refresh_token(
+        &self,
+        _auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
         Err(ProtocolError::internal("the stub only serves polls"))
     }
 
@@ -154,11 +175,11 @@ impl Authentication for ScriptedAuth {
         Err(ProtocolError::internal("the stub only serves polls"))
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         _auth_url: &str,
         _authn_token: &str,
-        _resource_id: &str,
+        _resource_ids: &[&str],
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
         Err(ProtocolError::internal("the stub only serves polls"))

@@ -26,7 +26,7 @@ use crate::runtime::execution_context;
 
 /// Descriptive data for a repository.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryDataEventData {
     /// Remote URL of the repository.
@@ -58,7 +58,8 @@ pub async fn info(repository_url: Option<&str>, identity: &str) -> Result<(), Re
         let execution_context = execution_context();
         let repo_path = execution_context.globals().repository_path();
 
-        let dot_lore_path = get_dot_lore_path(std::path::Path::new(repo_path))?;
+        let dot_lore_path = get_dot_lore_path(std::path::Path::new(repo_path))
+            .forward::<RepositoryError>("finding the Lore directory")?;
         let repo_context =
             read_id_from_file(dot_lore_path.join(ID)).internal("Invalid repository path")?;
         let instance_id = InstanceId::read_from_file(dot_lore_path.join(INSTANCE))

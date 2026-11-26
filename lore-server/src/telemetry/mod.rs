@@ -7,10 +7,20 @@
 //! - OTLP export configuration
 //! - Resource detection for AWS/Nomad environments
 //! - Tokio runtime metrics bridging
+//! - `lore-io` syscall pool metrics
 
 mod guard;
+mod io_pool;
+#[cfg(not(feature = "test-util"))]
 mod log;
+#[cfg(feature = "test-util")]
+pub mod log;
+#[cfg(not(feature = "test-util"))]
 mod metrics;
+#[cfg(feature = "test-util")]
+pub mod metrics;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod process;
 #[cfg(not(feature = "test-util"))]
 mod protocol;
 #[cfg(feature = "test-util")]
@@ -29,6 +39,7 @@ pub mod trace;
 use std::fs::File;
 
 pub use guard::TelemetryGuard;
+pub use io_pool::register_io_pool_metrics;
 use lore_error_set::prelude::*;
 use lore_telemetry::LogFormat;
 use lore_telemetry::LogOutput;
@@ -37,6 +48,12 @@ use lore_telemetry::TelemetryError;
 pub use metrics::init_meter_provider;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use process::FILE_DESCRIPTOR_LIMIT;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use process::OPEN_FILE_DESCRIPTORS;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use process::observe_file_descriptors;
 pub use protocol::StorageProtocol;
 pub use protocol::Transport;
 pub use resource_provider::ResourceDetectorProvider;
@@ -63,6 +80,16 @@ fn log_filter(directives: &str) -> EnvFilter {
     EnvFilter::builder()
         .with_default_directive(LevelFilter::WARN.into())
         .parse_lossy(directives)
+}
+
+/// Builds an OTLP exporter with the net runtime current.
+///
+/// An exporter's tonic channel runs its connection tasks on the runtime current when it is built,
+/// and every reconnect resolves the collector's address on that runtime's blocking pool. Built on
+/// net, export keeps working while long-running work holds the core blocking pool.
+fn on_net_runtime<T>(build: impl FnOnce() -> T) -> T {
+    let _net = lore_base::runtime::net_runtime().enter();
+    build()
 }
 
 fn is_filtered_otel_name(name: &str) -> bool {
@@ -99,6 +126,9 @@ pub struct TelemetryInitializer {
 
 impl TelemetryInitializer {
     /// Creates a new telemetry initializer from configuration.
+    ///
+    /// Building the OTLP exporters builds the net runtime, whose size is fixed from then on, so a
+    /// process sizes its runtimes before calling this.
     ///
     /// # Arguments
     ///

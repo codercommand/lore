@@ -7,7 +7,10 @@ mod environment_client;
 pub mod environment_client;
 mod lock_client;
 mod repository_client;
+#[cfg(not(feature = "test-util"))]
 mod revision_client;
+#[cfg(feature = "test-util")]
+pub mod revision_client;
 #[cfg(not(feature = "test-util"))]
 mod storage_client;
 #[cfg(feature = "test-util")]
@@ -46,7 +49,6 @@ use tonic::body::Body;
 use tonic::codegen::InterceptedService;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
-use tonic::transport::ClientTlsConfig;
 use tower::Layer;
 use tower::Service;
 use tower::ServiceBuilder;
@@ -60,7 +62,10 @@ use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
 use crate::connection::SuppliedCredentials;
+use crate::connection::authenticates_server;
+use crate::error::BranchPushError;
 use crate::error::ProtocolError;
+use crate::tls::grpc_client_tls_config;
 use crate::traits::*;
 use crate::types::*;
 
@@ -349,6 +354,8 @@ impl Interceptor for CorrelationInterceptor {
     }
 }
 
+/// Sends the authentication token, or the authorization token when there is none, as when the
+/// caller supplied only an access token.
 #[derive(Clone)]
 pub struct AuthnInterceptor {
     pub auth: Arc<parking_lot::RwLock<GRPCAuth>>,
@@ -360,7 +367,13 @@ impl Interceptor for AuthnInterceptor {
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
         inject_correlation_id(&mut request)?;
-        inject_authorization(&mut request, self.auth.read().authentication_token.as_str())?;
+        let auth = self.auth.read();
+        let token = if auth.authentication_token.is_empty() {
+            auth.authorization_token.as_str()
+        } else {
+            auth.authentication_token.as_str()
+        };
+        inject_authorization(&mut request, token)?;
         Ok(request)
     }
 }
@@ -652,8 +665,9 @@ const HTTP2_KEEP_ALIVE_INTERVAL: u64 = 30;
 const HTTP2_KEEP_ALIVE_TIMEOUT: u64 = 20;
 
 async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
-    let mut endpoint = tonic::transport::Channel::from_shared(remote.to_string())
-        .internal_with(|| format!("connect: {remote}"))?;
+    let mut endpoint =
+        tonic::transport::Channel::from_shared(crate::uds::channel_uri(remote.to_string()))
+            .internal_with(|| format!("connect: {remote}"))?;
 
     let keep_alive_interval = std::env::var("LORE_HTTP2_KEEP_ALIVE_INTERVAL")
         .ok()
@@ -667,14 +681,9 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
         .http2_keep_alive_interval(Duration::from_secs(keep_alive_interval))
         .keep_alive_timeout(Duration::from_secs(keep_alive_timeout));
 
-    if remote.starts_with("https://") {
+    if endpoint.uri().scheme_str() == Some("https") {
         endpoint = endpoint
-            .tls_config(
-                ClientTlsConfig::new()
-                    .assume_http2(true)
-                    .with_webpki_roots()
-                    .with_native_roots(),
-            )
+            .tls_config(grpc_client_tls_config())
             .internal_with(|| format!("configuring TLS for {remote}"))?;
     }
     let user_agent = crate::user_agent();
@@ -689,7 +698,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
     // Connect from a net-runtime task so the hyper/h2 driver tasks the
     // connection spawns are bound to the net runtime, isolated from compute and
     // file-I/O continuations on the core runtime.
-    let channel = match lore_base::lore_spawn_net!(async move { endpoint.connect().await })
+    let channel = match lore_base::lore_spawn_net!(crate::uds::connect_channel(endpoint))
         .await
         .internal_with(|| format!("gRPC connection task to {remote}"))?
     {
@@ -699,12 +708,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
             // engage, but the transport error's detail is kept on the trace
             // rather than collapsed into a bare variant.
             let mut disconnected = ProtocolError::from(lore_base::error::Disconnected);
-            disconnected.push_trace(lore_error_set::Location::with_context(
-                file!(),
-                line!(),
-                column!(),
-                Arc::from(format!("gRPC connection to {remote} failed: {err}")),
-            ));
+            disconnected.push_context(format!("gRPC connection to {remote} failed: {err}"));
             return Err(disconnected);
         }
     };
@@ -728,8 +732,7 @@ pub async fn connect(
         .host_str()
         .ok_or_else(|| ProtocolError::internal(format!("remote {remote_url} is invalid")))?;
 
-    // Possible HTTPS schemes: urcs, grpcs, lores
-    let (scheme, default_port) = if parsed_url.scheme().ends_with("s") {
+    let (scheme, default_port) = if authenticates_server(&parsed_url) {
         ("https", GRPCS_PORT_DEFAULT)
     } else {
         ("http", GRPC_PORT_DEFAULT)
@@ -810,6 +813,27 @@ pub(crate) fn address_not_found_details(status: &Status) -> Option<AddressNotFou
     })
 }
 
+/// Encode a refusal of a branch push onto `latest`, the branch latest that refuses it, as
+/// `FAILED_PRECONDITION` carrying `latest` in the status details: a push that isn't a fast-forward
+/// of `latest`, or a fast-forward merge onto it that conflicts.
+///
+/// The details mark the refusal apart from any other `FAILED_PRECONDITION`, such as a hook's, which
+/// carries none. They are 32 bytes, so they never read as the address of
+/// [`address_not_found_status`], which is 48.
+pub fn branch_advanced_status(latest: Hash, message: impl Into<String>) -> Status {
+    Status::with_details(
+        tonic::Code::FailedPrecondition,
+        message,
+        Bytes::copy_from_slice(latest.as_ref()),
+    )
+}
+
+/// Whether `status` carries the details [`branch_advanced_status`] attaches, a 32-byte branch
+/// latest.
+pub(crate) fn carries_branch_advanced(status: &Status) -> bool {
+    status.details().len() == size_of::<Hash>()
+}
+
 async fn handle_error(retry: &mut crate::util::Retry, status: Status) -> Result<(), ProtocolError> {
     match status.code() {
         tonic::Code::ResourceExhausted => {
@@ -820,6 +844,18 @@ async fn handle_error(retry: &mut crate::util::Retry, status: Status) -> Result<
         _ => return Err(ProtocolError::from(status)),
     }
     Ok(())
+}
+
+/// [`handle_error`] for a branch push, whose statuses map as
+/// [`branch_push_error`](crate::error::branch_push_error) maps them.
+pub(crate) async fn handle_branch_push_error(
+    retry: &mut crate::util::Retry,
+    status: Status,
+) -> Result<(), BranchPushError> {
+    if status.code() == tonic::Code::ResourceExhausted {
+        return Ok(handle_error(retry, status).await?);
+    }
+    Err(crate::error::branch_push_error(status))
 }
 
 #[allow(clippy::unused_async)]
@@ -1165,27 +1201,50 @@ const MAX_RECONNECTS_PER_OP: usize = 3;
 /// connections while failing every RPC on them reconnects successfully every round.
 ///
 /// The rebuild is boxed. It runs only after a lost channel, and inline it would make every
-/// request's future as large as a reconnect.
+/// request's future as large as a reconnect. It runs after the match ends, so the future does
+/// not hold an attempt's result across it.
 #[lore_macro::test_pub]
-async fn with_reconnect<T, Op, OpFut, Rebuild, RebuildFut>(
+async fn with_reconnect<T, E, Op, OpFut, Rebuild, RebuildFut>(
     connection: &GRPCConnection,
     op: Op,
     rebuild: Rebuild,
-) -> Result<T, ProtocolError>
+) -> Result<T, E>
 where
+    E: Disconnects + From<ProtocolError>,
     Op: Fn() -> OpFut,
-    OpFut: Future<Output = Result<T, ProtocolError>>,
+    OpFut: Future<Output = Result<T, E>>,
     Rebuild: Fn(u32) -> RebuildFut,
     RebuildFut: Future<Output = Result<(), ProtocolError>>,
 {
     for _ in 0..MAX_RECONNECTS_PER_OP {
         let reconnect_id = connection.reconnect.load(Ordering::Relaxed);
         match op().await {
-            Err(ProtocolError::Disconnected(_)) => Box::pin(rebuild(reconnect_id)).await?,
+            Err(err) if err.disconnected() => {}
             result => return result,
         }
+        Box::pin(rebuild(reconnect_id)).await?;
     }
-    Err(ProtocolError::from(lore_base::error::Disconnected))
+    Err(E::from(ProtocolError::from(lore_base::error::Disconnected)))
+}
+
+/// An error that tells a dropped connection, which a reconnect may clear, from the remote's
+/// answer.
+#[lore_macro::test_pub]
+trait Disconnects {
+    /// Whether the call failed because its connection dropped.
+    fn disconnected(&self) -> bool;
+}
+
+impl Disconnects for ProtocolError {
+    fn disconnected(&self) -> bool {
+        self.is_disconnected()
+    }
+}
+
+impl Disconnects for BranchPushError {
+    fn disconnected(&self) -> bool {
+        self.is_disconnected()
+    }
 }
 
 impl GRPCStorage {
@@ -1436,7 +1495,7 @@ impl Revision for GRPCRevision {
         category: &str,
         creator: &str,
         stack: &[BranchPoint],
-    ) -> Result<Hash, ProtocolError> {
+    ) -> Result<BranchRecord, ProtocolError> {
         with_reconnect(
             &self.connection,
             || async {
@@ -1479,7 +1538,7 @@ impl Revision for GRPCRevision {
         latest: Hash,
         force: bool,
         fast_forward_merge: bool,
-    ) -> Result<BranchPushResponse, ProtocolError> {
+    ) -> Result<BranchPushResponse, BranchPushError> {
         with_reconnect(
             &self.connection,
             || async {
@@ -1494,10 +1553,32 @@ impl Revision for GRPCRevision {
         .await
     }
 
-    async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
+    async fn branch_list(
+        &self,
+        creator: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<BranchListResponse, ProtocolError> {
         with_reconnect(
             &self.connection,
-            || async { self.client.read().await.branch_list().await },
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .branch_list(creator, include_deleted)
+                    .await
+            },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+
+    async fn branch_list_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.branch_list_bounded(limit).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await
@@ -1579,6 +1660,37 @@ impl GRPCRepository {
 
         Ok(())
     }
+
+    /// A client for the calls about `repository` on the OIDC path: they carry the
+    /// partition's authorization token, as the partition services do, since a Tier 2
+    /// server authorizes them from its partition grant. `None` on the gRPC path, where the login token is
+    /// checked online and these calls keep it.
+    async fn partition_client(
+        &self,
+        repository: RepositoryId,
+    ) -> Option<repository_client::RepositoryService<AuthzInterceptor>> {
+        if !self
+            .auth_endpoint
+            .url
+            .starts_with(crate::auth::oidc::SCHEME_PREFIX)
+        {
+            return None;
+        }
+        let auth = self
+            .connection
+            .repository_authz(
+                &self.auth_endpoint,
+                self.identity.as_str(),
+                repository,
+                &self.credentials,
+            )
+            .await;
+        Some(repository_client::RepositoryService::for_partition(
+            self.connection.channel(),
+            repository,
+            auth,
+        ))
+    }
 }
 
 #[async_trait]
@@ -1619,7 +1731,12 @@ impl Repository for GRPCRepository {
     async fn delete(&self, id: RepositoryId) -> Result<(), ProtocolError> {
         with_reconnect(
             &self.connection,
-            || async { self.client.read().await.delete(id).await },
+            || async {
+                match self.partition_client(id).await {
+                    Some(client) => client.delete(id).await,
+                    None => self.client.read().await.delete(id).await,
+                }
+            },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await
@@ -1650,7 +1767,12 @@ impl Repository for GRPCRepository {
     async fn metadata_get(&self, id: RepositoryId) -> Result<Hash, ProtocolError> {
         with_reconnect(
             &self.connection,
-            || async { self.client.read().await.metadata_get(id).await },
+            || async {
+                match self.partition_client(id).await {
+                    Some(client) => client.metadata_get(id).await,
+                    None => self.client.read().await.metadata_get(id).await,
+                }
+            },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await
@@ -1665,11 +1787,16 @@ impl Repository for GRPCRepository {
         with_reconnect(
             &self.connection,
             || async {
-                self.client
-                    .read()
-                    .await
-                    .metadata_set(id, expected, new)
-                    .await
+                match self.partition_client(id).await {
+                    Some(client) => client.metadata_set(id, expected, new).await,
+                    None => {
+                        self.client
+                            .read()
+                            .await
+                            .metadata_set(id, expected, new)
+                            .await
+                    }
+                }
             },
             |reconnect_id| self.reconnect(reconnect_id),
         )

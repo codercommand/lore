@@ -29,7 +29,6 @@ mod tests {
     use lore_transport::ResolvedUser;
     use lore_transport::UserService;
     use lore_transport::auth::authentication;
-    use lore_transport::auth::user_service;
 
     struct TestAuthentication {
         exchange_result:
@@ -43,6 +42,7 @@ mod tests {
                     Ok(AuthorizationToken {
                         token: "authz-token".into(),
                         expires_ms: u64::MAX,
+                        lifetime_ms: None,
                         acceptable_root_domains: vec![],
                     })
                 }),
@@ -97,6 +97,18 @@ mod tests {
             }))
         }
 
+        async fn authenticate_client(
+            &self,
+            _auth_url: &str,
+            _client_id: &str,
+            _client_secret: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "authenticate_client".into(),
+            }))
+        }
+
         async fn refresh_authentication(
             &self,
             _auth_url: &str,
@@ -105,6 +117,17 @@ mod tests {
         ) -> Result<AuthenticationToken, ProtocolError> {
             Err(ProtocolError::from(NotSupported {
                 operation: "refresh_authentication".into(),
+            }))
+        }
+
+        async fn revoke_refresh_token(
+            &self,
+            _auth_url: &str,
+            _refresh_token: &str,
+            _correlation_id: &str,
+        ) -> Result<(), ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "revoke_refresh_token".into(),
             }))
         }
 
@@ -118,11 +141,11 @@ mod tests {
             (self.exchange_result)(repository)
         }
 
-        async fn exchange_for_custom_resource(
+        async fn exchange_for_custom_resources(
             &self,
             _auth_url: &str,
             _authn_token: &str,
-            _resource_id: &str,
+            _resource_ids: &[&str],
             _correlation_id: &str,
         ) -> Result<AuthorizationToken, ProtocolError> {
             (self.exchange_result)(RepositoryId::default())
@@ -192,16 +215,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exchange_for_custom_resource_success_returns_token() {
+    async fn exchange_for_custom_resources_success_returns_token() {
         let scheme = "test-exchange-custom-success";
         authentication::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
 
         let auth = authentication::find(&format!("{scheme}://auth.test.com")).unwrap();
         let result = auth
-            .exchange_for_custom_resource(
+            .exchange_for_custom_resources(
                 &format!("{scheme}://auth.test.com"),
                 "authn-tok",
-                "bespoke-urc:uefn:some-stream",
+                &["bespoke-urc:uefn:some-stream"],
                 "corr",
             )
             .await;
@@ -251,84 +274,6 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().is_not_authenticated());
-    }
-
-    #[tokio::test]
-    async fn get_user_info_returns_resolved_users() {
-        let scheme = "test-userinfo";
-        user_service::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
-
-        let service = user_service::find(&format!("{scheme}://auth.test.com"));
-        let users = service
-            .get_user_info(
-                &format!("{scheme}://auth.test.com"),
-                "authz-tok",
-                RepositoryId::default(),
-                &["u1".into(), "u2".into()],
-                "corr",
-            )
-            .await
-            .unwrap();
-        assert_eq!(users.len(), 2);
-        assert_eq!(users[0].user_id, "u1");
-        assert_eq!(users[1].user_name, "User u2");
-    }
-
-    #[tokio::test]
-    async fn get_user_id_returns_resolved_user() {
-        let scheme = "test-userid";
-        user_service::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
-
-        let service = user_service::find(&format!("{scheme}://auth.test.com"));
-        let user = service
-            .get_user_id(
-                &format!("{scheme}://auth.test.com"),
-                "authz-tok",
-                RepositoryId::default(),
-                "Alice",
-                "corr",
-            )
-            .await
-            .unwrap();
-        assert!(user.is_some());
-        assert_eq!(user.unwrap().user_id, "id-for-Alice");
-    }
-
-    /// An authentication registered without a user service still resolves users:
-    /// the user's own name is resolved from the token, the other user names
-    /// are resolved as their IDs.
-    #[tokio::test]
-    async fn authentication_without_a_user_service_falls_back_to_the_token() {
-        /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
-        const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
-        let scheme = "test-authn-only";
-        authentication::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
-
-        let auth_url = format!("{scheme}://auth.test.com");
-        let users = user_service::find(&auth_url)
-            .get_user_info(
-                &auth_url,
-                ALICE_TOKEN,
-                RepositoryId::default(),
-                &["alice".into(), "bob".into()],
-                "corr",
-            )
-            .await
-            .unwrap();
-        let names: Vec<&str> = users.iter().map(|u| u.user_name.as_str()).collect();
-        assert_eq!(names, ["Alice", "bob"]);
-
-        let bob = user_service::find(&auth_url)
-            .get_user_id(
-                &auth_url,
-                ALICE_TOKEN,
-                RepositoryId::default(),
-                "bob",
-                "corr",
-            )
-            .await
-            .unwrap();
-        assert!(bob.is_none(), "the token names nobody but its bearer");
     }
 
     #[tokio::test]

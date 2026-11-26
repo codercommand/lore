@@ -205,7 +205,8 @@ pub struct RevisionSyncArgs {
     #[clap(long, action, conflicts_with = "forward_changes")]
     reset: bool,
 
-    /// Root files for dependency-based selective sync (only sync changes for these files and their dependencies)
+    /// Root files for dependency-based selective sync (only sync changes for these files and their dependencies, and
+    /// the whole folder that replaces a link they lie in). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long = "root-file", value_name = "path")]
     root_files: Vec<String>,
 
@@ -620,7 +621,7 @@ pub fn handle_revision_history(globals: LoreGlobalArgs, args: &RevisionHistoryAr
                 )
                 .unwrap_or_default()
             } else {
-                message.lines().next().map(String::from).unwrap_or_default()
+                message.lines().next().map_or_default(String::from)
             };
 
             println!("{revision_number} {message}");
@@ -923,19 +924,10 @@ fn resolve_link_messages(
     globals: &LoreGlobalArgs,
     args: &RevisionCommitArgs,
 ) -> Result<(Vec<LoreString>, Vec<LoreString>), u8> {
-    let mut link_paths: Vec<LoreString> = Vec::new();
-    let mut link_msgs: Vec<LoreString> = Vec::new();
-
-    let link_message_values = &args.link_messages;
-    for pair in link_message_values.chunks(2) {
-        if pair.len() == 2 {
-            link_paths.push(LoreString::from(pair[0].as_str()));
-            link_msgs.push(LoreString::from(pair[1].as_str()));
-        }
-    }
+    let (mut link_paths, mut link_msgs) = util::split_path_messages(&args.link_messages);
 
     let is_interactive = !config().non_interactive && !config().json;
-    let has_explicit_flags = !link_message_values.is_empty();
+    let has_explicit_flags = !args.link_messages.is_empty();
     let is_link_scoped = args.link.is_some();
 
     if is_interactive && !has_explicit_flags && !is_link_scoped {
@@ -1024,38 +1016,6 @@ fn resolve_link_messages(
         }
     }
 
-    if !link_paths.is_empty() {
-        let discovered_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::default()));
-        let discovered_paths_clone = discovered_paths.clone();
-        let validation_callback: LoreEventCallback = Some(
-            (Box::new(move |event: &LoreEvent| {
-                if let LoreEvent::LinkStagedEntry(data) = event {
-                    discovered_paths_clone.lock().push(data.path.to_string());
-                }
-            }) as EventCallbackFn)
-                .with_defaults(),
-        );
-
-        run_listing(
-            globals,
-            lore::link::LoreLinkListStagedArgs {},
-            validation_callback,
-        )?;
-
-        let valid_paths = discovered_paths.lock().clone();
-        for path in link_paths.iter() {
-            if !valid_paths.iter().any(|p| p == path.as_str()) {
-                println!(
-                    "{}Error: --link-message path '{}' does not match any linked repository with staged changes{}",
-                    CommonStyles::FAILURE,
-                    path.as_str(),
-                    anstyle::Reset
-                );
-                return Err(1);
-            }
-        }
-    }
-
     Ok((link_paths, link_msgs))
 }
 
@@ -1063,15 +1023,7 @@ fn resolve_layer_messages(
     globals: &LoreGlobalArgs,
     args: &RevisionCommitArgs,
 ) -> Result<(Vec<LoreString>, Vec<LoreString>), u8> {
-    let mut layer_paths: Vec<LoreString> = Vec::new();
-    let mut layer_msgs: Vec<LoreString> = Vec::new();
-
-    for pair in args.layer_messages.chunks(2) {
-        if pair.len() == 2 {
-            layer_paths.push(LoreString::from(pair[0].as_str()));
-            layer_msgs.push(LoreString::from(pair[1].as_str()));
-        }
-    }
+    let (mut layer_paths, mut layer_msgs) = util::split_path_messages(&args.layer_messages);
 
     let is_interactive = !config().non_interactive && !config().json;
     let has_explicit_flags = !args.layer_messages.is_empty();
@@ -1413,12 +1365,15 @@ fn revision_info_display(revision: &LoreRevisionSyncRevisionEventData) -> String
     )
 }
 
-fn print_sync_remote_warning(remote_available: u8, remote_authorized: u8) {
+fn print_sync_remote_warning(
+    remote_available: u8,
+    remote_authorized: u8,
+    remote_unauthenticated: u8,
+) {
     if remote_available != 0 && remote_authorized == 0 {
-        println!(
-            "{}Remote reachable but could not read remote revision (not authorized or unavailable), synchronizing against local history only{}",
-            LogStyles::WARNING,
-            anstyle::Reset,
+        util::print_remote_unread(
+            remote_unauthenticated != 0,
+            ", synchronizing against local history only",
         );
     }
 }
@@ -1426,7 +1381,11 @@ fn print_sync_remote_warning(remote_available: u8, remote_authorized: u8) {
 pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: bool) {
     match event {
         LoreEvent::RevisionSyncTarget(data) if data.source_revision == data.target_revision => {
-            print_sync_remote_warning(data.remote_available, data.remote_authorized);
+            print_sync_remote_warning(
+                data.remote_available,
+                data.remote_authorized,
+                data.remote_unauthenticated,
+            );
             if data.is_latest != 0 {
                 println!(
                     "Already on branch {} latest revision {} -> {}",
@@ -1440,7 +1399,11 @@ pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: b
             }
         }
         LoreEvent::RevisionSyncTarget(data) => {
-            print_sync_remote_warning(data.remote_available, data.remote_authorized);
+            print_sync_remote_warning(
+                data.remote_available,
+                data.remote_authorized,
+                data.remote_unauthenticated,
+            );
             if !data.remote.is_empty() {
                 println!("Sync from remote {}", data.remote);
             }
@@ -1960,7 +1923,7 @@ fn handle_revision_cherry_pick_resolve_impl(
 
                 count_atomic.fetch_add(1, Ordering::Relaxed);
             }
-            LoreEvent::Complete(_) => {
+            LoreEvent::Complete(data) if data.status == 0 => {
                 let count = count_atomic.load(Ordering::Relaxed);
                 if count == 0 {
                     println!("No conflicts resolved");
@@ -2242,7 +2205,7 @@ fn handle_revision_revert_resolve_impl(
 
                 count_atomic.fetch_add(1, Ordering::Relaxed);
             }
-            LoreEvent::Complete(_) => {
+            LoreEvent::Complete(data) if data.status == 0 => {
                 let count = count_atomic.load(Ordering::Relaxed);
                 if count == 0 {
                     println!("No conflicts resolved");

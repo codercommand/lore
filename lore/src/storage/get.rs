@@ -40,6 +40,7 @@ use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
 use lore_revision::event::LoreBytes;
 use lore_revision::event::LoreBytesMut;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::lore::execution_context;
@@ -56,13 +57,21 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::offset_past_end;
 use crate::storage::store::StoreInternal;
 
 /// One get item — the `(partition, address)` to read, and the range of it to read.
 #[repr(C)]
-#[derive(Copy, Clone, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreStorageGetItem {
     /// Caller-chosen id echoed back in every event for this item
     pub id: u64,
@@ -80,8 +89,10 @@ pub struct LoreStorageGetItem {
     /// that fails partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short
     /// with a success code
     pub streaming: u8,
-    /// Cache fetched bytes back to the local store even without the producer's
-    /// `PayloadLocalCachePriority` hint
+    /// Cache fetched bytes in the local store, as they always are for a fragment written with
+    /// `PayloadLocalCachePriority` or one of revision state. A fetched fragment whose bytes are not
+    /// cached is still written to the local store as an entry without its payload, so a put of
+    /// the same content uploads nothing. Either is marked stored durable
     pub local_cache: u8,
     /// Writable buffer receiving the requested range, `len` stating its capacity. Zero-initialized
     /// selects `GET_DATA` delivery.
@@ -109,7 +120,16 @@ impl core::fmt::Debug for LoreStorageGetItem {
 
 /// Arguments for `lore_storage_get`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(get_local)]
 pub struct LoreStorageGetArgs {
     /// Open storage handle
@@ -119,12 +139,12 @@ pub struct LoreStorageGetArgs {
 }
 
 /// Read one or more content-addressed buffers.
-pub async fn get(
+pub fn get(
     globals: LoreGlobalArgs,
     args: LoreStorageGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, get_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, get_local)
 }
 
 async fn get_local(
@@ -147,25 +167,30 @@ async fn get_local(
             }
             let effective = store.effective_flags(per_call)?;
             let mut reuse = crate::storage::store::SessionReuse::default();
+            let mut lent = crate::storage::lent::LentBuffers::default();
 
-            crate::storage::fan_out_items!(items, "get", |item| {
+            let result = crate::storage::fan_out_items!(items, "get", |item| {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                async move { get_item(store, &item, effective, session).await }
-            })
+                let lender = lent.lender(&item.data_out);
+                async move { get_item(store, &item, effective, session, lender).await }
+            });
+            lent.returned().await;
+            result
         },
     )
     .await
 }
 
 /// Read one item and emit its `HEADER` / `DATA…` / `ITEM_COMPLETE`
-/// sequence. Returns the item's own error so the call-level reduction can pick the dominant
-/// failure.
+/// sequence, into the item's `data_out` through `lender` when it supplies one. Returns the item's
+/// own error so the call-level reduction can pick the dominant failure.
 async fn get_item(
     store: Arc<StoreInternal>,
     item: &LoreStorageGetItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
+    lender: Option<crate::storage::lent::ItemLender>,
 ) -> Result<(), StorageError> {
     if item.partition == Partition::default() {
         return emit_item_complete(item, Err(invalid_item("item names the default partition")));
@@ -180,8 +205,8 @@ async fn get_item(
         return emit_item_complete(item, Ok(()));
     }
 
-    if item.data_out.is_supplied() {
-        return get_item_into(store, item, effective, remote_session).await;
+    if let Some(lender) = lender {
+        return get_item_into(store, item, effective, remote_session, lender).await;
     }
 
     if item.streaming != 0 {
@@ -228,17 +253,13 @@ async fn get_item_into(
     item: &LoreStorageGetItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
+    lender: crate::storage::lent::ItemLender,
 ) -> Result<(), StorageError> {
+    let mut dst = lender.lend(&item.data_out);
     let mut read_options = effective.read_options(remote_session.is_some());
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
     }
-
-    // SAFETY: `data_out` names caller memory that stays valid, and untouched by anyone else, for
-    // the duration of the call this future is wholly within. `len` bounds the read.
-    let mut dst = unsafe {
-        lore_storage::CallerBuffer::new(item.data_out.ptr.cast::<u8>(), item.data_out.len)
-    };
 
     match lore_storage::read_into_buffer(
         store.immutable.clone(),
@@ -377,7 +398,7 @@ fn emit_item_complete(
     LoreEvent::StorageGetItemComplete(LoreStorageGetItemCompleteEventData {
         id: item.id,
         address,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result

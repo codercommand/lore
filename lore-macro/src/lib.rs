@@ -3,9 +3,11 @@
 mod lore_args;
 mod lore_command;
 mod lore_instrument;
+mod position_bitcode;
 mod test_pub;
 mod validate_text;
 mod variant;
+mod wire_schema;
 
 use proc_macro::TokenStream;
 use syn::DeriveInput;
@@ -18,7 +20,18 @@ pub fn variant_type_size(input: TokenStream) -> TokenStream {
     variant::get_variant_type_sizes(&ast)
 }
 
-#[proc_macro_derive(LoreArgs, attributes(handler))]
+/// Derives bitcode's `Encode` and `Decode` for an enum whose variants each hold one value, as each
+/// value's position among the variants followed by the value its variant holds, for fewer than
+/// 2^32 variants, and `lore_base::wire_schema::WireSchema` for that encoding. The deriving crate
+/// depends on `bitcode` and `lore-base`, and has a `test-util` feature.
+#[proc_macro_derive(PositionBitcode)]
+pub fn position_bitcode(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+
+    position_bitcode::get_position_bitcode_impl(&ast)
+}
+
+#[proc_macro_derive(LoreArgs, attributes(handler, requires_service))]
 pub fn lore_args(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
 
@@ -37,6 +50,21 @@ pub fn lore_command(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
 
     lore_command::get_lore_command_impl(&ast)
+}
+
+/// Implements `lore_base::wire_schema::WireSchema` for a type that derives `bitcode::Encode` and
+/// `bitcode::Decode`, so that a change to its encoding changes the schema a client and the service
+/// compare.
+///
+/// The schema covers the order, names and schemas of the type's fields and variants, and leaves
+/// out a field that `#[bitcode(skip)]` leaves out of the encoding. Each type parameter must
+/// implement the trait. A type that holds itself, however indirectly, fails to compile, since its
+/// schema would be defined by its own.
+#[proc_macro_derive(WireSchema)]
+pub fn wire_schema(input: TokenStream) -> TokenStream {
+    let ast = parse_macro_input!(input as DeriveInput);
+
+    wire_schema::get_wire_schema_impl(&ast)
 }
 
 #[proc_macro_attribute]

@@ -24,44 +24,62 @@ required-features = ["integration_tests"]
 name = "store_gc_trigger"
 path = "tests/store_gc_trigger_test.rs"
 
+# Its own target: whether a process retains its stores is read once per process, so each test
+# runs in a copy of this binary started with `LORE_STORE_RETAIN` set or removed. Needs no service
+# from compose.yaml, so it is not behind `integration_tests`.
+[[test]]
+name = "store_retention"
+path = "tests/store_retention_test.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
-aws-sdk-dynamodb = { version = "1.92.0", default-features = false, features = ["rt-tokio"] }
-aws-sdk-s3 = { version = "1.104.0", default-features = false, features = ["rt-tokio"] }
 bytes = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
 serde_json = { workspace = true }
+smallvec = { workspace = true }
 rs-consul = "0.13.0"
-rustls = { workspace = true, optional = true }
-serde_dynamo = { version = "4.2.14", features = ["aws-sdk-dynamodb+1"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+url = { workspace = true }
 zerocopy = { workspace = true }
 lore = { workspace = true }
 lore-base = { workspace = true }
 lore-storage = { workspace = true }
 lore-aws = { workspace = true }
-lore-revision = { workspace = true, features = ["test-util"] }
+lore-revision = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-proto = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 ctor = { workspace = true }
+lore = { workspace = true, features = ["test-util"] }
 lore-base = { workspace = true, features = ["test-util"] }
-lore-server = { workspace = true }
-lore-transport = { workspace = true }
+lore-server = { workspace = true, features = ["test-util"] }
+lore-storage = { workspace = true, features = ["test-util"] }
+# Here rather than under [dependencies]: a normal dependency's features apply to every build that
+# includes this package, so a release build of the workspace would compile lore-revision's test
+# access into every binary.
+lore-revision = { workspace = true, features = ["test-util"] }
+lore-transport = { workspace = true, features = ["test-util"] }
 rcgen = { workspace = true }
+# The header and method types of the requests the fixtures send through `ClientCore`.
+http = { workspace = true }
+serde = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = { workspace = true }
+lore-fuse = { path = "../lore-fuse", features = ["test-util"] }
 
 [features]
-integration_tests = ["lore-server/integration_tests"]
+integration_tests = ["lore-server/integration_tests", "dep:tonic"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]
 
 [lints]

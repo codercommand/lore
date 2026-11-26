@@ -51,6 +51,9 @@ impl InstrumentProvider for RevisionServiceInstrumentProvider {
 #[derive(Clone)]
 pub struct LoreRevisionService {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    /// The store that reads through `immutable_store` fill with what they read. `None` where they
+    /// fill none.
+    local_tier: Option<Arc<dyn lore_storage::ImmutableStore>>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -67,6 +70,7 @@ impl LoreRevisionService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        local_tier: Option<Arc<dyn lore_storage::ImmutableStore>>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         notification: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
@@ -98,6 +102,7 @@ impl LoreRevisionService {
         };
         Self {
             immutable_store,
+            local_tier,
             mutable_store,
             notification,
             hook_dispatcher,
@@ -121,6 +126,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_create::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -139,6 +145,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_delete::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -202,7 +209,9 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_push::handler(
                 request,
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
+                self.local_tier.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
                 &self.hook_dispatcher,
@@ -315,6 +324,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_protect::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -345,6 +355,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_metadata_set::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -360,6 +371,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_unprotect::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),

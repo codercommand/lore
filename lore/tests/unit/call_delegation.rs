@@ -8,9 +8,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
+use lore::args::LoreArgs;
 use lore::call_delegation::*;
+use lore::interface::LoreEventCallback;
 use lore::interface::LoreString;
 use lore::remote::command::LoreCommand;
+use lore::remote::service_process::SERVICE_EXECUTABLE_SETTING;
+use lore::remote::service_process::running_as_service;
 use lore_base::error::InvalidArguments;
 use lore_base::error::NotFound;
 use lore_base::text::ValidateText;
@@ -20,6 +24,8 @@ use lore_revision::event::EventError;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreEventCallbackConfig;
 use lore_revision::interface::LoreGlobalArgs;
+
+use crate::service_unavailable;
 
 // A concrete error whose `NotFound` variant carries error code 79, so the
 // async failure path has a known non-`1` code to assert against.
@@ -35,6 +41,7 @@ impl EventError for SampleError {}
 // FFI boundary), keyed by `user_context` to a per-test sink.
 struct AsyncSink {
     status: Mutex<Option<i32>>,
+    message: Mutex<Option<String>>,
     done: Mutex<Option<mpsc::Sender<()>>>,
 }
 
@@ -48,6 +55,7 @@ unsafe extern "C" fn record_event(event: &LoreEvent, user_context: u64) {
     match event {
         LoreEvent::Complete(data) => {
             *sink.status.lock().unwrap() = Some(data.status);
+            *sink.message.lock().unwrap() = Some(data.error.message.as_str().to_string());
         }
         // `End` fires after `Complete`; use it to release the test.
         LoreEvent::End(_) => {
@@ -66,6 +74,7 @@ fn async_failure_delivers_code_only_through_complete_status() {
     // duration of the spawned task; the test process tears it down.
     let sink: &'static AsyncSink = Box::leak(Box::new(AsyncSink {
         status: Mutex::new(None),
+        message: Mutex::new(None),
         done: Mutex::new(Some(done_tx)),
     }));
     let context = sink as *const AsyncSink as u64;
@@ -81,6 +90,7 @@ fn async_failure_delivers_code_only_through_complete_status() {
         user_ids: lore_revision::interface::LoreArray::default(),
         with_identity_token: 0,
         with_access_token: 0,
+        with_claims: 0,
     };
 
     // The async entry point returns `()`; the failing handler's code can
@@ -248,6 +258,52 @@ fn a_batch_entry_name_that_is_not_utf8_is_rejected() {
     assert!(!handler_ran, "the verb must not run on a rejected call");
 }
 
+/// Each text field of a branch metadata set: an entry's key, an entry's value under the string tag,
+/// which the check reaches only through the value's tag, and a key to remove. The same set with
+/// valid text reaches the verb.
+#[test]
+fn metadata_set_text_that_is_not_utf8_is_rejected() {
+    use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataEntry;
+    use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataSetArgs;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreMetadata;
+
+    let set = |key: LoreString, value: LoreString, removed: LoreString| {
+        LoreRevisionGraphBranchMetadataSetArgs {
+            entries: LoreArray::from_vec(vec![LoreRevisionGraphBranchMetadataEntry {
+                key,
+                value: LoreMetadata::String(value),
+            }]),
+            remove: LoreArray::from_vec(vec![removed]),
+            ..Default::default()
+        }
+    };
+    let text = LoreString::from_str;
+
+    for (field, args) in [
+        (
+            "an entry's key",
+            set(invalid_utf8(), text("nightly"), text("reviewer")),
+        ),
+        (
+            "an entry's string value",
+            set(text("pipeline"), invalid_utf8(), text("reviewer")),
+        ),
+        (
+            "a key to remove",
+            set(text("pipeline"), text("nightly"), invalid_utf8()),
+        ),
+    ] {
+        let (status, handler_ran) = dispatch(&LoreGlobalArgs::default(), &args);
+
+        assert_eq!(status, rejected_status(), "{field} must be rejected");
+        assert!(!handler_ran, "the verb must not run on a rejected call");
+    }
+
+    let valid = set(text("pipeline"), text("nightly"), text("reviewer"));
+    assert_eq!(dispatch(&LoreGlobalArgs::default(), &valid), (0, true));
+}
+
 /// A text field of a nested struct, reached by descending one field deep.
 #[test]
 fn a_text_field_of_a_nested_argument_struct_that_is_not_utf8_is_rejected() {
@@ -310,6 +366,7 @@ fn the_asynchronous_entry_point_rejects_text_that_is_not_utf8() {
     let (done_tx, done_rx) = mpsc::channel();
     let sink: &'static AsyncSink = Box::leak(Box::new(AsyncSink {
         status: Mutex::new(None),
+        message: Mutex::new(None),
         done: Mutex::new(Some(done_tx)),
     }));
     let context = sink as *const AsyncSink as u64;
@@ -368,4 +425,367 @@ fn conflicting_identity_arguments_are_rejected_before_the_handler_runs() {
 
     assert_eq!(status, rejected_status());
     assert!(!handler_ran, "the verb must not run on a rejected call");
+}
+
+/// A repository directory with the given `config.toml` body. Returns the
+/// repository root, whose lifetime keeps the directory alive.
+fn repository_with_config(label: &str, config: &str) -> lore_base::test_util::TempDir {
+    let root = lore_base::test_util::TempDir::new(&format!("lore-cd-{label}-"));
+    let dot_dir = root.path().join(lore_revision::repository::DOT_LORE);
+    std::fs::create_dir_all(&dot_dir).expect("creating the repository directory");
+    std::fs::write(dot_dir.join("config.toml"), config).expect("writing the config");
+    root
+}
+
+fn globals_for(root: &lore_base::test_util::TempDir) -> LoreGlobalArgs {
+    LoreGlobalArgs {
+        repository_path: root.path().display().to_string().into(),
+        ..LoreGlobalArgs::default()
+    }
+}
+
+/// A FUSE instance forces a relay to the service regardless of the
+/// process-wide "use a service" setting -- the decision is made from the
+/// instance's own config, not from the setting that governs everything
+/// else, which is what makes it a forced relay rather than the ordinary one.
+#[test]
+fn fuse_instance_forces_service_call_when_service_disabled() {
+    let root = repository_with_config("fuse-forced", "[vfs]\nvfs_type = \"Fuse\"\n");
+    let globals = globals_for(&root);
+
+    assert!(
+        instance_requires_service_given(&globals, running_as_service()),
+        "a FUSE-backed instance must require the service"
+    );
+}
+
+/// A non-FUSE instance (here SWFS) is left to the ordinary process-wide
+/// decision: nothing about it forces a relay.
+#[test]
+fn non_fuse_instance_keeps_process_wide_decision() {
+    let root = repository_with_config("non-fuse", "[vfs]\nvfs_type = \"Swfs\"\n");
+    let globals = globals_for(&root);
+
+    assert!(
+        !instance_requires_service_given(&globals, running_as_service()),
+        "a non-FUSE instance must not force a relay"
+    );
+}
+
+/// Inside the service process, a FUSE instance never forces a relay: the
+/// service would otherwise relay the call to itself.
+#[test]
+fn in_service_process_fuse_instance_runs_locally() {
+    let root = repository_with_config("fuse-in-service", "[vfs]\nvfs_type = \"Fuse\"\n");
+    let globals = globals_for(&root);
+
+    // `running_as_service` is passed in directly rather than set through
+    // `mark_running_as_service()`: that flag is one-way and process-wide,
+    // so setting the real one here would leak into every other test
+    // sharing this process afterwards.
+    assert!(
+        !instance_requires_service_given(&globals, true),
+        "a FUSE instance must run locally inside the service process"
+    );
+}
+
+fn clone_command(vfs: lore::repository::LoreVfsType) -> LoreCommand {
+    LoreCommand::RepositoryClone(lore::repository::LoreRepositoryCloneArgs {
+        vfs,
+        ..Default::default()
+    })
+}
+
+/// A clone whose `vfs` resolves to FUSE forces the same relay an existing
+/// FUSE instance does: outside the service, a local FUSE clone is
+/// refused, not mounted.
+#[test]
+fn a_fuse_clone_requires_the_service() {
+    let globals = LoreGlobalArgs::default();
+    let command = clone_command(lore::repository::LoreVfsType::Fuse);
+
+    assert!(
+        command_requires_service(&globals, &command),
+        "a FUSE clone must require the service"
+    );
+}
+
+/// A clone whose `vfs` does not resolve to FUSE is left to the ordinary
+/// process-wide relaying decision.
+#[test]
+fn a_plain_clone_does_not() {
+    let globals = LoreGlobalArgs::default();
+    let command = clone_command(lore::repository::LoreVfsType::None);
+
+    assert!(
+        !command_requires_service(&globals, &command),
+        "a plain clone must not force a relay"
+    );
+}
+
+/// Inside the service process, a FUSE clone never forces a relay either:
+/// the service would otherwise relay the call to itself.
+#[test]
+fn inside_the_service_nothing_requires_it() {
+    let globals = LoreGlobalArgs::default();
+    let command = clone_command(lore::repository::LoreVfsType::Fuse);
+
+    assert!(
+        !command_requires_service_given(&globals, &command, true),
+        "a FUSE clone must run locally inside the service process"
+    );
+}
+
+fn create_args(vfs: lore::repository::LoreVfsType) -> lore::repository::LoreRepositoryCreateArgs {
+    lore::repository::LoreRepositoryCreateArgs {
+        repository_url: Default::default(),
+        description: Default::default(),
+        id: Default::default(),
+        vfs,
+        use_shared_store: lore_revision::repository::LoreSharedStoreMode::Disabled,
+        shared_store_path: Default::default(),
+    }
+}
+
+fn create_command(vfs: lore::repository::LoreVfsType) -> LoreCommand {
+    LoreCommand::RepositoryCreate(create_args(vfs))
+}
+
+/// A create whose `vfs` resolves to FUSE forces the same relay a FUSE
+/// clone does: outside the service, it would be refused rather than set
+/// up as a mount.
+#[test]
+fn a_fuse_create_requires_the_service() {
+    let globals = LoreGlobalArgs::default();
+    let command = create_command(lore::repository::LoreVfsType::Fuse);
+
+    assert!(
+        command_requires_service(&globals, &command),
+        "a FUSE create must require the service"
+    );
+}
+
+/// `LoreVfsType::Default` resolves to FUSE on Linux, so a clone that
+/// leaves `vfs` at its default must require the service exactly as one
+/// naming FUSE explicitly does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_default_vfs_clone_resolves_to_fuse_and_requires_the_service() {
+    let globals = LoreGlobalArgs::default();
+    let command = clone_command(lore::repository::LoreVfsType::Default);
+
+    assert!(
+        command_requires_service(&globals, &command),
+        "a Default-vfs clone must resolve to FUSE on Linux and require the service"
+    );
+}
+
+/// A FUSE instance with no running service, in a program that names no executable to start
+/// one from and does not run the service itself, fails with `ServiceUnavailable`, on Linux
+/// naming where to set one, rather than silently running the call locally against a mount the
+/// service isn't maintaining.
+#[tokio::test]
+async fn fuse_instance_without_a_service_to_reach_or_start_reports_where_to_name_one() {
+    let _socket = crate::SERVICE_SOCKET_TESTS.lock().await;
+    let root = repository_with_config("fuse-unavailable", "[vfs]\nvfs_type = \"Fuse\"\n");
+    let globals = globals_for(&root);
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let sink: &'static AsyncSink = Box::leak(Box::new(AsyncSink {
+        status: Mutex::new(None),
+        message: Mutex::new(None),
+        done: Mutex::new(Some(done_tx)),
+    }));
+    let context = sink as *const AsyncSink as u64;
+    registry().lock().unwrap().insert(context, sink);
+    let config = LoreEventCallbackConfig {
+        user_context: context,
+        func: Some(record_event),
+    };
+    let callback = lore_revision::event::convert_event_callback(config);
+
+    let reached = Arc::new(AtomicBool::new(false));
+    let handler_reached = reached.clone();
+    let args = lore::revision_tree::close::LoreRevisionTreeCloseArgs::default();
+    let status = dispatch_call(
+        globals,
+        args,
+        callback,
+        move |_globals, _args, _callback| {
+            let reached = handler_reached.clone();
+            async move {
+                reached.store(true, Ordering::Release);
+                0
+            }
+        },
+    )
+    .await;
+
+    assert!(
+        !reached.load(Ordering::Acquire),
+        "a FUSE instance without a running service must not run locally"
+    );
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the call must complete");
+    let expected_code = lore_base::error::ServiceUnavailable {
+        reason: String::new(),
+    }
+    .ffi_code();
+    assert_eq!(status, expected_code);
+    assert_eq!(*sink.status.lock().unwrap(), Some(expected_code));
+    let message = sink.message.lock().unwrap().clone().unwrap_or_default();
+    assert!(
+        message.contains("This instance is served through a FUSE mount"),
+        "the message must say why the call needs the service, got: {message}"
+    );
+    assert!(
+        !cfg!(target_os = "linux") || message.contains(SERVICE_EXECUTABLE_SETTING),
+        "on Linux, where a service would be started, it must say where to name one, got: {message}"
+    );
+}
+
+/// A call in a FUSE instance, which only the service may run, never runs here when the service
+/// socket answers it with the move reply: it fails with `ServiceUnavailable`.
+#[tokio::test]
+async fn a_forced_call_answered_with_the_move_reply_is_unavailable() {
+    let _socket = crate::SERVICE_SOCKET_TESTS.lock().await;
+    let replier = crate::test_util::Replier::move_reply(lore::remote::service_socket_name());
+    let root = repository_with_config("fuse-moving", "[vfs]\nvfs_type = \"Fuse\"\n");
+    let (sink, callback, done) = recording_callback();
+
+    let reached = Arc::new(AtomicBool::new(false));
+    let handler_reached = reached.clone();
+    let status = dispatch_call(
+        globals_for(&root),
+        lore::revision_tree::close::LoreRevisionTreeCloseArgs::default(),
+        callback,
+        move |_globals, _args, _callback| {
+            let reached = handler_reached.clone();
+            async move {
+                reached.store(true, Ordering::Release);
+                0
+            }
+        },
+    )
+    .await;
+
+    let (reported, message) = reported(sink, &done);
+    assert!(
+        !reached.load(Ordering::Acquire),
+        "the call doesn't run here"
+    );
+    assert_eq!(status, service_unavailable(), "{message}");
+    assert_eq!(reported, Some(status));
+    assert_eq!(replier.answered(), 1, "the call reached the socket");
+}
+
+/// A sink registered for [`record_event`], the callback reporting to it, and the receiver
+/// its `End` releases.
+fn recording_callback() -> (&'static AsyncSink, LoreEventCallback, mpsc::Receiver<()>) {
+    let (done_tx, done_rx) = mpsc::channel();
+    let sink: &'static AsyncSink = Box::leak(Box::new(AsyncSink {
+        status: Mutex::new(None),
+        message: Mutex::new(None),
+        done: Mutex::new(Some(done_tx)),
+    }));
+    let context = sink as *const AsyncSink as u64;
+    registry().lock().unwrap().insert(context, sink);
+    let callback = lore_revision::event::convert_event_callback(LoreEventCallbackConfig {
+        user_context: context,
+        func: Some(record_event),
+    });
+    (sink, callback, done_rx)
+}
+
+/// The status and message a call reported to `sink`, once its `End` came.
+fn reported(sink: &AsyncSink, done: &mpsc::Receiver<()>) -> (Option<i32>, String) {
+    done.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the call must complete");
+    let message = sink.message.lock().unwrap().clone().unwrap_or_default();
+    (*sink.status.lock().unwrap(), message)
+}
+
+/// Whether [`dispatch_call`] of `args`, from no repository and with no service running, ran
+/// its handler, which reports nothing, else its status and what it reported.
+async fn dispatched_without_a_service<ArgsType: LoreArgs>(
+    args: ArgsType,
+) -> (bool, i32, Option<i32>, String) {
+    let (sink, callback, done) = recording_callback();
+    let reached = Arc::new(AtomicBool::new(false));
+    let handler_reached = reached.clone();
+    let status = dispatch_call(
+        LoreGlobalArgs::default(),
+        args,
+        callback,
+        move |_globals, _args, _callback| {
+            let reached = handler_reached.clone();
+            async move {
+                reached.store(true, Ordering::Release);
+                0
+            }
+        },
+    )
+    .await;
+    if reached.load(Ordering::Acquire) {
+        return (true, status, None, String::new());
+    }
+    let (reported, message) = reported(sink, &done);
+    (false, status, reported, message)
+}
+
+/// A FUSE clone and a FUSE create through the arguments entry point, with no service
+/// running and none this program can start, never run here: each is refused with
+/// `ServiceUnavailable` and its own reason.
+#[tokio::test]
+async fn fuse_clone_and_create_arguments_without_a_running_service_report_their_reasons() {
+    let _socket = crate::SERVICE_SOCKET_TESTS.lock().await;
+    let clone = lore::repository::LoreRepositoryCloneArgs {
+        vfs: lore::repository::LoreVfsType::Fuse,
+        ..Default::default()
+    };
+    let cases = [
+        (
+            dispatched_without_a_service(clone).await,
+            "A FUSE instance is mounted by the Lore service",
+        ),
+        (
+            dispatched_without_a_service(create_args(lore::repository::LoreVfsType::Fuse)).await,
+            "A FUSE instance is created and mounted by the Lore service",
+        ),
+    ];
+
+    for ((ran, status, reported, message), reason) in cases {
+        assert!(!ran, "{reason}: the call must not run here");
+        assert_eq!(status, service_unavailable(), "{reason}: {message}");
+        assert_eq!(reported, Some(status));
+        assert!(
+            message.contains(reason),
+            "expected '{reason}', got: {message}"
+        );
+    }
+}
+
+/// A FUSE clone through the command entry point, with no service running and none this
+/// program can start, is refused with `ServiceUnavailable` and the clone's reason rather than
+/// run here.
+#[tokio::test]
+async fn a_fuse_clone_command_without_a_running_service_reports_the_clone_reason() {
+    let _socket = crate::SERVICE_SOCKET_TESTS.lock().await;
+    let (sink, callback, done) = recording_callback();
+
+    let status = dispatch_command(
+        LoreGlobalArgs::default(),
+        clone_command(lore::repository::LoreVfsType::Fuse),
+        callback,
+    )
+    .await;
+
+    let (reported, message) = reported(sink, &done);
+    assert_eq!(status, service_unavailable(), "{message}");
+    assert_eq!(reported, Some(status));
+    assert!(
+        message.contains("A FUSE instance is mounted by the Lore service"),
+        "got: {message}"
+    );
 }

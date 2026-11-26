@@ -1,22 +1,34 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+mod aws_native_client_test;
 mod aws_store_test;
 mod common;
 mod dynamodb_test;
+mod fuse_remote_test;
 mod hashicorp;
 mod locks_test;
 mod presign_test;
 mod remote_store_test;
 mod replicated_store_test;
 mod replication_service_test;
+mod revision_graph;
 mod revision_tree_test;
 mod shared_store_test;
 mod storage_copy_on_write_test;
 mod storage_mutable_test;
+mod storage_remote_query_test;
 mod storage_remote_test;
 mod storage_test;
 mod store_fan_out_test;
 mod store_keep_alive_test;
+
+/// The suite drives real services, so it refuses to build against the `lore-aws` mocks, which
+/// `cargo test --workspace` unifies in from `lore-aws`'s own tests.
+const _: () = assert!(
+    !lore_aws::FACADES_ARE_MOCKS,
+    "lore-aws is built with `test-util`, so its S3 and DynamoDB facades are mocks; run this suite \
+     with `cargo test --package lore-integration-tests --features integration_tests`"
+);
 
 /// Points this test binary's global config, credentials and service socket at
 /// names of its own, rather than the machine's.

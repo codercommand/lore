@@ -20,7 +20,9 @@ use crate::interface::LoreString;
 
 /// Arguments for adding a new link to a linked repository at the given path.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(add_local)]
 pub struct LoreLinkAddArgs {
     /// Link repository URL
@@ -58,12 +60,12 @@ pub struct LoreLinkAddArgs {
 /// | [`LoreEvent::RepositoryCloneEnd`](crate::interface::LoreEvent::RepositoryCloneEnd) | Emitted when cloning a linked repository completes |
 /// | [`LoreEvent::LinkBranchCreate`](crate::interface::LoreEvent::LinkBranchCreate) | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 /// | [`LoreEvent::LinkChange`](crate::interface::LoreEvent::LinkChange) | Emitted when the link has been added and saved |
-pub async fn add(
+pub fn add(
     globals: LoreGlobalArgs,
     args: LoreLinkAddArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, add_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, add_local)
 }
 
 fn add_local(
@@ -112,7 +114,9 @@ async fn add_impl(
 
 /// Arguments for removing a link from the repository at the given path.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(remove_local)]
 pub struct LoreLinkRemoveArgs {
     /// Path within this repository where the link is removed
@@ -139,12 +143,12 @@ pub struct LoreLinkRemoveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkChange`](crate::interface::LoreEvent::LinkChange) | Emitted when the link has been removed |
-pub async fn remove(
+pub fn remove(
     globals: LoreGlobalArgs,
     args: LoreLinkRemoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, remove_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, remove_local)
 }
 
 fn remove_local(
@@ -175,7 +179,9 @@ async fn remove_impl(
 
 /// Arguments for listing all linked repositories in the current repository.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(list_local)]
 pub struct LoreLinkListArgs {}
 
@@ -199,12 +205,12 @@ pub struct LoreLinkListArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkEntry`](crate::interface::LoreEvent::LinkEntry) | Emitted for each linked repository |
-pub async fn list(
+pub fn list(
     globals: LoreGlobalArgs,
     args: LoreLinkListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, list_local)
 }
 
 fn list_local(
@@ -219,7 +225,9 @@ fn list_local(
 
 /// Arguments for reading detailed information about a single link.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(info_local)]
 pub struct LoreLinkInfoArgs {
     /// Path within this repository of the link to describe
@@ -246,12 +254,12 @@ pub struct LoreLinkInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkInfo`](crate::interface::LoreEvent::LinkInfo) | Emitted once for the described link |
-pub async fn info(
+pub fn info(
     globals: LoreGlobalArgs,
     args: LoreLinkInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, info_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, info_local)
 }
 
 fn info_local(
@@ -278,7 +286,9 @@ fn info_local(
 
 /// Arguments for listing the links whose linked repositories hold staged changes.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(list_staged_local)]
 pub struct LoreLinkListStagedArgs {}
 
@@ -302,12 +312,12 @@ pub struct LoreLinkListStagedArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkStagedEntry`](crate::interface::LoreEvent::LinkStagedEntry) | Emitted for each link with staged changes |
-pub async fn list_staged(
+pub fn list_staged(
     globals: LoreGlobalArgs,
     args: LoreLinkListStagedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, list_staged_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, list_staged_local)
 }
 
 fn list_staged_local(
@@ -326,7 +336,9 @@ fn list_staged_local(
 
 /// Arguments for updating the pin or properties of an existing link.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[handler(update_local)]
 pub struct LoreLinkUpdateArgs {
     /// Path within this repository of the link to update
@@ -355,12 +367,12 @@ pub struct LoreLinkUpdateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::LinkChange`](crate::interface::LoreEvent::LinkChange) | Emitted when a link property is updated and again when the link update is finalized |
-pub async fn update(
+pub fn update(
     globals: LoreGlobalArgs,
     args: LoreLinkUpdateArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, update_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, update_local)
 }
 
 fn update_local(

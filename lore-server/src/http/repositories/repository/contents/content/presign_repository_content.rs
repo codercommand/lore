@@ -9,6 +9,7 @@ use axum::Extension;
 use axum::Json;
 use axum::extract::Path;
 use axum::extract::State;
+use axum::http::Extensions;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
@@ -23,13 +24,18 @@ use lore_transport::grpc::CORRELATION_ID_HEADER;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
+use tracing::info;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt_axum_middleware::http_permits;
+use crate::authnz::repository_authorizer::Action;
+use crate::http::failed_authorization_status;
 use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
 use crate::http::presign_token::sign;
+use crate::http::presign_token::token_hash;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -42,8 +48,10 @@ pub enum PresignError {
     ParseAddress(FromHexError),
     #[error("Presign feature is not configured")]
     NotConfigured,
-    #[error("Only service accounts may vend presigned URLs")]
-    NotServiceAccount,
+    #[error("Presign not permitted on this repository")]
+    NotPermitted,
+    #[error("Authorization check failed")]
+    AuthorizationFailed(tonic::Status),
     #[error("content_type is not allowed: {0}")]
     DisallowedContentType(String),
     #[error("header value is not valid: {0}")]
@@ -67,9 +75,13 @@ impl IntoResponse for PresignError {
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
             ),
-            PresignError::NotServiceAccount => (
+            PresignError::NotPermitted => (
                 StatusCode::FORBIDDEN,
-                "only service accounts may vend presigned URLs".to_string(),
+                "presign not permitted on this repository".to_string(),
+            ),
+            PresignError::AuthorizationFailed(status) => (
+                failed_authorization_status(status),
+                "authorization check failed".to_string(),
             ),
             PresignError::StoreError | PresignError::SystemTime(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -78,7 +90,10 @@ impl IntoResponse for PresignError {
             PresignError::NotFound => (StatusCode::NOT_FOUND, "address not found".to_string()),
         };
 
-        log_http_error(&self, status);
+        // The authorizer logs a failed check where it happens.
+        if !matches!(self, PresignError::AuthorizationFailed(_)) {
+            log_http_error(&self, status);
+        }
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/plain".parse().unwrap());
@@ -100,23 +115,11 @@ pub struct PresignResponse {
     pub expires_at: u64,
 }
 
-/// Whether the caller is a service account.
-///
-/// Reads the `is_service_account` claim from the token. A `None` token means no
-/// JWT verifier is configured and auth is disabled server-wide, which counts as
-/// a service account.
-#[lore_macro::test_pub]
-fn call_is_service_account(user_info: &Option<AuthorizationToken>) -> bool {
-    match user_info {
-        Some(token) => token.is_service_account.unwrap_or(false),
-        None => true,
-    }
-}
-
 pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path((repository_id, address)): Path<(String, String)>,
     Extension(user_info): Extension<Option<AuthorizationToken>>,
+    extensions: Extensions,
     headers: HeaderMap,
     Json(body): Json<PresignRequest>,
 ) -> Result<impl IntoResponse, PresignError> {
@@ -126,13 +129,20 @@ pub async fn handler(
         .ok_or(PresignError::NotConfigured)?
         .clone();
 
-    if !call_is_service_account(&user_info) {
-        return Err(PresignError::NotServiceAccount);
-    }
-
     let repository = repository_id
         .parse::<RepositoryId>()
         .map_err(PresignError::ParseRepository)?;
+    if !http_permits(
+        state.repository_authorizer.as_ref(),
+        &extensions,
+        repository,
+        Action::Presign,
+    )
+    .await
+    .map_err(PresignError::AuthorizationFailed)?
+    {
+        return Err(PresignError::NotPermitted);
+    }
     let parsed_address = address
         .parse::<Address>()
         .map_err(PresignError::ParseAddress)?;
@@ -167,11 +177,8 @@ pub async fn handler(
         .get(CORRELATION_ID_HEADER)
         .and_then(|v| v.to_str().map(str::to_string).ok())
         .unwrap_or_default();
-    let execution = setup_execution(
-        module_path!(),
-        correlation_id,
-        get_user_id_from_token(user_info),
-    );
+    let user_id = get_user_id_from_token(user_info);
+    let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
 
     let immutable_store = state.immutable_store.clone();
 
@@ -216,6 +223,15 @@ pub async fn handler(
             };
 
             let token_str = sign(&payload, &presign_config.hmac_key);
+            info!(
+                user_id,
+                key_id = payload.key_id,
+                repository = payload.repository,
+                address = payload.address,
+                expires_at,
+                token_hash = token_hash(&token_str),
+                "Minted presigned URL"
+            );
 
             let url_suffix = format!("/v1/presigned/{repository_id}/{address}?token={token_str}");
 

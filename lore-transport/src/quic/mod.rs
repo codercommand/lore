@@ -3,11 +3,14 @@
 pub mod chunking;
 pub mod client;
 pub mod command_header;
+pub mod frame_queue;
 pub mod net_runtime;
+pub mod response_observer;
 #[cfg(not(feature = "test-util"))]
-mod response_reader;
+pub(crate) mod response_reader;
 #[cfg(feature = "test-util")]
 pub mod response_reader;
+pub mod slow_response;
 pub mod storage_service;
 
 use std::sync::Arc;
@@ -23,6 +26,7 @@ use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
+use crate::quic::client::CongestionAlgorithm;
 use crate::quic::storage_service::client::StorageClient;
 use crate::traits::Storage;
 
@@ -88,6 +92,11 @@ pub enum QuicClientError {
     NotFound,
     #[error("Oversized fragment rejected by server")]
     Oversized,
+    /// The command's session was issued on an earlier connection than the one it would be written
+    /// to, which knows another session or none by its id, or on no connection. Raised by the
+    /// client, never the server.
+    #[error("Session not issued on this connection")]
+    StaleSession,
 }
 
 #[derive(Debug)]
@@ -100,6 +109,7 @@ pub async fn storage(
     identity: &str,
     partition: Partition,
     credentials: &Arc<SuppliedCredentials>,
+    congestion_algorithm: CongestionAlgorithm,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     let remote_domain = domain_from_url_str_or_url(remote_url)
         .internal_with(|| format!("remote {remote_url} is invalid"))?;
@@ -113,9 +123,10 @@ pub async fn storage(
         partition,
         credentials,
         None,
+        congestion_algorithm,
     )
     .await
     .forward_with::<ProtocolError, _>(|| format!("connecting to {remote_url}"))?;
 
-    Ok(Arc::new(storage))
+    Ok(storage)
 }

@@ -9,8 +9,12 @@ use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
+use lore_revision::metadata::branch::ARCHIVE_KEYS;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::revision::v1::branch_metadata_set::*;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
@@ -78,6 +82,7 @@ async fn cas_hit_swaps_pointer_and_returns_updated() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -91,6 +96,7 @@ async fn cas_hit_swaps_pointer_and_returns_updated() {
 
         let response = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -113,6 +119,7 @@ async fn cas_miss_returns_current_pointer_in_band() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -137,6 +144,7 @@ async fn cas_miss_returns_current_pointer_in_band() {
 
         let response = handler(
             make_request(repository_id, branch_id, stale_expected, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -163,6 +171,7 @@ async fn rejects_modification_of_read_only_name() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -176,6 +185,7 @@ async fn rejects_modification_of_read_only_name() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -199,6 +209,7 @@ async fn rejects_modification_of_read_only_category() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -212,6 +223,7 @@ async fn rejects_modification_of_read_only_category() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -235,6 +247,7 @@ async fn rejects_removal_of_read_only_creator() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -246,6 +259,7 @@ async fn rejects_removal_of_read_only_creator() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -255,6 +269,117 @@ async fn rejects_removal_of_read_only_creator() {
         assert!(err.message().contains("creator"));
     }))
     .await;
+}
+
+/// A swap that adds any of the keys archives and restores write, to a branch without it, is
+/// refused: such a value would change what the next archive or restore of the branch does.
+#[tokio::test]
+async fn rejects_addition_of_an_archive_key() {
+    for &key in ARCHIVE_KEYS {
+        let repository_id = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+                allow_all_repositories(),
+            ));
+            let current = create_branch(repository.clone(), branch_id).await;
+
+            let mut proposed = Metadata::deserialize(repository.clone(), current)
+                .await
+                .expect("deserialize");
+            set_archive_key(&mut proposed, key, 1);
+            let updated = serialize(repository.clone(), &proposed).await;
+
+            let err = handler(
+                make_request(repository_id, branch_id, current, updated),
+                &crate::util::test_support::allow_all_authorizer(),
+                immutable_store,
+                mutable_store.clone(),
+            )
+            .await
+            .expect_err("adding an archive key must fail");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{key}");
+            assert_eq!(
+                branch::metadata_hash(repository, branch_id).await.ok(),
+                Some(current),
+                "{key}: the metadata stays as it was"
+            );
+        }))
+        .await;
+    }
+}
+
+/// A swap that changes the value of any of the keys archives and restores write, or removes one,
+/// is refused, and the metadata stays as it was.
+#[tokio::test]
+async fn rejects_change_or_removal_of_an_archive_key() {
+    for &key in ARCHIVE_KEYS {
+        for removed in [false, true] {
+            let repository_id = random::<RepositoryId>();
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository_id,
+                    allow_all_repositories(),
+                ));
+                let created = create_branch(repository.clone(), branch_id).await;
+                let mut stamped = Metadata::deserialize(repository.clone(), created)
+                    .await
+                    .expect("deserialize");
+                set_archive_key(&mut stamped, key, 1);
+                let current = serialize(repository.clone(), &stamped).await;
+                branch::mutable_store_metadata(repository.clone(), branch_id, current)
+                    .await
+                    .expect("store the stamped metadata");
+
+                let mut proposed = stamped;
+                if removed {
+                    proposed.remove_key(key);
+                } else {
+                    set_archive_key(&mut proposed, key, 2);
+                }
+                let updated = serialize(repository.clone(), &proposed).await;
+
+                let err = handler(
+                    make_request(repository_id, branch_id, current, updated),
+                    &crate::util::test_support::allow_all_authorizer(),
+                    immutable_store,
+                    mutable_store.clone(),
+                )
+                .await
+                .expect_err("changing an archive key must fail");
+                assert_eq!(err.code(), tonic::Code::InvalidArgument, "{key} {removed}");
+                assert_eq!(
+                    branch::metadata_hash(repository, branch_id).await.ok(),
+                    Some(current),
+                    "{key} {removed}: the metadata stays as it was"
+                );
+            }))
+            .await;
+        }
+    }
+}
+
+/// Sets archive key `key` in `metadata` to a value of its type that `seed` picks.
+fn set_archive_key(metadata: &mut Metadata, key: &str, seed: u64) {
+    if key == branch::RESTORING || key == branch::RELEASED {
+        metadata
+            .set_string(key, &format!("name-{seed}"))
+            .expect("set the key");
+    } else {
+        metadata.set_u64(key, seed).expect("set the key");
+    }
 }
 
 #[tokio::test]
@@ -269,6 +394,7 @@ async fn allows_protect_modification() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -282,6 +408,7 @@ async fn allows_protect_modification() {
 
         let response = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -302,6 +429,7 @@ async fn rejects_unknown_branch_with_not_found() {
     Box::pin(LORE_CONTEXT.scope(execution, async move {
         let err = handler(
             make_request(repository_id, branch_id, Hash::default(), Hash::default()),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -325,6 +453,7 @@ async fn cas_succeeds_on_deleted_branch() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let write_token = get_write_token();
 
@@ -355,13 +484,15 @@ async fn cas_succeeds_on_deleted_branch() {
             .expect("serialize state");
         let main_latest = lore_server::grpc::handlers::branch_push::push(
             repository.clone(),
+            None,
             main_id,
             state_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("seed main")
@@ -384,15 +515,15 @@ async fn cas_succeeds_on_deleted_branch() {
         )
         .await
         .expect("create child");
-        let current = branch::metadata_hash(repository.clone(), child_id)
-            .await
-            .expect("child metadata");
         branch::delete(repository.clone(), child_id)
             .await
             .expect("delete child");
+        let current = branch::metadata_hash(repository.clone(), child_id)
+            .await
+            .expect("child metadata");
 
-        // Delete preserves the metadata pointer; CAS must still
-        // succeed against it.
+        // Delete keeps the metadata, with its archive time recorded;
+        // CAS must still succeed against it.
         let mut proposed = Metadata::deserialize(repository.clone(), current)
             .await
             .expect("deserialize current");
@@ -403,6 +534,7 @@ async fn cas_succeeds_on_deleted_branch() {
 
         let response = handler(
             make_request(repository_id, child_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -425,6 +557,7 @@ async fn rejects_garbage_updated_hash() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -434,6 +567,7 @@ async fn rejects_garbage_updated_hash() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, garbage),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -456,6 +590,7 @@ async fn rejects_garbage_expected_hash() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -471,6 +606,7 @@ async fn rejects_garbage_expected_hash() {
 
         let err = handler(
             make_request(repository_id, branch_id, garbage, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -493,6 +629,7 @@ async fn rejects_dangling_address_reference() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let current = create_branch(repository.clone(), branch_id).await;
 
@@ -510,6 +647,7 @@ async fn rejects_dangling_address_reference() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -534,6 +672,7 @@ async fn rejects_zero_branch_id() {
             Hash::default(),
             Hash::default(),
         ),
+        &crate::util::test_support::allow_all_authorizer(),
         immutable_store,
         mutable_store,
     )
@@ -553,8 +692,13 @@ async fn rejects_missing_repository_id() {
         expected: Hash::default().into(),
         updated: Hash::default().into(),
     });
-    let err = handler(request, immutable_store, mutable_store)
-        .await
-        .expect_err("missing repository must fail");
+    let err = handler(
+        request,
+        &crate::util::test_support::allow_all_authorizer(),
+        immutable_store,
+        mutable_store,
+    )
+    .await
+    .expect_err("missing repository must fail");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }

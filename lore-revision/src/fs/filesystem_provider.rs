@@ -5,7 +5,10 @@
 //! This module defines the two-trait architecture that separates operation context creation
 //! (freeze for SWFS) from actual file operations (work against frozen snapshot).
 
+use std::collections::HashSet;
 use std::fs::Metadata;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -14,26 +17,41 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::error::FileNotFound;
 use lore_base::error::InvalidArguments;
+use lore_base::error::InvalidPath;
 use lore_base::error::LocalModifications;
+use lore_base::error::NotSupported;
+use lore_base::error::Oversized;
 use lore_base::types::Fragment;
 use lore_error_set::ErrorSet;
 use lore_error_set::error_set;
 use lore_error_set::prelude::*;
+use lore_io::clone::Backend;
+use lore_io::clone::Volume;
 
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+#[cfg(target_os = "linux")]
+use crate::fs::fuse::operation::FuseDirectoryListing;
+#[cfg(target_os = "linux")]
+use crate::fs::fuse::operation::FuseOperation;
 use crate::fs::os::OsDirectoryListing;
 use crate::fs::os::OsOperation;
 use crate::fs::swfs::filesystem::SwfsOperation;
+use crate::fs::walk::CloneStats;
+use crate::fs::walk::Progress;
+use crate::fs::walk::TreeSize;
 use crate::hash::hash_string;
+use crate::infer::ConflictMarkers;
 use crate::lore::Address;
 use crate::lore::Context;
-use crate::lore::execution_context;
+use crate::lore::Hash;
 use crate::lore_debug;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::node::Node;
 use crate::node::NodeFileMode;
 use crate::node::NodeFlags;
+use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::ChangeStream;
 use crate::state::FilesystemDiffStats;
@@ -42,6 +60,7 @@ use crate::state::LinkMountInfo;
 use crate::state::NodeComparison;
 use crate::state::NodeMapping;
 use crate::state::RecordedModifiedTimes;
+use crate::state::SerializedBlocks;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
@@ -49,7 +68,9 @@ use crate::util::path::RelativePath;
 pub enum FsError {
     FileNotFound,
     InvalidArguments,
+    InvalidPath,
     LocalModifications,
+    NotSupported,
 }
 
 impl From<std::io::Error> for FsError {
@@ -63,8 +84,9 @@ impl From<std::io::Error> for FsError {
 /// The repository tracks files and directories. Anything else the file system holds — a device, a
 /// socket — answers as holding nothing, and a directory listing skips a link rather than
 /// describing what it points at. A path named on its own is stat'd through a link, so one naming
-/// a link answers for the target it resolves to. Supporting links means giving them a variant of
-/// their own rather than widening one of these.
+/// a link answers for the target it resolves to, except on a virtual clone, which answers one as
+/// holding nothing. Supporting links means giving them a variant of their own rather than widening
+/// one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileInfo {
     /// The path holds nothing, which a path the walk skipped also answers.
@@ -84,18 +106,21 @@ pub enum FileInfo {
 }
 
 impl FileInfo {
+    /// What `metadata` measured at a path, read as [`from_stat`](Self::from_stat) reads it.
     pub fn from_metadata(metadata: &Metadata) -> Self {
-        if metadata.is_dir() {
-            return FileInfo::Directory;
-        }
-        if !metadata.is_file() {
-            return FileInfo::NotExist;
-        }
-        let (mtime, size) = crate::util::fs::file_mtime_and_size(metadata);
-        FileInfo::File {
-            executable: crate::util::fs::file_executable_observed(metadata),
-            size,
-            mtime,
+        Self::from_stat(&lore_io::Stat::from(metadata))
+    }
+
+    /// What `stat` measured at a path.
+    pub fn from_stat(stat: &lore_io::Stat) -> Self {
+        match stat.kind {
+            lore_io::StatKind::Directory => FileInfo::Directory,
+            lore_io::StatKind::Other => FileInfo::NotExist,
+            lore_io::StatKind::File => FileInfo::File {
+                executable: crate::util::fs::mode_executable_observed(stat.mode),
+                size: stat.len,
+                mtime: crate::util::fs::modified_millis(stat.modified),
+            },
         }
     }
 
@@ -174,10 +199,44 @@ pub struct DirectoryEntry {
     pub name_hash: u64,
 }
 
+impl DirectoryEntry {
+    /// The entry for `name`, holding `info`, its name hash taken from the name.
+    pub fn new(name: String, info: FileInfo) -> Self {
+        Self {
+            name_hash: lore_storage::hash::hash_string(&name),
+            name,
+            info,
+        }
+    }
+}
+
+/// One child of a directory listing that yields every child.
+pub enum ListedEntry {
+    /// A file or a directory.
+    Tracked(DirectoryEntry),
+    /// A symbolic link or a special file, which the repository cannot track, by its name.
+    Untracked(String),
+}
+
 /// Wraps every type a provider lists a directory with, so a listing dispatches statically for
 /// the same reason [`InstanceOperationImpl`] does.
 pub enum StaticDispatchDirectoryListing {
-    Os(OsDirectoryListing),
+    Os(Box<OsDirectoryListing>),
+    /// Entries a provider built from what it holds, rather than read from a directory.
+    Entries(EntriesListing),
+    #[cfg(target_os = "linux")]
+    Fuse(FuseDirectoryListing),
+}
+
+/// A listing of entries already in hand.
+pub struct EntriesListing {
+    entries: std::vec::IntoIter<DirectoryEntry>,
+}
+
+impl EntriesListing {
+    fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
+        self.entries.next().map(Ok)
+    }
 }
 
 /// Directory entries, resolved as the consumer asks for them.
@@ -190,6 +249,13 @@ impl DirectoryListing {
         Self { dispatch }
     }
 
+    /// A listing of `entries`, for a provider that holds the directory's children itself.
+    pub fn from_entries(entries: Vec<DirectoryEntry>) -> Self {
+        Self::new(StaticDispatchDirectoryListing::Entries(EntriesListing {
+            entries: entries.into_iter(),
+        }))
+    }
+
     /// The next entry, or `None` once the directory is exhausted.
     ///
     /// Reads no further than the entry asked for, so a consumer that stops early stops the walk
@@ -197,6 +263,22 @@ impl DirectoryListing {
     pub async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
         match &mut self.dispatch {
             StaticDispatchDirectoryListing::Os(this) => this.next().await,
+            StaticDispatchDirectoryListing::Entries(this) => this.next(),
+            #[cfg(target_os = "linux")]
+            StaticDispatchDirectoryListing::Fuse(this) => this.next().await,
+        }
+    }
+
+    /// The next entry as [`next`](Self::next) answers it, a symbolic link and a special file
+    /// included. A name that could not be read is still left out.
+    pub async fn next_with_untracked(&mut self) -> Option<Result<ListedEntry, FsError>> {
+        match &mut self.dispatch {
+            StaticDispatchDirectoryListing::Os(this) => this.next_with_untracked().await,
+            StaticDispatchDirectoryListing::Entries(this) => {
+                this.next().map(|entry| entry.map(ListedEntry::Tracked))
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchDirectoryListing::Fuse(this) => this.next_with_untracked().await,
         }
     }
 }
@@ -222,11 +304,37 @@ pub struct StageIntent {
     pub file_id: Option<Context>,
 }
 
+/// How a walk finds the entry a directory holds a name in under another case than the revision
+/// spells it, which turns on whether the file system folds case and on what answers for one name
+/// without a read of the whole directory. A purge reads every directory it purges whatever the
+/// answer, and pairs its children from that listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CaseLookup {
+    /// A path names only the entry spelled as it, so the stat of each child at the revision's
+    /// spelling, which a walk makes anyway, misses where the working tree spells it otherwise, and
+    /// the directory is read on its first miss alone: the OS provider on Linux. On a Linux file
+    /// system that folds case every such stat hits, and the walk keeps the working tree's
+    /// spelling.
+    OnMiss,
+    /// The provider answers for each name from an index of its own
+    /// ([`InstanceOperation::holds_name_exactly`], then [`InstanceOperation::names_folding_to`])
+    /// without reading the directory: FUSE.
+    PerName,
+    /// A path names the entry whatever case it is spelled in, so only a read of the directory tells
+    /// a spelling apart, and the walk reads each directory once before its children: the OS
+    /// provider on Windows and macOS, and SWFS.
+    #[default]
+    Listing,
+}
+
 /// What a filesystem diff does with the differences it finds.
 #[derive(Debug, Clone, Copy)]
 pub enum FilesystemDiffIntent {
     /// Report them, leaving the trees untouched.
     Report,
+    /// Report them as [`Report`](Self::Report) does, leaving out each entry `from` lacks that
+    /// `current` does not track, which is what a reset to `from` leaves alone.
+    ReportTracked,
     /// Set and clear `Dirty` on each node as the walk settles it.
     MarkDirty,
     /// Mark as [`MarkDirty`](Self::MarkDirty) does and record the staged action too.
@@ -242,6 +350,15 @@ impl FilesystemDiffIntent {
         )
     }
 
+    /// The intent a walk takes below a directory that replaced a file, all of whose content is
+    /// new, so that a walk reporting tracked content alone reports it.
+    pub fn below_replacement(self) -> Self {
+        match self {
+            FilesystemDiffIntent::ReportTracked => FilesystemDiffIntent::Report,
+            intent => intent,
+        }
+    }
+
     /// What the walk stages beyond marking, where it stages at all.
     pub fn stage(self) -> Option<StageIntent> {
         match self {
@@ -249,6 +366,23 @@ impl FilesystemDiffIntent {
             _ => None,
         }
     }
+}
+
+/// Where a marking walk adds the directories leading to a path a caller names that the `from`
+/// tree lacks: below `node` of the `from` tree, which the leading `skip` bytes of the path name,
+/// with their separator. Past a link, `node` is in the tree the walk reached.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainRoot {
+    pub node: NodeID,
+    pub skip: u32,
+}
+
+impl ChainRoot {
+    /// The root, standing for none of the path.
+    pub const ROOT: ChainRoot = ChainRoot {
+        node: crate::node::ROOT_NODE,
+        skip: 0,
+    };
 }
 
 /// What to diff against the filesystem: `from` is the tree it is compared against and
@@ -263,12 +397,17 @@ pub struct FilesystemDiffContext {
     /// The path as the file system spells it, which parts from the mappings' own spelling only
     /// where the two name a component with different case.
     pub filesystem_path: RelativePath,
-    /// The filter's verdict at `filesystem_path`, which each child steps from rather
-    /// than refolding the ancestors it already accounts for.
+    /// The filter's verdict at `filesystem_path`, or at its parent where `named_path` is set,
+    /// which each child steps from rather than refolding the ancestors it already accounts for.
     pub states: FilterStates,
     /// The same verdict on the `from` side, which diverges from `states` once a move
     /// puts the two sides at different paths.
     pub from_states: FilterStates,
+    /// Set for a walk over a path a caller names, to where a marking walk starts the directories
+    /// leading to it. The walk asks the filter about `filesystem_path` itself once it reads what
+    /// the working tree holds there, `states` and `from_states` then being the verdict at its
+    /// parent; below it, each listing asks about the entries it lists.
+    pub named_path: Option<ChainRoot>,
     pub filter_mode: FilterMode,
     pub intent: FilesystemDiffIntent,
     pub layer_mounts: Arc<Vec<LayerMountInfo>>,
@@ -337,9 +476,157 @@ pub trait FilesystemProvider: Send + Sync + 'static {
     /// working tree holds without reading it. Every operation it begins answers the same
     /// ([`InstanceOperationImpl::holds_state`]), so a provider handing out another provider's
     /// operations answers as that provider does.
+    ///
+    /// Such a provider serves a link from the link's node, so nothing of a link is written through
+    /// its operations: not the link's directory, its content, a move of it or its removal.
+    ///
+    /// # Implementation notes
+    ///
+    /// - **FUSE**: true. Every change reaches the tree through the provider, which diffs the
+    ///   State it serves against the tree lore names by address.
     fn holds_state(&self) -> bool {
         false
     }
+
+    /// Whether the provider supports a sync restricted to a dependency set, which leaves what lies
+    /// outside the set as the working tree held it.
+    ///
+    /// # Implementation notes
+    ///
+    /// - **SWFS**: false. The mount serves the new revision whole, so what lies outside the set
+    ///   would have to be kept by the operation, and a scan afterwards reports it differently than
+    ///   a plain instance does.
+    /// - **FUSE**: refused through [`Self::holds_state`] instead.
+    fn supports_dependency_sync(&self) -> bool {
+        true
+    }
+
+    /// The content of the file at `path` in the working tree, read without going through the
+    /// file system the provider serves it on, by a provider that holds its state
+    /// ([`Self::holds_state`]): the service never reads through its own mount. `None` where no
+    /// file stands there, and from a provider over files on a file system for every path, as a
+    /// caller reads those files directly.
+    async fn read_held_file(&self, _path: &RelativePath) -> Result<Option<Bytes>, FsError> {
+        Ok(None)
+    }
+
+    /// What cloning the instance tree at `source`, whose Lore directory is at `dot_path`, to
+    /// `destination` would do, answered before anything is written but probe files, which are
+    /// removed. A provider that cannot clone answers [`CloneAnswer::Unsupported`].
+    async fn clone_answer(
+        &self,
+        _source: &Path,
+        _dot_path: &Path,
+        _destination: &Path,
+    ) -> Result<CloneAnswer, InstanceCloneError> {
+        Ok(CloneAnswer::Unsupported {
+            reason: "this filesystem provider cannot clone instances".to_string(),
+        })
+    }
+
+    /// Clones the instance tree at `source`, whose Lore directory is at `dot_path`, into
+    /// `destination` as `answer` describes, leaving out the Lore directory's transient state and
+    /// the files a clone writes for itself. `destination` exists and holds those files. An entry
+    /// that fails to clone fails the clone, unless `copy_unclonable` lets it be copied.
+    /// `run` counts what the clone does, can stop it, and holds what the clone keeps until the
+    /// work it started has ended, even where the future is dropped before it.
+    async fn clone_instance(
+        &self,
+        _source: &Path,
+        _dot_path: &Path,
+        _destination: &Path,
+        _answer: &CloneAnswer,
+        _copy_unclonable: bool,
+        _run: &CloneRun,
+    ) -> Result<CloneStats, InstanceCloneError> {
+        Err(NotSupported {
+            operation: "cloning an instance with this filesystem provider".to_string(),
+        }
+        .into())
+    }
+}
+
+/// What a running clone of an instance counts and keeps.
+pub struct CloneRun {
+    /// What the clone has done so far, and the request to stop it.
+    pub progress: Arc<Progress>,
+    /// Kept until the work the clone started has ended, even where the future that started it
+    /// is dropped first.
+    pub hold: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// What a filesystem provider's clone of an instance fails with.
+#[error_set]
+pub enum InstanceCloneError {
+    /// A path the clone needs is gone.
+    FileNotFound,
+    /// A path the clone writes is taken.
+    InvalidArguments,
+    /// A path the clone is given names no place to clone to.
+    InvalidPath,
+    /// An entry cannot be cloned where the clone promised to share blocks.
+    NotSupported,
+    /// A volume the clone writes is full, the destination's or the source's.
+    Oversized,
+}
+
+/// What cloning an instance's tree to a destination would do, as its filesystem provider answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CloneAnswer {
+    /// The clone shares the source's data blocks through `backend`, so it costs filesystem
+    /// metadata, not content. `volume` holds the destination. `entry_by_entry` names the
+    /// directories, relative to the tree, that a backend that clones whole directories clones
+    /// entry by entry instead, as found before the clone.
+    SharesBlocks {
+        backend: Backend,
+        volume: Volume,
+        entry_by_entry: Arc<HashSet<PathBuf>>,
+    },
+    /// The clone copies `size` onto `volume`, which has `available` bytes free, because of
+    /// `reason`, which names the volumes.
+    CopiesBytes {
+        reason: String,
+        size: TreeSize,
+        volume: Volume,
+        available: u64,
+    },
+    /// No clone is possible, because of `reason`.
+    Unsupported { reason: String },
+}
+
+/// The error an I/O failure `err` of a clone reports, by its kind, with `context` saying what was
+/// being done.
+#[lore_macro::test_pub]
+pub(crate) fn clone_io_failure(err: std::io::Error, context: &str) -> InstanceCloneError {
+    let message = format!("{context}: {err}");
+    match err.kind() {
+        std::io::ErrorKind::NotFound => FileNotFound { resource: message }.into(),
+        std::io::ErrorKind::AlreadyExists => InvalidArguments { reason: message }.into(),
+        std::io::ErrorKind::Unsupported => NotSupported { operation: message }.into(),
+        std::io::ErrorKind::StorageFull
+        | std::io::ErrorKind::QuotaExceeded
+        | std::io::ErrorKind::FileTooLarge => Oversized { context: message }.into(),
+        _ => InstanceCloneError::internal_with_context(err, context),
+    }
+}
+
+/// The path of the Lore directory at `dot_path` relative to the working tree at `tree`, which
+/// holds it in a directory a clone copies.
+#[lore_macro::test_pub]
+pub(crate) fn lore_directory_within<'a>(
+    tree: &Path,
+    dot_path: &'a Path,
+) -> Result<&'a Path, InstanceCloneError> {
+    dot_path.strip_prefix(tree).map_err(|_outside| {
+        InvalidPath {
+            path: format!(
+                "{}: the Lore directory is outside the working tree at {}",
+                dot_path.display(),
+                tree.display()
+            ),
+        }
+        .into()
+    })
 }
 
 /// Runs `work` inside one filesystem operation, finalizing it whether or not the work
@@ -361,6 +648,9 @@ where
         .await
         .forward_any::<E>("Failed to start filesystem operation")?;
     let result = work(operation.clone()).await;
+    if result.is_err() {
+        operation.fail();
+    }
     let finalized = operation
         .finalize()
         .await
@@ -391,9 +681,7 @@ where
     with_operation(filesystem, async |operation| work(Some(operation)).await).await
 }
 
-/// Creates `path` and any missing ancestor, for a directory no file written below it creates on
-/// the way: one the revision holds with nothing in it, or one whose every child the view filter
-/// leaves out.
+/// Creates `path` and any missing ancestor.
 ///
 /// A directory already standing there is the state asked for. Anything else standing there is
 /// reported, the caller holding a directory and nothing to put in that thing's place.
@@ -496,6 +784,18 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
+    /// What [`file_info`](Self::file_info) reports where the working tree spells the path as
+    /// `path` does, and [`FileInfo::NotExist`] where it spells it otherwise. It stands beside
+    /// `file_info` so that a provider holding its own index, which answers a path in any case,
+    /// answers both in the one lookup a stage takes per target. The default is `file_info`, which
+    /// answers so only where the file system tells case apart.
+    fn file_info_as_spelled(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<FileInfo, FsError>> + Send {
+        self.file_info(path)
+    }
+
     /// What [`file_info`](Self::file_info) reports, read from the working tree rather than
     /// from the tree the path is tracked in.
     ///
@@ -508,6 +808,28 @@ pub trait InstanceOperation: Send + Sync {
         &self,
         path: &RelativePath,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
+
+    /// Whether the working tree holds a directory at each of `paths`, as a stat of each path
+    /// answers, which folds case where the file system does, pushed to `held` in order: a file,
+    /// nothing, or a path through a file holds none. A failure is answered.
+    ///
+    /// The default reads [`file_info`](Self::file_info) one path at a time, and takes a path as
+    /// that answers it, a refused stat included. A provider whose stats permission refuses
+    /// overrides it, as the OS provider does: it reads the paths side by side, and takes a path a
+    /// stat is refused permission for as holding a directory.
+    fn directories_held(
+        &self,
+        paths: Arc<[RelativePath]>,
+        held: &mut Vec<bool>,
+    ) -> impl Future<Output = Result<(), FsError>> + Send {
+        async move {
+            held.reserve(paths.len());
+            for path in paths.iter() {
+                held.push(self.file_info(path).await?.is_dir());
+            }
+            Ok(())
+        }
+    }
 
     /// Whether the directory holding `path` holds a child named exactly as `path` spells it.
     ///
@@ -549,6 +871,12 @@ pub trait InstanceOperation: Send + Sync {
             }
             Ok(matches)
         }
+    }
+
+    /// How a walk finds the entry a directory holds a name in under another case than the one it
+    /// asks for ([`CaseLookup`]).
+    fn case_lookup(&self) -> CaseLookup {
+        CaseLookup::Listing
     }
 
     /// The children of the directory at `path`, described as the repository tracks them.
@@ -596,6 +924,10 @@ pub trait InstanceOperation: Send + Sync {
     /// of one can ask about either. Reads no recorded modification time: a recorded time speaks
     /// for the node the current revision holds and answers for no other.
     ///
+    /// `mtime` is the modification time the caller read for the file before asking, 0 where it read
+    /// none. A provider that serves a matching file from the store records that time for it; the
+    /// others ignore it.
+    ///
     /// `established` carries what comparing this file has already settled, so a caller measuring
     /// one path against several addresses reads it no more than the answers require. A provider
     /// answering without reading leaves it untouched.
@@ -603,6 +935,7 @@ pub trait InstanceOperation: Send + Sync {
         &self,
         repository: Arc<RepositoryContext>,
         path: &RelativePath,
+        mtime: u64,
         previous: Address,
         previous_size: u64,
         established: &lore_storage::ContentHashes,
@@ -649,15 +982,38 @@ pub trait InstanceOperation: Send + Sync {
     ///
     /// A case change is a move like any other, `from` and `to` differing only in spelling. It is
     /// what the unification is for: a file system holding both spellings side by side leaves two
-    /// entries to merge rather than one to rename.
+    /// entries to merge rather than one to rename. Where `to` names the entry `from` does, as it
+    /// does on a file system that folds case, a refused rename is answered as refused and
+    /// nothing is unified.
     fn rename(
         &self,
         from: &RelativePath,
         to: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
+    /// Whether `to` names the entry of the working tree `from` does, as another spelling of its
+    /// name does on a file system that folds case: `None` where `from` names nothing, and `false`
+    /// where `to` names nothing or another entry.
+    ///
+    /// A provider answers from the tree it serves. The OS provider reads the file system's own
+    /// identity of each file, symbolic links followed. A provider serving a tree of its own, as
+    /// FUSE and SWFS do, answers by the entry of that tree each path resolves to, any spelling of a
+    /// name finding it, and a path its tree holds no entry at names nothing.
+    fn names_one_entry(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> impl Future<Output = Result<Option<bool>, FsError>> + Send;
+
     /// Delete a file or empty directory.
     fn remove(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
+
+    /// Delete the directory at `path`, which fails where `path` holds entries or is no directory,
+    /// with [`FileNotFound`] where nothing stands at `path`.
+    fn remove_empty_directory(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Delete a directory and all contents.
     fn remove_recursive(
@@ -665,8 +1021,8 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
-    /// Write `node`'s content to `path`, creating the directory above it, applying the node's
-    /// mode, and reporting what the file looks like once written.
+    /// Write `node`'s content to `path`, creating the directory above it where it is missing,
+    /// applying the node's mode, and reporting what the file looks like once written.
     ///
     /// One call rather than four because the steps are never useful apart, and each one asked
     /// separately resolves the same name against the root again.
@@ -732,10 +1088,10 @@ pub trait InstanceOperation: Send + Sync {
         }
     }
 
-    /// Whether the content at `path` holds conflict markers.
+    /// Whether the content at `path` holds conflict markers, or the path holds no file.
     ///
-    /// Content that cannot be opened or read holds none, a failed read logged at debug, and neither
-    /// does a path holding no file. A provider that cannot name the content of a file reports why
+    /// Content that cannot be opened or read holds none, a failed read logged at debug. A provider
+    /// that cannot name the content of a file reports why
     /// ([`content_source`](Self::content_source)).
     ///
     /// Derived from [`content_source`](Self::content_source). A provider that answers without
@@ -743,24 +1099,25 @@ pub trait InstanceOperation: Send + Sync {
     fn infer_is_conflicted(
         &self,
         path: &RelativePath,
-    ) -> impl Future<Output = Result<bool, FsError>> + Send {
+    ) -> impl Future<Output = Result<ConflictMarkers, FsError>> + Send {
         async move {
             let source = match self.content_source(path).await {
                 Ok(source) => source,
-                Err(FsError::FileNotFound(_)) => return Ok(false),
+                Err(FsError::FileNotFound(_)) => return Ok(ConflictMarkers::NoFile),
                 Err(err) => return Err(err),
             };
             Ok(crate::infer::infer_is_conflicted(&source)
                 .await
                 .unwrap_or_else(|err| {
                     lore_debug!("Conflict check cannot read {path}: {err}");
-                    false
+                    ConflictMarkers::Absent
                 }))
         }
     }
 
     /// Takes that a commit of the instance's repository stored the content read at `path` through
-    /// this operation as `address`, `size` bytes long, with `mode`. The commit tells it of each
+    /// this operation as `address`, `size` bytes long, with `mode`, from a file that showed
+    /// `mtime` before the commit read it, the time it records for the path. The commit tells it of each
     /// file it reads from the working tree, before it hands over the revision holding them
     /// ([`committed`](Self::committed)), and of no view-excluded file, whose content it takes
     /// from the staged node. A dry run, and a commit that fails, tells of the content it stored
@@ -770,9 +1127,10 @@ pub trait InstanceOperation: Send + Sync {
     /// # Implementation notes
     ///
     /// - **`OsFilesystem`**, **`SWFS`**: nothing, the default.
-    /// - A provider that holds its state keeps what each file it served was stored as, which
-    ///   `committed` serves the file from without resolving its path again.
-    fn stored(&self, _path: &RelativePath, _address: Address, _size: u64, _mode: u16) {}
+    /// - **FUSE**: keeps it with what it recorded of the file as it served it, which `committed`
+    ///   serves the file from without resolving its path again.
+    fn stored(&self, _path: &RelativePath, _address: Address, _size: u64, _mode: u16, _mtime: u64) {
+    }
 
     /// Takes `committed`, the revision a commit of the instance's repository stored, made current
     /// and flushed, as the revision the working tree stands at, from the files read through this
@@ -788,8 +1146,8 @@ pub trait InstanceOperation: Send + Sync {
     /// # Implementation notes
     ///
     /// - **`OsFilesystem`**, **`SWFS`**: nothing, the default.
-    /// - A provider that holds its state serves each file the commit read from `committed` rather
-    ///   than from the copy it kept.
+    /// - **FUSE**: each file the commit read and nothing wrote since is served from `committed`
+    ///   rather than from `write/`, which it leaves.
     fn committed(
         &self,
         _repository: Arc<RepositoryContext>,
@@ -804,14 +1162,16 @@ pub trait InstanceOperation: Send + Sync {
 /// while still not knowing which type is in use at compile time.
 pub enum StaticDispatchInstanceOperation {
     Os(OsOperation),
-    Swfs(SwfsOperation),
+    Swfs(Box<SwfsOperation>),
+    #[cfg(target_os = "linux")]
+    Fuse(FuseOperation),
     #[cfg(feature = "test-util")]
     Test(test_util::TestOperation),
 }
 
 /// What holding a target revision does to the local changes at the paths it changes
-/// ([`InstanceOperationImpl::hold_state`]). Without `overwrite_local` or `keep_local`, a local
-/// change at such a path refuses the hold, as it refuses a sync.
+/// ([`InstanceOperationImpl::hold_state`]). Without `overwrite_local`, `keep_local` or
+/// `reset_local`, a local change at such a path refuses the hold, as it refuses a sync.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HoldOptions {
     /// Give a local file the target's content, or remove it where the target removes it, as a
@@ -820,37 +1180,96 @@ pub struct HoldOptions {
     /// Keep each local change, a local deletion included, as a sync forwarding local changes
     /// does.
     pub keep_local: bool,
+    /// Give every path the held revision tracks and a local change holds what the target holds
+    /// there, whether the target changes the path or not, as a sync resetting local changes does:
+    /// local edits take the target's content and spelling, and local deletions come back. Local
+    /// files at paths the held revision does not track stay, unless the target places a node
+    /// where they stand: a file takes their place, and a node of the other kind removes them
+    /// whole. Overwrites as `overwrite_local` does.
+    pub reset_local: bool,
     /// Check and report what holding the target changes, changing nothing.
     pub dry_run: bool,
+}
+
+impl HoldOptions {
+    /// Whether the hold gives the local files at the paths it changes the target's content, or
+    /// removes them, as a forced sync and one resetting local changes do.
+    pub fn overwrites_local(&self) -> bool {
+        self.overwrite_local || self.reset_local
+    }
 }
 
 pub struct InstanceOperationImpl {
     dispatch: StaticDispatchInstanceOperation,
     /// What the provider that began the operation answers for [`FilesystemProvider::holds_state`].
     holds_state: bool,
+    /// Whether the operation began in a dry run, which writes nothing through it.
+    dry_run: bool,
     finalized: AtomicBool,
     changed: AtomicBool,
-    modified_times: RecordedModifiedTimes,
+    /// Whether the work the operation was opened for failed, which a provider that holds what it was
+    /// told a commit stored until the work is known to have succeeded drops.
+    failed: AtomicBool,
+    modified_times: Arc<RecordedModifiedTimes>,
     /// The filesystem clock, read once, the first time [`Self::clock_floor`] is asked.
     clock_floor: tokio::sync::OnceCell<u64>,
+    /// Whether a walk of the tree lists directories and probes names through this operation's own
+    /// reads, which it does where the operation answers for the tree itself, rather than reading
+    /// the file system.
+    lists_through_operation: AtomicBool,
+    /// How many directories were listed through the operation.
+    #[cfg(feature = "test-util")]
+    directory_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl InstanceOperationImpl {
     pub fn new(dispatch: StaticDispatchInstanceOperation, holds_state: bool) -> Self {
+        let lists_through_operation = matches!(dispatch, StaticDispatchInstanceOperation::Swfs(_));
         Self {
+            lists_through_operation: AtomicBool::new(lists_through_operation),
+            #[cfg(feature = "test-util")]
+            directory_reads: std::sync::atomic::AtomicUsize::new(0),
             dispatch,
             holds_state,
+            dry_run: crate::runtime::try_execution_context()
+                .is_some_and(|context| context.globals().dry_run()),
             finalized: AtomicBool::new(false),
             changed: AtomicBool::new(false),
-            modified_times: RecordedModifiedTimes::default(),
+            failed: AtomicBool::new(false),
+            modified_times: Arc::default(),
             clock_floor: tokio::sync::OnceCell::new(),
         }
     }
 
+    /// Whether a walk of the tree takes its directories and name probes from this operation's
+    /// own reads, rather than from the file system.
+    pub fn lists_through_operation(&self) -> bool {
+        self.lists_through_operation.load(Ordering::Acquire)
+    }
+
+    /// Has a walk list through the operation, or not, whatever the operation is.
+    #[cfg(feature = "test-util")]
+    pub fn set_listing_through_operation(&self, through_operation: bool) {
+        self.lists_through_operation
+            .store(through_operation, Ordering::Release);
+    }
+
+    /// How many directories were listed through the operation.
+    #[cfg(feature = "test-util")]
+    pub fn directory_reads(&self) -> usize {
+        self.directory_reads.load(Ordering::Relaxed)
+    }
+
     /// The filesystem clock of `repository`'s working copy as the operation first asked for it,
     /// read then ([`crate::state::read_clock_floor`]): a file the operation reads after asking
-    /// may record its time only where it is older, so no write after the read shares it.
+    /// may record its time only where it is older, so no write after the read shares it. No
+    /// floor, `u64::MAX`, for a provider that holds its state: a commit there records the time of
+    /// each file it stores however recent, and a diff's comparison records against the floor the
+    /// provider reads itself (`record_local_time`).
     pub async fn clock_floor(&self, repository: &RepositoryContext) -> u64 {
+        if self.holds_state {
+            return u64::MAX;
+        }
         *self
             .clock_floor
             .get_or_init(|| crate::state::read_clock_floor(repository))
@@ -865,7 +1284,20 @@ impl InstanceOperationImpl {
         path: &RelativePath,
         mtime: u64,
     ) {
+        if self.dry_run {
+            return;
+        }
         self.modified_times.record(repository, path, mtime);
+    }
+
+    /// Collects an entry keyed by the caller, stored and discarded with the recorded times.
+    pub fn record_modified_entry(&self, entry: crate::state::ModifiedTimeEntry) {
+        self.modified_times.push(entry);
+    }
+
+    /// The operation's collector, for a clone whose files are stored and discarded with the rest.
+    pub fn modified_times(&self) -> Arc<RecordedModifiedTimes> {
+        self.modified_times.clone()
     }
 
     /// Takes the times collected so far. Times left behind are dropped with the operation,
@@ -888,6 +1320,74 @@ impl InstanceOperationImpl {
         self.changed.store(true, Ordering::Release);
     }
 
+    /// Notes that a commit stored `path`, so the provider thaws it as committed once the commit
+    /// went through: SWFS holds a change to a path until a thaw names it. Counted as a change,
+    /// outside a dry run.
+    pub fn committed_path(&self, path: &RelativePath) {
+        if self.dry_run {
+            return;
+        }
+        if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
+            this.committed_path(path);
+            self.record_change();
+        }
+    }
+
+    /// Notes that a commit deleted the file at `path`, so the provider names it as removed once the
+    /// commit went through, where SWFS lists it or a directory above it as deleted: SWFS holds
+    /// the user's deletion until a thaw names the path. Counted as a change, outside a dry run.
+    pub fn committed_removal(&self, path: &RelativePath) {
+        if self.dry_run {
+            return;
+        }
+        if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
+            this.committed_removal(path);
+            self.record_change();
+        }
+    }
+
+    /// Notes that a commit deleted the directory at `path` and all it held, so the provider names
+    /// what SWFS holds deleted there once the commit went through. Counted as a change, outside a
+    /// dry run.
+    pub fn committed_tree_removal(&self, path: &RelativePath) {
+        if self.dry_run {
+            return;
+        }
+        if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
+            this.committed_tree_removal(path);
+            self.record_change();
+        }
+    }
+
+    /// Notes that the operation may leave changes of the revision it moves the instance to
+    /// unwritten, as a sync or clone restricted to a dependency set leaves what lies outside it.
+    /// A provider serving the revision whole, as SWFS does, then keeps what the working tree
+    /// showed where the operation wrote nothing (ADR-00034); one whose working tree holds what was
+    /// written has nothing to keep.
+    pub fn leaves_changes_unwritten(&self) {
+        if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
+            this.leaves_changes_unwritten();
+        }
+    }
+
+    /// Notes that the link or layer mounted at `path` now stands at a state the operation could not
+    /// see while it ran, as one realized before the state holding the change was stored, so the
+    /// operation describes the mount again on finalizing. A plain filesystem has nothing to describe.
+    pub fn mount_changed(&self, path: &RelativePath) {
+        if self.dry_run {
+            return;
+        }
+        if let StaticDispatchInstanceOperation::Swfs(this) = &self.dispatch {
+            this.mount_changed(path);
+            self.record_change();
+        }
+    }
+
+    /// Notes that the work this operation was opened for failed, ahead of its finalize.
+    pub fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
     /// Finishes the operation, reporting to the provider behind it whether the work wrote.
     ///
     /// # Implementation notes
@@ -895,6 +1395,9 @@ impl InstanceOperationImpl {
     /// - **`OsOperation`**: Nothing to finish, the writes having gone to the filesystem the
     ///   reads come from.
     /// - **`SWFS`**: Thaws the filesystem, clearing the write cache where writes were made.
+    /// - **`FuseOperation`**: Serves from the store the local files a marking diff under the
+    ///   command's write token found unchanged, then writes back the time of the files the
+    ///   operation served from the store again.
     pub async fn finalize(&self) -> Result<(), FsError> {
         if !self.claim_finalize() {
             return Err(FsError::internal("Operation already finalized"));
@@ -904,7 +1407,15 @@ impl InstanceOperationImpl {
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.finalize(changes_made),
             StaticDispatchInstanceOperation::Os(_this) => Ok(()),
-            StaticDispatchInstanceOperation::Swfs(this) => this.finalize(changes_made).await,
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.finalize(changes_made, !self.failed.load(Ordering::Acquire))
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.finalize().await;
+                Ok(())
+            }
         }
     }
 
@@ -914,18 +1425,349 @@ impl InstanceOperationImpl {
         self.holds_state
     }
 
+    /// Serves `link`, a link node of the instance's own tree, at `path`, in place of what stands
+    /// there, or takes away the link standing at `path` where `None`, where the provider holds
+    /// its state in a `State` ([`FilesystemProvider::holds_state`]): such a provider serves a link
+    /// from its node, so a command changing a link changes what it serves (ADR-00036). A link
+    /// placed over a local change is refused unless `force`, which discards the change. A path
+    /// through a link takes nothing, as the link's pin serves it. Nothing for other providers,
+    /// which write a link's files, nor in a dry run. Counts as a change.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub async fn place_link(
+        &self,
+        path: &RelativePath,
+        link: Option<&Node>,
+        force: bool,
+    ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            self.record_change();
+            // Boxed: kept out of the future of every caller, a change's realize among them.
+            // Type-erased: a caller's `Send` check of it overflows the recursion limit.
+            let placed: crate::BoxFuture<'_, Result<(), FsError>> =
+                Box::pin(this.place_link(path, link, force));
+            return placed.await;
+        }
+        let _ = (path, link, force);
+        Ok(())
+    }
+
+    /// Serves at `path` a copy of the node `side` names, with every node below it, where nothing
+    /// stands there and the provider holds its state in a `State`
+    /// ([`FilesystemProvider::holds_state`]): what a reset puts back of the current revision where
+    /// a link staged in its place goes, which other providers create on disk. A path through a
+    /// link takes nothing. Nothing for other providers, nor in a dry run. Counts as a change.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub async fn place_copy(
+        &self,
+        path: &RelativePath,
+        side: &crate::state::NodeMapping,
+    ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            self.record_change();
+            return this.place_copy(path, side).await;
+        }
+        let _ = (path, side);
+        Ok(())
+    }
+
+    /// [`Self::place_link`] of the link standing at `path` moved to the revision `pin`, mounting
+    /// its node `source`; nothing where no link stands there.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub async fn repin_link(
+        &self,
+        path: &RelativePath,
+        pin: Hash,
+        source: NodeID,
+    ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            self.record_change();
+            return this.repin_link(path, pin, source).await;
+        }
+        let _ = (path, pin, source);
+        Ok(())
+    }
+
+    /// Starts warming what `plan` names into the local store in the background, for a provider
+    /// that answers reads from a `State` snapshot; returns at once. Other providers hold every
+    /// file already and ignore it.
+    pub fn start_prefetch(&self, plan: crate::repository::prefetch::PrefetchPlan) {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.filesystem().start_prefetch(plan),
+            _ => drop(plan),
+        }
+    }
+
+    /// Hands the provider `paths`, directories the commit adds or moves, which the provider settles
+    /// once the revision is current. Other providers ignore them.
+    pub(crate) fn hand_directories(&self, paths: Vec<RelativePath>) {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.hand_directories(paths),
+            _ => drop(paths),
+        }
+    }
+
+    /// Keeps `blocks`, the committed State's blocks as its serialize wrote them, in memory until
+    /// the provider settles against that State. A provider that holds no `State` drops them.
+    pub(crate) fn keep_serialized_blocks(&self, blocks: SerializedBlocks) {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) if self.holds_state => {
+                this.keep_serialized_blocks(blocks);
+            }
+            _ => drop(blocks),
+        }
+    }
+
+    /// Drops what [`Self::keep_serialized_blocks`] kept: the commit settles nothing.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
+    pub(crate) fn drop_serialized_blocks(&self) {
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch {
+            this.drop_serialized_blocks();
+        }
+    }
+
+    /// Owes the provider's settle of the commit before its revision may become current: until
+    /// the settle completes with no error, a removal of a node the commit may have added records
+    /// its deletion ([`FuseOperation::owe_settle`]). Other providers owe nothing.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub(crate) async fn owe_settle(&self) {
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            this.owe_settle().await;
+        }
+    }
+
+    /// Whether the operation is a dry run's, which writes nothing.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn dry_run(&self) -> bool {
+        self.dry_run
+    }
+
+    /// The time recorded for `path`, where the provider compares a local file of its State by it
+    /// before reading it, as an instance on disk compares each file: 0 for none, and `None`
+    /// where the provider reads the file instead.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn recorded_local_time(
+        &self,
+        repository: &RepositoryContext,
+        path: &RelativePath,
+    ) -> Option<u64> {
+        match &self.dispatch {
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.recorded_time(repository, path).await
+            }
+            _ => None,
+        }
+    }
+
+    /// Records `mtime` for `path`, a local file a diff found holding the content of `revision`,
+    /// the diff's current revision, after [`Self::recorded_local_time`] answered `expected` for
+    /// it.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn record_local_time(
+        &self,
+        repository: &RepositoryContext,
+        path: &RelativePath,
+        times: (u64, u64),
+        revision: crate::lore::Hash,
+    ) {
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch {
+            this.record_compared_time(repository, path, times, revision)
+                .await;
+        }
+    }
+
+    /// Ends what [`Self::owe_settle`] owes: the revision never became current.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
+    pub(crate) fn release_settle_owed(&self) {
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch {
+            this.release_settle_owed();
+        }
+    }
+
+    /// What the file at `path` holds, measured from `node`, the record a diff walk read of it,
+    /// where the operation answers from a `State`: the FUSE provider reads a local-content node's
+    /// host file and a tracked node's record, never resolving the path. Other operations read the
+    /// path.
+    #[cfg(target_os = "linux")]
+    pub async fn measure(&self, path: &RelativePath, node: &Node) -> Result<FileInfo, FsError> {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.measure(path, node).await,
+            _ => self.file_info(path).await,
+        }
+    }
+
+    /// Whether `path` names a symbolic link [`InstanceOperation::file_info`] answers as holding
+    /// nothing: a virtual clone versions none. Other operations' `file_info` follows a link, and
+    /// answer false.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub async fn unversioned_symlink_at(&self, path: &RelativePath) -> Result<bool, FsError> {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.symlink_at(path).await,
+            _ => {
+                let _ = path;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Whether a write at `path` meets such a symbolic link, at the path or above it: the user's,
+    /// which a command must not write over or through.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub async fn unversioned_symlink_at_or_above(
+        &self,
+        path: &RelativePath,
+    ) -> Result<bool, FsError> {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.symlink_at_or_above(path).await,
+            _ => {
+                let _ = path;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Deletes a directory and its contents as [`InstanceOperation::remove_recursive`] does, but
+    /// keeps each nested repository in it, with the directories leading to one. An SWFS mount
+    /// deletes nothing on disk, so there the two are the same, and a virtual clone deletes as
+    /// `remove_recursive` does: its provider tracks no nested repository. Nor does a test
+    /// provider, which records the path as `remove_recursive` does.
+    pub async fn remove_recursive_keeping_repositories(
+        &self,
+        path: &RelativePath,
+    ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        self.record_change();
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.remove_recursive(path).await,
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.remove_recursive_keeping_repositories(path).await
+            }
+            StaticDispatchInstanceOperation::Swfs(this) => this.remove_recursive(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.remove_recursive(path).await,
+        }
+    }
+
+    /// Renames `from` to `to` as [`InstanceOperation::rename`] does. Where the rename is refused,
+    /// the working tree holds `from` and the directory `to` lands in is missing, creates it and the
+    /// missing directories above it and renames again, removing those it created where that rename
+    /// fails too ([`Self::rename_into_created_parent`]).
+    pub async fn rename_creating_parent(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<(), FsError> {
+        let Err(refused) = self.rename(from, to).await else {
+            return Ok(());
+        };
+        Box::pin(self.rename_into_created_parent(from, to, refused)).await
+    }
+
+    /// The rename of `from` to `to` after its refusal, `refused`: answers `refused` where the
+    /// working tree holds nothing at `from` or [`Self::missing_ancestors`] finds no directory above
+    /// `to` missing, and otherwise the error of the create or of the rename into the directories
+    /// created. Boxed, being cold.
+    async fn rename_into_created_parent(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+        refused: FsError,
+    ) -> Result<(), FsError> {
+        if !self.file_info(from).await.is_ok_and(|info| info.exists()) {
+            return Err(refused);
+        }
+        let missing = self.missing_ancestors(to).await;
+        let Some(deepest) = missing.first() else {
+            return Err(refused);
+        };
+        create_empty_directory::<FsError>(self, deepest).await?;
+        let Err(failed) = self.rename(from, to).await else {
+            return Ok(());
+        };
+        for directory in &missing {
+            if let Err(left) = self.remove_empty_directory(directory).await {
+                lore_warn!(
+                    "A rename of {from} to {to} leaves {directory}, which it created: {left}"
+                );
+                break;
+            }
+        }
+        Err(failed)
+    }
+
+    /// The directories above `path` the working tree holds nothing at, deepest first, up to the
+    /// first one it holds or cannot describe.
+    async fn missing_ancestors(&self, path: &RelativePath) -> Vec<RelativePath> {
+        let mut missing = Vec::new();
+        let mut parent = path.parent_path();
+        while !parent.is_empty() && matches!(self.file_info(&parent).await, Ok(FileInfo::NotExist))
+        {
+            let above = parent.parent_path();
+            missing.push(parent);
+            parent = above;
+        }
+        missing
+    }
+
     /// Hands `target`, under `repository`, its context, to a provider that holds its state in a
     /// `State` ([`FilesystemProvider::holds_state`]) to hold as the revision the working tree
-    /// stands at, its local changes refused, kept or overwritten as `options` asks
+    /// stands at, its local changes refused, kept, overwritten or reset as `options` asks
     /// ([`crate::fs::hold`]). Outside a dry run the hold counts as a change. An operation that
     /// holds no `State` refuses, changing nothing.
-    #[allow(clippy::unused_async)]
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
     pub async fn hold_state(
         &self,
         repository: Arc<RepositoryContext>,
         target: Arc<State>,
         options: HoldOptions,
     ) -> Result<(), FsError> {
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            if !options.dry_run {
+                self.record_change();
+            }
+            return crate::fs::fuse::swap::hold_mounted(
+                this.filesystem(),
+                self,
+                repository,
+                target,
+                options,
+            )
+            .await;
+        }
         #[cfg(feature = "test-util")]
         if let StaticDispatchInstanceOperation::Test(this) = &self.dispatch
             && self.holds_state
@@ -939,6 +1781,31 @@ impl InstanceOperationImpl {
         Err(FsError::internal(
             "Unable to hold a revision through an operation that holds no State",
         ))
+    }
+
+    /// Reads the ignore file at the root of the revision the provider serves into the local store,
+    /// where the provider holds its state in a `State` ([`FilesystemProvider::holds_state`]), so a
+    /// command run offline finds it. A failure is left for the next command to report. Other
+    /// providers read the ignore file from the working tree, and nothing is read here, nor in a dry
+    /// run.
+    #[lore_macro::test_pub]
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+    pub(crate) async fn warm_held_ignore_file(&self) {
+        if self.dry_run {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            this.filesystem().warm_ignore_file().await;
+        }
+        #[cfg(feature = "test-util")]
+        if let StaticDispatchInstanceOperation::Test(this) = &self.dispatch
+            && self.holds_state
+        {
+            this.warm_count.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -958,6 +1825,10 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Swfs(this) => {
                 this.changes_from_filesystem_to_state(diff)
             }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.changes_from_filesystem_to_state(diff)
+            }
         }
     }
 
@@ -967,6 +1838,19 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.file_info(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.file_info(path).await,
+        }
+    }
+
+    async fn file_info_as_spelled(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.file_info_as_spelled(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.file_info_as_spelled(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.file_info_as_spelled(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.file_info_as_spelled(path).await,
         }
     }
 
@@ -976,6 +1860,23 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.untracked_file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.untracked_file_info(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.untracked_file_info(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.untracked_file_info(path).await,
+        }
+    }
+
+    async fn directories_held(
+        &self,
+        paths: Arc<[RelativePath]>,
+        held: &mut Vec<bool>,
+    ) -> Result<(), FsError> {
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.directories_held(paths, held).await,
+            StaticDispatchInstanceOperation::Os(this) => this.directories_held(paths, held).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.directories_held(paths, held).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.directories_held(paths, held).await,
         }
     }
 
@@ -985,6 +1886,19 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.holds_name_exactly(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.holds_name_exactly(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.holds_name_exactly(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.holds_name_exactly(path).await,
+        }
+    }
+
+    fn case_lookup(&self) -> CaseLookup {
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.case_lookup(),
+            StaticDispatchInstanceOperation::Os(this) => this.case_lookup(),
+            StaticDispatchInstanceOperation::Swfs(this) => this.case_lookup(),
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.case_lookup(),
         }
     }
 
@@ -998,15 +1912,21 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.names_folding_to(path, name).await,
             StaticDispatchInstanceOperation::Os(this) => this.names_folding_to(path, name).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.names_folding_to(path, name).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.names_folding_to(path, name).await,
         }
     }
 
     async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
+        #[cfg(feature = "test-util")]
+        self.directory_reads.fetch_add(1, Ordering::Relaxed);
         match &self.dispatch {
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.read_directory(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.read_directory(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.read_directory(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.read_directory(path).await,
         }
     }
 
@@ -1019,6 +1939,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.content_source(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.content_source(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.content_source(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.content_source(path).await,
         }
     }
 
@@ -1026,25 +1948,65 @@ impl InstanceOperation for InstanceOperationImpl {
         &self,
         repository: Arc<RepositoryContext>,
         path: &RelativePath,
+        mtime: u64,
         previous: Address,
         previous_size: u64,
         established: &lore_storage::ContentHashes,
     ) -> Result<NodeComparison, FsError> {
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => {
+                this.file_holds_content(
+                    repository,
+                    path,
+                    mtime,
+                    previous,
+                    previous_size,
+                    established,
+                )
+                .await
+            }
             StaticDispatchInstanceOperation::Os(this) => {
-                this.file_holds_content(repository, path, previous, previous_size, established)
-                    .await
+                this.file_holds_content(
+                    repository,
+                    path,
+                    mtime,
+                    previous,
+                    previous_size,
+                    established,
+                )
+                .await
             }
             StaticDispatchInstanceOperation::Swfs(this) => {
-                this.file_holds_content(repository, path, previous, previous_size, established)
-                    .await
+                this.file_holds_content(
+                    repository,
+                    path,
+                    mtime,
+                    previous,
+                    previous_size,
+                    established,
+                )
+                .await
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.file_holds_content(
+                    repository,
+                    path,
+                    mtime,
+                    previous,
+                    previous_size,
+                    established,
+                )
+                .await
             }
         }
     }
 
     async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1053,58 +2015,117 @@ impl InstanceOperation for InstanceOperationImpl {
                 this.make_executable(path, executable).await
             }
             StaticDispatchInstanceOperation::Swfs(this) => {
+                this.make_executable(path, executable).await
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
                 this.make_executable(path, executable).await
             }
         }
     }
 
     async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.create_dir_all(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.create_dir_all(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.create_dir_all(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.create_dir_all(path).await,
         }
     }
 
     async fn write_file(&self, path: &RelativePath, contents: Bytes) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.write_file(path, contents).await,
             StaticDispatchInstanceOperation::Os(this) => this.write_file(path, contents).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.write_file(path, contents).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.write_file(path, contents).await,
         }
     }
 
     async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.rename(from, to).await,
             StaticDispatchInstanceOperation::Os(this) => this.rename(from, to).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.rename(from, to).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.rename(from, to).await,
+        }
+    }
+
+    async fn names_one_entry(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<Option<bool>, FsError> {
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.names_one_entry(from, to).await,
+            StaticDispatchInstanceOperation::Os(this) => this.names_one_entry(from, to).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.names_one_entry(from, to).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.names_one_entry(from, to).await,
         }
     }
 
     async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.remove(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.remove(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.remove(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.remove(path).await,
+        }
+    }
+
+    async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        self.record_change();
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.remove_empty_directory(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.remove_empty_directory(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.remove_empty_directory(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.remove_empty_directory(path).await,
         }
     }
 
     async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.remove_recursive(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.remove_recursive(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.remove_recursive(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.remove_recursive(path).await,
         }
     }
 
@@ -1114,14 +2135,23 @@ impl InstanceOperation for InstanceOperationImpl {
         node: &Node,
         path: &RelativePath,
     ) -> Result<FileInfo, FsError> {
+        if self.dry_run {
+            return Ok(FileInfo::from_node_and_mtime(node, 0));
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => {
+                this.write_node(repository, node, path).await
+            }
             StaticDispatchInstanceOperation::Os(this) => {
                 this.write_node(repository, node, path).await
             }
             StaticDispatchInstanceOperation::Swfs(this) => {
+                this.write_node(repository, node, path).await
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
                 this.write_node(repository, node, path).await
             }
         }
@@ -1133,6 +2163,9 @@ impl InstanceOperation for InstanceOperationImpl {
         address: Address,
         path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
+        if self.dry_run {
+            return Ok((Fragment::default(), None));
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1142,6 +2175,11 @@ impl InstanceOperation for InstanceOperationImpl {
                     .await
             }
             StaticDispatchInstanceOperation::Swfs(this) => {
+                this.set_file_to_immutable_store_contents(repository, address, path)
+                    .await
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
                 this.set_file_to_immutable_store_contents(repository, address, path)
                     .await
             }
@@ -1153,6 +2191,9 @@ impl InstanceOperation for InstanceOperationImpl {
         source_path: &RelativePath,
         destination_path: &RelativePath,
     ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1161,6 +2202,10 @@ impl InstanceOperation for InstanceOperationImpl {
                 this.copy_file(source_path, destination_path).await
             }
             StaticDispatchInstanceOperation::Swfs(this) => {
+                this.copy_file(source_path, destination_path).await
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
                 this.copy_file(source_path, destination_path).await
             }
         }
@@ -1172,27 +2217,41 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.infer_is_diffable(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.infer_is_diffable(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_diffable(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.infer_is_diffable(path).await,
         }
     }
 
-    async fn infer_is_conflicted(&self, path: &RelativePath) -> Result<bool, FsError> {
+    async fn infer_is_conflicted(&self, path: &RelativePath) -> Result<ConflictMarkers, FsError> {
         match &self.dispatch {
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.infer_is_conflicted(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.infer_is_conflicted(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_conflicted(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.infer_is_conflicted(path).await,
         }
     }
 
-    fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16) {
+    fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16, mtime: u64) {
         if !self.holds_state {
             return;
         }
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(this) => this.stored(path, address, size, mode),
-            StaticDispatchInstanceOperation::Os(this) => this.stored(path, address, size, mode),
-            StaticDispatchInstanceOperation::Swfs(this) => this.stored(path, address, size, mode),
+            StaticDispatchInstanceOperation::Test(this) => {
+                this.stored(path, address, size, mode, mtime);
+            }
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.stored(path, address, size, mode, mtime);
+            }
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.stored(path, address, size, mode, mtime);
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.stored(path, address, size, mode, mtime);
+            }
         }
     }
 
@@ -1201,7 +2260,7 @@ impl InstanceOperation for InstanceOperationImpl {
         repository: Arc<RepositoryContext>,
         committed: Arc<State>,
     ) -> Result<(), FsError> {
-        if !self.holds_state || execution_context().globals().dry_run() {
+        if !self.holds_state || self.dry_run {
             return Ok(());
         }
         self.record_change();
@@ -1214,6 +2273,10 @@ impl InstanceOperation for InstanceOperationImpl {
                 this.committed(repository, committed).await
             }
             StaticDispatchInstanceOperation::Swfs(this) => {
+                this.committed(repository, committed).await
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
                 this.committed(repository, committed).await
             }
         }
@@ -1235,6 +2298,7 @@ pub mod test_util {
     use lore_error_set::prelude::*;
     use parking_lot::Mutex;
 
+    use crate::fs::filesystem_provider::CaseLookup;
     use crate::fs::filesystem_provider::DirectoryListing;
     use crate::fs::filesystem_provider::FileInfo;
     use crate::fs::filesystem_provider::FilesystemDiffContext;
@@ -1264,8 +2328,12 @@ pub mod test_util {
     /// handed over before the call)`.
     pub type StoredCalls = Arc<Mutex<Vec<(String, Address, u64, u16, bool)>>>;
 
-    /// Answers the reads and the directory create these tests make, and records each finalize,
-    /// `stored` and `committed` call and hold. Every other member panics.
+    /// Answers the reads and the directory create these tests make, refuses each rename unless
+    /// `refuses_rename` says otherwise, and records each finalize, `stored` and `committed` call,
+    /// hold, warm-up of the held ignore file and recursive removal, which removes nothing. Where it
+    /// reads from a directory, it also writes and removes single entries there. `write_fails` fails
+    /// only the directory create. Every other member panics.
+    #[derive(Default)]
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
         pub holds_name_count: Arc<AtomicUsize>,
@@ -1273,12 +2341,20 @@ pub mod test_util {
         pub finalize_events: Arc<Mutex<Vec<bool>>>,
         pub finalize_fails: bool,
         pub write_fails: bool,
+        /// Whether the provider cannot describe any path, as one that cannot stat the working
+        /// tree.
+        pub file_info_fails: bool,
+        /// Paths the provider cannot describe.
+        pub failing_file_infos: Arc<Mutex<Vec<String>>>,
         pub holds_paths: bool,
         /// Whether the provider cannot name the content at any path.
         pub content_source_fails: bool,
         /// Whether the provider holds no file at any path.
         pub content_source_missing: bool,
         pub hold_calls: HoldCalls,
+        /// How many times the held ignore file was read into the store
+        /// ([`InstanceOperationImpl::warm_held_ignore_file`]).
+        pub warm_count: Arc<AtomicUsize>,
         pub stored_calls: StoredCalls,
         pub committed_calls: CommittedCalls,
         /// Whether each `committed` call fails.
@@ -1292,6 +2368,38 @@ pub mod test_util {
         /// Paths whose scan finds the named node of the tree it walks stale, and queues it for
         /// discarding where it is handed a queue.
         pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
+        /// Paths each recursive removal was asked for, which removes nothing.
+        pub removed: Arc<Mutex<Vec<String>>>,
+        /// How `names_one_entry` answers.
+        pub identity: TestIdentity,
+        /// What `case_lookup` answers.
+        pub case_lookup: CaseLookup,
+        /// How many directories were read.
+        pub directory_reads: Arc<AtomicUsize>,
+        /// How many directory creates were asked for.
+        pub directory_creates: Arc<AtomicUsize>,
+        /// Paths each removal of an empty directory was asked for.
+        pub empty_directory_removals: Arc<Mutex<Vec<String>>>,
+        /// How many renames were asked for.
+        pub rename_count: Arc<AtomicUsize>,
+        /// The error that refuses each rename, by the number of renames asked for before it, or
+        /// `None` to carry it out in the directory the provider reads from. Without it, or without
+        /// a directory to read from, every rename is refused.
+        pub refuses_rename: Option<fn(usize) -> Option<FsError>>,
+    }
+
+    /// How a [`TestOperation`] answers `names_one_entry`.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub enum TestIdentity {
+        /// From the paths as spelled, as a file system that does not fold case does.
+        #[default]
+        Exact,
+        /// From the paths folded, as a file system that folds case does.
+        Folded,
+        /// As though `from` names nothing, as a path whose entry is gone does.
+        NamesNothing,
+        /// With an error, as a file system that cannot read what a path names does.
+        Fails,
     }
 
     impl TestOperation {
@@ -1366,9 +2474,19 @@ pub mod test_util {
         }
 
         /// Counts the lookup, and reports what the directory it reads from holds where given and
-        /// otherwise what the provider was told to hold.
+        /// otherwise what the provider was told to hold, except where it was told it cannot
+        /// describe the path.
         async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
+            if self.file_info_fails
+                || self
+                    .failing_file_infos
+                    .lock()
+                    .iter()
+                    .any(|failing| failing == path.as_str())
+            {
+                return Err(FsError::internal("File information failed"));
+            }
             match &self.reads {
                 Some(reads) => reads.file_info(path).await,
                 None => Ok(self.held()),
@@ -1401,8 +2519,17 @@ pub mod test_util {
             })
         }
 
-        async fn read_directory(&self, _path: &RelativePath) -> Result<DirectoryListing, FsError> {
-            panic!("Test operation unimplemented except finalize")
+        fn case_lookup(&self) -> CaseLookup {
+            self.case_lookup
+        }
+
+        /// Lists the directory the provider reads from, and panics where it reads from none.
+        async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
+            self.directory_reads.fetch_add(1, Ordering::AcqRel);
+            match &self.reads {
+                Some(reads) => reads.read_directory(path).await,
+                None => panic!("Test operation reads no directory"),
+            }
         }
 
         /// The file under the directory the provider reads from. Reports no file where the
@@ -1427,15 +2554,32 @@ pub mod test_util {
             }
         }
 
+        /// Compares the file under the directory the provider reads from, and panics where it
+        /// reads from none.
         async fn file_holds_content(
             &self,
-            _repository: Arc<RepositoryContext>,
-            _path: &RelativePath,
-            _previous: Address,
-            _previous_size: u64,
-            _established: &lore_storage::ContentHashes,
+            repository: Arc<RepositoryContext>,
+            path: &RelativePath,
+            mtime: u64,
+            previous: Address,
+            previous_size: u64,
+            established: &lore_storage::ContentHashes,
         ) -> Result<NodeComparison, FsError> {
-            panic!("Test operation unimplemented except finalize")
+            match &self.reads {
+                Some(reads) => {
+                    reads
+                        .file_holds_content(
+                            repository,
+                            path,
+                            mtime,
+                            previous,
+                            previous_size,
+                            established,
+                        )
+                        .await
+                }
+                None => panic!("Test operation unimplemented except finalize"),
+            }
         }
 
         async fn make_executable(
@@ -1446,37 +2590,91 @@ pub mod test_util {
             panic!("Test operation unimplemented except finalize")
         }
 
-        /// Succeeds without a tree behind it, or fails where the provider was told writes fail.
-        async fn create_dir_all(&self, _path: &RelativePath) -> Result<(), FsError> {
+        /// Creates the directory under the directory the provider reads from, where it reads from
+        /// one, and otherwise succeeds without a tree behind it; fails where the provider was told
+        /// writes fail. Counts each call in `directory_creates`.
+        async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
+            self.directory_creates.fetch_add(1, Ordering::Relaxed);
             if self.write_fails {
                 return Err(FsError::internal("Write failed"));
             }
+            match &self.reads {
+                Some(reads) => reads.create_dir_all(path).await,
+                None => Ok(()),
+            }
+        }
+
+        /// Writes under the directory the provider reads from, and panics where it reads from none.
+        async fn write_file(&self, path: &RelativePath, contents: Bytes) -> Result<(), FsError> {
+            match &self.reads {
+                Some(reads) => reads.write_file(path, contents).await,
+                None => panic!("Test operation unimplemented except finalize"),
+            }
+        }
+
+        /// Counts the rename, and refuses it, as a file system that cannot carry it does, or
+        /// carries it out as `refuses_rename` says.
+        async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
+            let asked = self.rename_count.fetch_add(1, Ordering::AcqRel);
+            match (&self.reads, self.refuses_rename) {
+                (Some(reads), Some(refuses)) => match refuses(asked) {
+                    Some(refused) => Err(refused),
+                    None => reads.rename(from, to).await,
+                },
+                _ => Err(FsError::internal("Rename refused")),
+            }
+        }
+
+        /// Answers for the paths alone, as [`TestIdentity`] says.
+        async fn names_one_entry(
+            &self,
+            from: &RelativePath,
+            to: &RelativePath,
+        ) -> Result<Option<bool>, FsError> {
+            match self.identity {
+                TestIdentity::Exact => Ok(Some(from.as_str() == to.as_str())),
+                TestIdentity::Folded => Ok(Some(from.as_lowercase_str() == to.as_lowercase_str())),
+                TestIdentity::NamesNothing => Ok(None),
+                TestIdentity::Fails => Err(FsError::internal("The entries cannot be told apart")),
+            }
+        }
+
+        /// Removes under the directory the provider reads from, and panics where it reads from
+        /// none.
+        async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
+            match &self.reads {
+                Some(reads) => reads.remove(path).await,
+                None => panic!("Test operation unimplemented except finalize"),
+            }
+        }
+
+        /// Records the path and removes under the directory the provider reads from, and panics
+        /// where it reads from none.
+        async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
+            self.empty_directory_removals.lock().push(path.to_string());
+            match &self.reads {
+                Some(reads) => reads.remove_empty_directory(path).await,
+                None => panic!("Test operation unimplemented except finalize"),
+            }
+        }
+
+        /// Records the path, removing nothing.
+        async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
+            self.removed.lock().push(path.to_string());
             Ok(())
         }
 
-        async fn write_file(&self, _path: &RelativePath, _contents: Bytes) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
-        }
-
-        async fn rename(&self, _from: &RelativePath, _to: &RelativePath) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
-        }
-
-        async fn remove(&self, _path: &RelativePath) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
-        }
-
-        async fn remove_recursive(&self, _path: &RelativePath) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
-        }
-
+        /// Writes under the directory the provider reads from, and panics where it reads from none.
         async fn write_node(
             &self,
-            _repository: Arc<RepositoryContext>,
-            _node: &Node,
-            _path: &RelativePath,
+            repository: Arc<RepositoryContext>,
+            node: &Node,
+            path: &RelativePath,
         ) -> Result<FileInfo, FsError> {
-            panic!("Test operation unimplemented except finalize")
+            match &self.reads {
+                Some(reads) => reads.write_node(repository, node, path).await,
+                None => panic!("Test operation unimplemented except finalize"),
+            }
         }
 
         async fn set_file_to_immutable_store_contents(
@@ -1497,7 +2695,7 @@ pub mod test_util {
         }
 
         /// Records what was stored, and whether a revision had been handed over before.
-        fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16) {
+        fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16, _mtime: u64) {
             let handed_over = !self.committed_calls.lock().is_empty();
             self.stored_calls.lock().push((
                 path.as_str().to_owned(),

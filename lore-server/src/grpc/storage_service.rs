@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -46,8 +47,11 @@ use super::rpc_code_to_str;
 use super::send_err;
 use super::simple_map_message_handle_error;
 use super::warn_error_to_status;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::get_user_id;
+use crate::grpc::require_action;
+use crate::grpc::until_request_cancelled;
 use crate::legacy::rpc::storage_service_server::StorageService;
 use crate::protocol::attribute_map::get_user_id_from_context;
 use crate::protocol::attribute_map::repository_id_from_context;
@@ -109,6 +113,15 @@ impl LoreStorageService {
     }
 }
 
+/// The status code for a handler error when the calling RPC doesn't assign one. A slow-down maps
+/// to `RESOURCE_EXHAUSTED`; all other errors map to `INTERNAL`.
+fn unmapped_error_code(err: &MessageHandleError) -> Code {
+    match err {
+        MessageHandleError::SlowDown => Code::ResourceExhausted,
+        _ => Code::Internal,
+    }
+}
+
 #[tonic::async_trait]
 impl StorageService for LoreStorageService {
     type GetStream = GetResponseStream;
@@ -124,7 +137,7 @@ impl StorageService for LoreStorageService {
         )?);
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-        let mut stream = request.into_inner();
+        let stream = request.into_inner();
 
         // TODO(psharpe): Make channel capacity configurable
         let (tx, rx) = mpsc::channel(8192);
@@ -137,6 +150,9 @@ impl StorageService for LoreStorageService {
             Arc::new(self.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY));
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+            // Ends once nobody reads the answers. An item already started finishes, so no
+            // store operation is cut off part way.
+            let mut stream = pin!(until_request_cancelled(stream));
             while let Some(request) = stream.next().await {
                 let immutable_store = immutable_store.clone();
                 let repository_authorizer = repository_authorizer.clone();
@@ -203,7 +219,7 @@ impl StorageService for LoreStorageService {
                                     ),
                                     default => warn_error_to_status(&default, |err| {
                                         Status::with_details(
-                                            Code::Internal,
+                                            unmapped_error_code(err),
                                             format!("Error from get handler: {err}"),
                                             request.address.into(),
                                         )
@@ -263,6 +279,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::PutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
+        require_action(&self.repository_authorizer, &request, Action::Write).await?;
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -271,7 +288,7 @@ impl StorageService for LoreStorageService {
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
         // Stream of fragments
-        let mut stream = request.into_inner();
+        let stream = request.into_inner();
 
         // TODO(psharpe): make this capacity configurable or unbounded
         let (tx, rx) = mpsc::channel(8192);
@@ -284,6 +301,9 @@ impl StorageService for LoreStorageService {
             Arc::new(self.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY));
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+            // Ends once nobody reads the answers. An item already started finishes, so no
+            // store operation is cut off part way.
+            let mut stream = pin!(until_request_cancelled(stream));
             while let Some(req) = stream.next().await {
                 let immutable_store = immutable_store.clone();
                 let repository_authorizer = repository_authorizer.clone();
@@ -364,10 +384,13 @@ impl StorageService for LoreStorageService {
                                         )),
                                         Err(err) => {
                                             let response = warn_error_to_status(&err, |err| {
-                                                Status::internal(format!(
-                                                    "Error storing fragment {}: {err}",
-                                                    request.address()
-                                                ))
+                                                Status::new(
+                                                    unmapped_error_code(err),
+                                                    format!(
+                                                        "Error storing fragment {}: {err}",
+                                                        request.address()
+                                                    ),
+                                                )
                                             });
                                             Err(response)
                                         }
@@ -478,6 +501,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
+        require_action(&self.repository_authorizer, &request, Action::Write).await?;
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -485,7 +509,7 @@ impl StorageService for LoreStorageService {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
-        let mut stream = request.into_inner();
+        let stream = request.into_inner();
 
         let (tx, rx) = mpsc::channel(8192);
         let immutable_store = self.immutable_store.clone();
@@ -498,6 +522,9 @@ impl StorageService for LoreStorageService {
             LORE_CONTEXT.scope(
                 execution,
                 async move {
+                    // Ends once nobody reads the answers. An item already started finishes, so no
+                    // store operation is cut off part way.
+                    let mut stream = pin!(until_request_cancelled(stream));
                     while let Some(req) = stream.next().await {
                         let immutable_store = immutable_store.clone();
                         let repository_authorizer = repository_authorizer.clone();
@@ -600,7 +627,7 @@ impl StorageService for LoreStorageService {
                                                             msg.source_address.into(),
                                                         ),
                                                         _ => Status::with_details(
-                                                            Code::Internal,
+                                                            unmapped_error_code(err),
                                                             format!(
                                                                 "Error copying fragment: {err}"
                                                             ),
@@ -649,6 +676,10 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<lore_proto::VerifyRequest>,
     ) -> Result<Response<lore_proto::VerifyResponse>, Status> {
+        // Healing drops the server's index entries for a corrupt fragment.
+        if request.get_ref().heal {
+            require_action(&self.repository_authorizer, &request, Action::Write).await?;
+        }
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
@@ -674,10 +705,10 @@ impl StorageService for LoreStorageService {
                         heal: if req.heal { 1 } else { 0 },
                     };
 
-                    msg.handle(
+                    msg.handle_with(
                         context,
                         self.local_store.clone(),
-                        self.repository_authorizer.clone(),
+                        self.immutable_store.clone(),
                     )
                     .await
                     .map(|resp| {
@@ -747,6 +778,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<lore_proto::MutableStoreRequest>,
     ) -> Result<Response<lore_proto::MutableStoreResponse>, Status> {
+        require_action(&self.repository_authorizer, &request, Action::Write).await?;
         let mutable_store = self.mutable_store.clone();
 
         let user_id = get_user_id(request.extensions());
@@ -785,6 +817,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<lore_proto::MutableCompareAndSwapRequest>,
     ) -> Result<Response<lore_proto::MutableCompareAndSwapResponse>, Status> {
+        require_action(&self.repository_authorizer, &request, Action::Write).await?;
         let mutable_store = self.mutable_store.clone();
 
         let user_id = get_user_id(request.extensions());

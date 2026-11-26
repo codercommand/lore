@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 
 use crate::change;
 use crate::change::NodeChange;
+use crate::errors::Cancelled;
 use crate::errors::InvalidArguments;
 use crate::errors::SlowDown;
 use crate::filter::FilterMode;
@@ -27,6 +28,7 @@ use crate::util::path::RelativePath;
 
 #[error_set]
 pub enum DiffError {
+    Cancelled,
     InvalidArguments,
     SlowDown,
 }
@@ -93,10 +95,21 @@ pub async fn diff_revision_paths(
                 let Some(change) = walk.next().await else {
                     break;
                 };
-                let permit = task_tx
+                let permit = match task_tx
                     .reserve()
                     .await
-                    .internal("revision diff receiver dropped")?;
+                    .internal("revision diff receiver dropped")
+                {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        // Abandoned rather than dropped, so the walk is joined on every path:
+                        // closing its channel stops it at its next emit, and this task reports
+                        // once it has. The walk's complaint that its receiver went away is this
+                        // task's own doing, so the failure that caused it is the one reported.
+                        walk.abandon().await;
+                        return Err(DiffError::from(err));
+                    }
+                };
                 permit.send(Ok(change));
             }
             walk.finish()
@@ -166,18 +179,19 @@ async fn diff_filesystem_paths_in(
             let mut exists_in_state = false;
             let mut exists_in_filesystem = false;
 
-            let node_link = state_from
-                .find_node_link(repository.clone(), path.as_str())
+            let found = state_from
+                .locate_node(repository.clone(), path.as_str())
                 .await
                 .unwrap_or_default();
-            if node_link.is_valid() {
+            if found.is_valid() {
                 exists_in_state = true;
             } else {
                 let repository_path = path.clone();
                 exists_in_filesystem = operation
                     .file_info(&repository_path)
                     .await
-                    .is_ok_and(|info| info.exists());
+                    .forward_any::<DiffError>("Failed to describe a path to diff")?
+                    .exists();
             }
 
             if !exists_in_state && !exists_in_filesystem {

@@ -64,6 +64,16 @@ Environment-variable overrides apply last, after every file layer, so they win o
 > [!NOTE]
 > Only scalar fields can be set this way. Array-valued fields — such as the `peers` list under `[topology.fixed]` — cannot be overridden through a single environment variable; configure those in a file layer instead.
 
+## Runtime environment variables
+
+This variable is not a settings field, so it has no `LORE__` form and no config-file key. The server reads it once, when it builds its async runtime at startup.
+
+| Variable | Values | Default | Effect |
+| --- | --- | --- | --- |
+| `LORE_CORE_TIMER` | `per-worker`, `shared` | `per-worker` | The timer the server's core runtime keeps its sleeps and timeouts in. `per-worker` gives each worker thread its own timer, which suits a server whose requests set many timers at once. `per-worker` is Tokio's unstable alternative timer; `shared` selects Tokio's default timer, one for the whole runtime, without a rebuild. |
+
+Unset or blank, `LORE_CORE_TIMER` is `per-worker`. Surrounding whitespace is ignored. Any other value keeps `per-worker`, and the server logs a warning once its logging is set up. Only the server reads it: the CLI and programs that embed Lore always use the shared timer.
+
 ## Zero-config defaults
 
 With no config files loaded, the server runs as a self-contained, single-node instance, substituting ephemeral local artifacts for what a production deployment would configure. It logs each substitution so the choice is visible.
@@ -88,6 +98,8 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 | --- | --- | --- |
 | `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close after a shutdown signal. |
 | `server.runtime_shutdown_timeout_seconds` | `25` | Seconds to wait for the async runtime to shut down after connections close. Accepts the alias `shutdown_delay_seconds`. |
+| `server.trust_unsigned_identity` | `false` | Without `[server.auth]`, take the caller's identity from an unsigned bearer token on gRPC, HTTP and QUIC. See [Unsigned identity](#unsigned-identity). The server refuses to start if it is set beside `[server.auth]`. |
+| `server.upstream_connections` | `4` | Storage connections the server opens to the [upstream](../glossary.md#upstream) of a `remote` immutable or mutable store for each identity it authenticates there as (see [Remote store mode](#remote-store-mode)), from `1` to `10`; `0` reads as `1`. The connections belong to the upstream and the identity, not to a repository: every repository the server reaches there as that identity shares them, as do its QUIC, gRPC and socket handlers. |
 
 ### Advertised endpoints
 
@@ -96,12 +108,34 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 | Field | Default | Description |
 | --- | --- | --- |
 | `auth_url` | none | The authentication service clients log in at and exchange tokens with. Setting it requires `[server.auth]`. If `auth_url` and `[server.auth]` are not set, starts the server unauthenticated. |
-| `user_url` | `auth_url` | The user directory that clients use to resolve user IDs to display names, and back. If not set, uses `auth_url` as the user service. If both are unset, falls back to an offline resolver that returns user IDs as names. |
+| `user_url` | none | A user directory served over `lore.user.v1.UserService`, which clients use to resolve user IDs to display names, and back. If not set, clients speak the `UrcAuthApi` `GetUserInfo` and `GetUserId` RPCs to `auth_url` instead. If neither is set, clients fall back to an offline resolver that returns user IDs as names. When set, the server also calls `lore.user.v1.RepositoryRegistryService` there: its repository catalog lists repositories with `RepositoryList` by default (see `repository_catalog`), and it registers the repositories it creates and deletes with `RepositoryRegister` and `RepositoryUnregister` instead of the `RebacApi` `CreateResource` and `DeleteResource` calls to `auth_url`. A refused `RepositoryRegister` fails the create, and a refused `RepositoryUnregister` the delete. |
+| `storage_url` | none | The endpoint advertised for the storage service. If not set, clients use the server they connected to. |
+| `repository_url` | none | The endpoint advertised for the repository service. If not set, clients use the server they connected to. |
+| `revision_url` | none | The endpoint advertised for the revision service. If not set, clients use the server they connected to. |
+| `lock_url` | none | The endpoint advertised for the lock service. If not set, clients use the server they connected to. |
+| `notification_url` | none | The endpoint advertised for the notification service. If not set, clients use the server they connected to. |
 
 ```toml
 [environment.endpoint]
 auth_url = "ucs-auth://auth.example.com"
 user_url = "ucs-auth://directory.example.com"
+```
+
+A client connected over `lores://` refuses to connect if the server advertises a `storage_url`, `repository_url`, `revision_url`, `lock_url`, or `notification_url` whose scheme doesn't authenticate the server, such as `lore://`. Give these endpoints a scheme that does, such as `lores://`.
+
+### Advertised client settings
+
+`[environment.config]` defines settings the environment service hands to clients with the endpoints. Every field is optional. Where a store limits a batch, the server narrows the advertised value to that limit.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `max_query_batch` | none | The most addresses a client puts in one storage query. When the immutable store has a limit, `0` or unset advertises that limit, and any other value advertises the smaller of the two. Otherwise the value is advertised as set, and a client told `0` uses its own default. |
+| `max_lock_batch` | none | The most resources a client puts in one lock, unlock or lock status request. A client splits a larger request into batches of this size. `0` or unset advertises the lock store's limit, and any other value advertises the smaller of the two. The limit is 100 for both the `local` and the `aws` lock stores. The lock service refuses a request with more resources than the limit. |
+| `compression_mode` | none | The codec the server asks clients to compress new payloads with: `NoCompression`, `Lz4` or `Zstd`. `Oodle` is advertised as `Zstd`. A client that already has a mode selected keeps it. Unset leaves the choice to the client. |
+
+```toml
+[environment.config]
+max_lock_batch = 50
 ```
 
 ### Local store disk space
@@ -130,9 +164,12 @@ At startup the server also reports where each local store lands, warning when th
 | `idle_timeout` | `30000` | Connection idle timeout in milliseconds. |
 | `keep_alive` | `500` | Keep-alive interval in milliseconds. |
 | `max_bidi_streams` | `8` | Maximum concurrent bidirectional streams per connection. |
-| `num_listeners` | `10` | Number of listener tasks. |
+| `num_listeners` | `1` | Accept tasks per socket. One keeps up, as an accept task only hands each connection to a task of its own. |
+| `num_sockets` | `16`, or one per processor on a machine with fewer (`quic`); `4` (`quic_internal`) | UDP sockets bound to `port` with `SO_REUSEPORT`, each with its own QUIC endpoint and receive buffer of about 2.9 MiB. Linux hands each datagram to one socket by a hash of its source and destination, which spreads the clients across the sockets; other platforms bind one. Each socket asks the kernel for a 512 KiB receive buffer, which Linux caps at `net.core.rmem_max`. The sockets share the limits on connections not yet accepted, 65,536 attempts and 100 MiB of buffered datagrams. A client whose address changes mid-connection can reach another socket, whose endpoint resets the connection; the client reconnects. |
 | `transport_bits_per_second` | `1073741824` (`quic`), `10737418240` (`quic_internal`) | Transport bandwidth estimate in bits per second. |
-| `transport_rtt` | `100` | Expected round-trip time in milliseconds. |
+| `transport_rtt` | `100` (`quic`), `220` (`quic_internal`) | Expected round-trip time in milliseconds. Together with `transport_bits_per_second` it sizes the receive and send windows of every connection the endpoint accepts: how much a client may have in flight, and how much of a response the server holds until it is acknowledged. One value serves every client, so set it for the most distant one; a window sized too short limits a distant client's throughput, and a nearer client never fills a larger one. Each connection may buffer up to one window in each direction, so a larger value raises the server's worst-case memory per connection. The internal endpoint's default covers peers in other regions. |
+| `initial_cwnd_bytes` | none (`quic`), `1048576` (`quic_internal`) | Congestion window, in bytes, that each accepted connection starts with: how much the server sends before the peer's first acknowledgements arrive. The congestion controller may cap it at the send window derived from `transport_bits_per_second` and `transport_rtt`. When unset, `quic` uses the congestion controller's own default and `quic_internal` always uses `1048576`. At least `2400`. |
+| `congestion_algorithm` | `bbr` (`quic`), `cubic` (`quic_internal`) | Congestion controller of each connection the endpoint accepts: `bbr` or `cubic`. It paces only what the server sends, such as the data of a get. What a client sends, such as the data of a put, follows the client's controller: a CLI or storage API client's is the one `LORE_QUIC_CONGESTION_ALGORITHM` names, another server's `remote` store's is its `congestion_algorithm` (see [Remote store mode](#remote-store-mode)), and on `quic_internal`, a peer's replicated store's is the `congestion_algorithm` of its `[immutable_store.replicated]` table, Cubic unless configured (see [Replicated store mode](#replicated-store-mode)). [Environment variables](lore-cli-config.md#environment-variables) in the Lore CLI configuration reference says when to choose which. Any other value fails startup. |
 | `handler_timeout_seconds` | `50` | Per-request handler timeout. Guards against handlers that hang indefinitely. |
 | `connection_message_limit` | none | Maximum in-flight messages per connection. When unset, the server falls back to `500` for the public endpoint and `50000` for the internal endpoint. |
 
@@ -171,7 +208,7 @@ Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.qu
 
 #### `presigned_url_hmac_key`
 
-This field is optional. When it's absent, the server starts with the presigned URL feature disabled and logs `Presigned URL feature disabled (presigned_url_hmac_key not configured)`. When it's set, the value must be valid hexadecimal that decodes to at least 32 bytes — generate one with `openssl rand -hex 32`. An invalid or too-short key stops the server from starting. Set this only for deployments that hand out presigned URLs, and use a fresh key per deployment.
+This field is optional. When it's absent, the server starts with the presigned URL feature disabled and logs `Presigned URL feature disabled (presigned_url_hmac_key not configured)`. When it's set, the value must be valid hexadecimal that decodes to at least 32 bytes — generate one with `openssl rand -hex 32`. An invalid or too-short key stops the server from starting. Set this only for deployments that hand out presigned URLs, and use a fresh key per deployment. Vending a presigned URL needs the `presign` permission on the repository. Without `[server.auth]`, every caller holds it.
 
 #### Presigned URL content types
 
@@ -363,6 +400,18 @@ absent by default, and no RPC is forwarded until it is named under `enabled_rpcs
 per forwardable RPC, all `false` by default. Releases add to the set; an unknown
 key here is ignored, so a name that is not yet forwardable forwards nothing.
 
+`lock_query`, `lock_lock`, `lock_status` and `lock_unlock` forward the lock
+service's `Query`, `Lock`, `Status` and `Unlock`. The peer answers them only if
+its own `[lock_store]` is at a mode other than `none`; otherwise it answers
+`UNIMPLEMENTED`, which the forwarding server relays to its client. The
+forwarding server authorizes the caller before it forwards, including whether
+an `Unlock` may release other users' locks, and the peer sends the lock and
+unlock notifications. The peer trusts that authorization, as it does for every
+forwarded RPC, so only Lore servers should hold a client certificate its
+internal endpoint accepts. A peer running a release without one of
+these RPCs answers it `UNIMPLEMENTED` as well, so upgrade the peer before
+turning a flag on.
+
 `[server.grpc_public_services.forwarded_requests.client]` configures the channel to
 the peer. The defaults suit a long-lived connection that sits idle between
 forwards; tune them to the path the peer is actually reached over:
@@ -392,7 +441,7 @@ repository_get = true
 
 ### Authentication
 
-`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` is defined, JWT verification is enabled. If it is absent, the services accept unauthenticated requests. If `[server.auth.jwk].endpoint` is set, it will be used as the JWKS endpoint. If not, the validation keys will be discovered from JWT issuer OIDC discovery document.
+`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` is defined, JWT verification is enabled. If it is absent, the services accept unauthenticated requests, and every caller holds `read`, `write`, `obliterate` and `presign` on every partition. Repository delete and branch protection, which otherwise need `owner` or `admin`, or `write` for the repository's creator, need only `write` there, since an unauthenticated caller has no identity to compare with the creator. With `[server.auth]`, `set-protected` also permits branch protection; `lore branch protect` and `lore branch unprotect` also need `write`. If `[server.auth.jwk].endpoint` is set, it will be used as the JWKS endpoint. If not, the validation keys will be discovered from JWT issuer OIDC discovery document.
 
 When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandatory and the server refuses to start without them: A deployment that verifies tokens without pinning issuer would accept tokens from any issuer. And a deployment that doesn't pin the audience would accept tokens minted for any service.
 
@@ -404,14 +453,16 @@ When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandat
 | `jwk` | none | The optional `[server.auth.jwk]` override sub-table below. |
 | `oidc` | none | The optional `[server.auth.oidc]` sub-table below, which configures the OIDC provider info shown to clients. |
 | `permission_claim` | none | Dotted path of the JWT claim carrying the caller's allowed actions, e.g. `realm_access.roles` (Keycloak) or `groups` (Dex). When using `GlobalGrantsAuthorizer` (Tier 1), this JWT claim defines where the user's global permissions are read from. When `resource_claim` is set and `ResourceGrantsAuthorizer` (Tier 2) is in use, it instead names the field inside each resource entry holding the per-partition actions, defaulting to `permission`. |
+| `implicit_actions` | `["write"]` | Actions every token holder gets under `GlobalGrantsAuthorizer` (Tier 1), added to those `permission_claim` carries and to `read`, which any token implies. Set `[]` to grant `write` through a role only, or, without `permission_claim`, to make the server read-only. Any of `read`, `write`, `owner`, `admin`, `migrate`, `push-protected`, `set-protected`, `obliterate` and `presign` may be listed; any other name is a configuration error. The server refuses to start with it set beside `resource_claim` or `auth_url`, where it would do nothing. |
 | `resource_claim` | none | Dotted path of the JWT claim carrying per-repository resource grants. If this is set, enables the granular `ResourceGrantsAuthorizer` (Tier 2) authorizer. |
 | `resource_id_claim` | `resource_id` | The field inside each resource entry that names the resource, for providers whose entry shape cannot be changed. Keycloak's UMA `authorization.permissions` entries carry the resource name in `rsname`, for example: set `resource_claim = "authorization.permissions"`, `resource_id_claim = "rsname"` and `permission_claim = "scopes"` to read them. Tier 2 only. |
 | `resource_id_template` | `urc-{id}` | Template that renders a repository id into the corresponding resource name. `{id}` is replaced by the repository id. When verifying permissions with `ResourceGrantsAuthorizer` (Tier 2), uses this string to search for the matching resource entry in the JWT. |
 | `resource_wildcard` | `urc-*` | The resource name that matches every repository. |
-| `identity_claim` | `sub` | The claim recorded and compared as the caller's identity. The value read from this claim will be recorded as the user ID in Lore revisions. Any unique string value can be used as the user ID. |
-| `baseline_access` | `denied` | What the `baseline` repository catalog answers to `lore repository list`: `denied` (the default) lists none, `reachable` lists every partition ID the server holds. Gates listing of the IDs only, never grants access to the contents. `denied` blocks no operation on a partition the caller holds a grant for. Not consulted by the `auth_service` catalog. A server with no `[server.auth]` lists everything it holds. |
-| `repository_catalog` | derived | Which catalog answers `lore repository list`: `auth_service` fetches the list from `UrcAuthApi` gRPC service's `LookupUserPermissions`. `baseline` fetches the list from the server's own store, based on `baseline_access` configuration rule. When unset, uses `auth_service` if `[environment.endpoint] auth_url` is set, and `baseline` otherwise. Set this to `auth_service` to keep an auth-service catalog on a deployment authorizing from token claims, or set it to `baseline` to list from the server store on a `UrcAuthApi` deployment. |
-| `repository_catalog_url` | `auth_url` | The `UrcAuthApi` endpoint the `auth_service` catalog asks. Defaults to `[environment.endpoint] auth_url`. This is required with `repository_catalog = "auth_service"` when `auth_url` is unset. The catalog forwards the caller's own token, so the endpoint must accept the tokens this server verifies. |
+| `baseline_access` | `denied` | What the `baseline` repository catalog answers to `lore repository list`: `denied` (the default) lists none, `reachable` lists every partition ID the server holds. Gates listing of the IDs only, never grants access to the contents. `denied` blocks no operation on a partition the caller holds a grant for. Not consulted by the `auth_service` or `user_service` catalogs. A server with no `[server.auth]` lists everything it holds. |
+| `repository_catalog` | derived | Which catalog answers `lore repository list`: `user_service` fetches the list from `RepositoryList` on the `lore.user.v1.RepositoryRegistryService` at `[environment.endpoint] user_url`, and requires `user_url`. `auth_service` fetches the list from `UrcAuthApi` gRPC service's `LookupUserPermissions`. `baseline` fetches the list from the server's own store, based on `baseline_access` configuration rule. When unset, uses `user_service` if `[environment.endpoint] user_url` is set, else `auth_service` if `auth_url` is set, and `baseline` otherwise. Both remote catalogs forward the caller's own token. A listing of more than 100,000 partitions fails with `RESOURCE_EXHAUSTED`. Set this to `auth_service` to keep an auth-service catalog on a deployment authorizing from token claims, or set it to `baseline` to list from the server store on a `UrcAuthApi` deployment. |
+| `repository_catalog_url` | `auth_url` | The `UrcAuthApi` endpoint the `auth_service` catalog asks. The `user_service` catalog ignores it and asks `user_url`. Defaults to `[environment.endpoint] auth_url`. This is required with `repository_catalog = "auth_service"` when `auth_url` is unset. The catalog forwards the caller's own token, so the endpoint must accept the tokens this server verifies. |
+
+The caller's identity, recorded as the creator of what the caller makes and compared wherever an identity is checked, is read from the token: its `identity` claim, or the namespaced alias `https://lore.org/claims/identity`, where the issuer mints one, and `sub` otherwise. No setting names it.
 
 `[server.auth.jwk]`:
 
@@ -435,9 +486,10 @@ When this table is present, the environment service advertises an OIDC provider 
 | Field | Default | Description |
 | --- | --- | --- |
 | `client_id` | required | The public client ID clients present to the provider. |
-| `scopes` | `[]` | Default scopes clients request at login. Empty leaves the choice to the client. |
+| `scopes` | `[]` | Default scopes clients request at an interactive (device) login. Empty leaves the choice to the client. |
+| `client_credentials_scopes` | `[]` | Scopes clients request when they log in with the client credentials grant, `lore auth login --client-id`. Set it for a provider that adds the claims Lore reads only for a requested scope. Empty requests no scope, which leaves the client's default scopes to the provider. `scopes` doesn't apply to this grant. Clients from the release that adds this setting on send the scopes; older clients send none. |
 | `preferred` | `false` | Whether a client should use OIDC auth rather than at `auth_url`, if both are configured. Used during migration to route clients to the old auth by default, while allowing testing of the new OIDC auth. |
-| `token_exchange_issuer` | `jwt_issuer` | The issuer of the RFC 8693 token-exchange endpoint that mints partition-scoped tokens. Defaults to the advertised issuer. Set it only when a separate token service does the partition scoped token exchange. Tier 2. |
+| `token_exchange_issuer` | `jwt_issuer` | The issuer of the RFC 8693 token-exchange endpoint that mints partition-scoped tokens. Set it only when a separate token service does the exchange, as an http or https issuer URL. If `jwt_issuer` lists it, the `jwt_issuer` keys verify its tokens. Otherwise, the server verifies a token naming the service as `iss` against the service's own keys, found through `<token_exchange_issuer>/.well-known/openid-configuration`, and every other token against the `jwt_issuer` keys. It fetches the service's keys at startup and doesn't start if it can't. `jwt_audience` and `jwt_typ` apply to the service's tokens too, and `[server.auth.jwk].endpoint` to the `jwt_issuer` keys only. Tier 2. |
 | `resource_template` | none | Template string for mapping a partition to an RFC 8707 resource, for example `https://lore.example.com/partitions/{id}`. `{id}` is replaced by the partition ID. Tier 2. |
 | `scope_template` | none | Template string for mapping a partition to a scope value, for example `partition:{id}`. For OIDC providers that use scope for token exchange, not `resource`. Tier 2. |
 
@@ -453,6 +505,74 @@ resource_claim = "resources"
 client_id = "lore-cli"
 scopes = ["openid", "offline_access"]
 resource_template = "https://lore.example.com/partitions/{id}"
+```
+
+#### Unsigned identity
+
+Without `[server.auth]`, the server records every caller as `<unknown>`, so a lock or a notification can't tell one user from another. With `server.trust_unsigned_identity = true`, the server reads the identity from a bearer token without checking its signature or the values of `iss`, `aud` and `exp`. The token must still carry `iss`, `sub`, `aud`, `iat` and `exp`. It takes the `identity` claim, or `sub` when there is none, as other deployments do. A client sends such a token when the server advertises no authentication and the call has an identity, from `--identity` or the repository or global configuration. A request without a token is still accepted as `<unknown>`. A token that doesn't decode or names no identity is refused: with `UNAUTHENTICATED` on gRPC, with `401` on HTTP, and as an authorization failure on QUIC.
+
+The identity names the caller and grants nothing: permissions stay as described above for a server without `[server.auth]`. Any caller can claim any identity, and hooks receive the token's `is_service_account` claim as given. No caller holds `owner` or `admin`, so only a caller naming the lock's owner can release it: `lore --identity <owner> lock release <path>`. A lock that a client without an identity took is owned by `<unknown>`.
+
+### Container sockets
+
+`[server.uds]` serves the containers of one machine over stream sockets in the filesystem, one socket per container: Unix domain sockets on Linux and macOS, and `AF_UNIX` sockets on Windows. A server that does so is the machine's [machine server](../glossary.md#machine-server); [Run a machine server for containers](../how-to/run-a-machine-server-for-containers.md) sets one up. A client reaches a socket through a `lore-unix://<upstream host>/<repository>` remote, with `LORE_UDS_SOCKET` naming the socket (see the [Lore CLI configuration reference](lore-cli-config.md#environment-variables)). A connection that opens with the storage handshake speaks the storage protocol, and the server answers it from its stores with the same storage service as `[server.quic]`. A connection that opens with the HTTP/2 client preface carries gRPC over plaintext HTTP/2, which the server forwards to the host each request names (see [Forwarded gRPC](#forwarded-grpc)). The server closes a connection that opens with neither. The table does nothing unless it sets `enabled = true`.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `enabled` | `false` | Whether to serve the sockets. |
+| `sockets` | `[]` | Socket paths, one per container, each in a directory bind-mounted into its container. A relative path resolves against the server's working directory. See [Socket files](#socket-files). |
+| `socket_mode` | `0o666` | Permission bits of each socket file on Unix. On Windows, a mode that lets others write (`0o002`) lets the machine's users connect to the socket; otherwise the socket keeps what its directory grants. |
+| `credits` | `4000` | Requests a connection may have in handling. The server states it in its handshake, and a client never has more requests outstanding. |
+| `credit_bytes` | `268435456` | Bytes a connection may hold (256 MiB): its request bodies in handling, the largest response, `262480` bytes, for each read (`Get`, `GetResolved`) in handling, and its responses the socket has not taken yet. The server states it in its handshake. |
+| `max_connections_per_socket` | `64` | Connections a socket holds at once, storage and gRPC alike, which the container's processes share. The server closes a connection past the limit as it accepts it. A closed connection counts until its requests in handling finish. |
+| `socket_bytes` | `1073741824` | Bytes all of a socket's connections may hold together (1 GiB): request bodies of `4096` bytes or more in handling, the largest response for each read in handling, and responses not yet written. Smaller request bodies count against their connection's `credits` and `credit_bytes` only, so a socket may have up to `max_connections_per_socket` times `credits` of those requests in handling, `256000` by default. |
+| `handler_timeout_seconds` | `50` | Longest the server handles one storage request before it answers `SlowDown`, from `1` to `65535`. The server states it in its handshake. |
+| `forward` | `{}` | Hosts gRPC is forwarded to: a table from the host name a request names to the URL the server reaches that host at. See [Forwarded gRPC](#forwarded-grpc). |
+
+When a connection reaches `credits`, `credit_bytes` or `socket_bytes`, the server stops reading it until a handler finishes or a response is written, and the socket's own buffer holds the client back. The server never answers `SlowDown` for these limits.
+
+The server closes a connection whose first four bytes, or the rest of its storage handshake or HTTP/2 client preface after them, take more than 5 seconds to arrive. It also closes a storage connection whose client takes none of its responses for 30 seconds. No setting changes either bound.
+
+At the shutdown signal, the server stops accepting on its sockets and closes every socket connection, storage and gRPC alike, as it closes its QUIC connections. Requests still in handling get no response. A client reconnects with back-off once a server answers on the socket again, and sends a request the closed connection failed once more.
+
+With `enabled = true`, the server refuses to start unless all of these hold:
+
+- `[server.auth]` is set, since the sockets verify every token.
+- The authorizer grants per partition: `[environment.endpoint] auth_url` is set, or `[server.auth] resource_claim` is (Tier 2). `GlobalGrantsAuthorizer` (Tier 1) lets every authenticated caller reach every partition, so the sockets refuse it.
+- `sockets` names at least one path.
+- `handler_timeout_seconds` is from `1` to `65535`.
+- Every key in `forward` is a bare host name, with no scheme or port, and every value is a valid URL.
+
+An empty `forward` starts the server with a warning: its containers then reach no host over gRPC, so they can't clone or push.
+
+Whatever its configuration, the server refuses to start with `LORE_UDS_SOCKET` set in its own environment: the variable would send the server's own gRPC, such as a `remote` store's calls to its upstream, into a socket (see the [Lore CLI configuration reference](lore-cli-config.md#environment-variables)). An empty value reads as unset.
+
+The server raises a value below its floor instead of refusing it: `credits` to `1`, `credit_bytes` and `socket_bytes` to `524960`, twice the largest message body, and `max_connections_per_socket` to `1`. It lowers `credits` above `1048575` to `1048575`.
+
+#### Socket files
+
+For each path in `sockets`, the server:
+
+- Creates the socket's directory when it is missing. On Unix it leaves the directory's permissions to the operator. On Windows a directory it creates lets only SYSTEM, the Administrators and its owner change it, and the machine's users list and traverse it; the server refuses an existing directory that another account owns or may change.
+- Claims the path with a lock file beside the socket, `<socket>.lock`, and refuses a path that another server has claimed or answers on. The lock file stays after the server stops.
+- Removes whatever file is at the path once nothing answers on it, a socket or not, so a `sockets` entry must name a path that holds no other file. Then binds a new socket at the path and applies `socket_mode` to it.
+- Removes the socket file when it stops.
+
+A socket the server cannot claim or bind stops the server.
+
+#### Forwarded gRPC
+
+A client that names a socket sends every gRPC request through it, with the host it would have dialed as the request's authority: the upstream, its authentication service, and each service endpoint the upstream advertises. `forward` maps each such host name, without its port and compared without regard to case, to the URL the server reaches it at, so it names every one of them. Each socket reaches each host over a connection of its own, with TLS for an `https` URL, so a container that stops reading a response holds up no other container's requests. It answers a request for a host the table does not name with `PERMISSION_DENIED`, and a request it cannot deliver with `UNAVAILABLE`. A request's metadata, its token included, passes through unchanged: the server verifies no token on gRPC, and the host it forwards to authorizes the caller.
+
+```toml
+# Also needs [server.auth] and an authorizer that grants per partition; see above.
+[server.uds]
+enabled = true
+sockets = ["/var/run/lore/build-1/lore.sock", "/var/run/lore/build-2/lore.sock"]
+
+[server.uds.forward]
+"lore.example.com" = "https://lore.example.com:41337"
+"auth.example.com" = "https://auth.example.com"
 ```
 
 ## Store settings
@@ -476,7 +596,7 @@ Each mode reads its settings from a matching sub-table. The `local` mode uses `[
 | Field | Default | Applies to | Description |
 | --- | --- | --- | --- |
 | `path` | derived `<temp>/lore-server` | both | Filesystem location for the store. When empty, the server derives a path under the system temporary directory at startup (ephemeral — see [Zero-config defaults](#zero-config-defaults)). |
-| `flush_delay_seconds` | `10` | both | Seconds between background flushes to disk. |
+| `flush_delay_seconds` | `10` | both | Seconds between background flushes to disk. In the immutable store, index writes pending after a capacity eviction pass are also spread across this interval, group by group, except in maintenance mode, where they are written as the pass ends. If the server stops before a group's writes reach disk, the entries evicted from that group are back when it restarts. |
 | `max_capacity` | none | immutable | Maximum number of entries before eviction. |
 | `max_size` | none | immutable | Maximum total store size in bytes before background compaction reclaims space. Compaction rewrites a group's packfiles only once at least 10% of their bytes are no longer referenced. |
 | `eviction_delay` | none | immutable | Interval in milliseconds between eviction passes. Defaults to 10 s when unset. |
@@ -486,9 +606,45 @@ Each mode reads its settings from a matching sub-table. The `local` mode uses `[
 | `compaction_parallel_groups` | `8` | immutable | Number of compaction groups processed in parallel. |
 
 > [!NOTE]
-> The `composite` mode layers a local cache tier over a durable plugin tier (for example, a local cache in front of S3). It reads `[immutable_store.composite.local]` and `[immutable_store.composite.durable]`, where the durable tier names a plugin mode such as `aws`. Composite and replicated store internals are out of scope here.
+> The `composite` mode layers a local cache tier over a durable plugin tier (for example, a local cache in front of S3). It reads `[immutable_store.composite.local]` and `[immutable_store.composite.durable]`, where the durable tier names a plugin mode such as `aws`, or `remote` (see [Remote store mode](#remote-store-mode)). Composite store internals are out of scope here. Of the replicated store's settings, only `congestion_algorithm` is covered, in [Replicated store mode](#replicated-store-mode).
 
 The lock store's `local` mode takes no sub-table — it uses an in-process, in-memory lock store (a single in-memory map) with no fields to configure. Because it lives entirely within one server process, it coordinates locks only on that node; distributed locking across a multi-node cluster requires a plugin backend such as `aws` (DynamoDB).
+
+### Remote store mode
+
+The `remote` mode keeps a store at another Lore server, the upstream, which the server reaches as a client does: the immutable store reads and writes content there, and the mutable store loads and stores mutable keys there, but lists none. `[immutable_store] mode = "remote"` reads `[immutable_store.remote]`, `[mutable_store] mode = "remote"` reads `[mutable_store.remote]`, and a composite store's durable tier in `remote` mode reads `[immutable_store.composite.durable.remote]`. The server refuses to start in `remote` mode without the table. How many storage connections it opens to the upstream follows `server.upstream_connections` (see [Server and endpoint settings](#server-and-endpoint-settings)).
+
+| Field | Default | Applies to | Description |
+| --- | --- | --- | --- |
+| `remote_url` | required | both | URL of the upstream as a client names it, without a repository, for example `lores://lore.example.com:41337`. |
+| `verify` | `false` | immutable | Whether the store checks each payload the upstream serves against its address, decoding and hashing it. When `false`, the store trusts the upstream and checks only a payload's sizes. Either way, a client checks each payload it fetches from the server against its address, except a client that trusts its remote (`--trust-remote`, or `trust_remote` or `skip_verify` through the C API), which checks only the sizes. A client that finds a payload corrupt asks the server to heal it: the server drops its own copy only if that copy is corrupt, and asks the upstream to heal only where its own copy was corrupt or missing. |
+| `auth_url` | none | immutable | Despite its name, the identity the store authenticates at the upstream as, not a URL. The server uses the login stored for that identity in the token store of the user it runs as. When unset, the store uses the first identity stored there that the upstream accepts. The `remote` mutable store ignores the field and always uses that first identity. |
+| `congestion_algorithm` | `bbr` | both | Congestion controller a storage connection to the upstream runs when the store establishes it, which paces what the server sends there, such as content it writes through: `bbr` or `cubic`. A connection to the upstream already established is reused as it is, so where the immutable and mutable stores reach one upstream as the same identity, their connections run the controller of the store that established them. Any other value fails startup. The server reads no environment variable for it; `LORE_QUIC_CONGESTION_ALGORITHM` is for clients with no settings to name one. |
+
+```toml
+[mutable_store]
+mode = "remote"
+
+[mutable_store.remote]
+remote_url = "lores://lore.example.com:41337"
+```
+
+### Replicated store mode
+
+The `replicated` mode forwards the immutable store's operations to another Lore server, the peer, which the server reaches on the peer's internal QUIC endpoint, `[server.quic_internal]` (see [QUIC endpoints](#quic-endpoints)). `[immutable_store] mode = "replicated"` reads `[immutable_store.replicated]`, and a composite store's tier in `replicated` mode reads the `replicated` table of that tier, such as `[immutable_store.composite.durable.replicated]`. The server refuses to start in `replicated` mode without the table. Only the table's `congestion_algorithm` field is covered here.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `congestion_algorithm` | `cubic` | Congestion controller of each connection the store establishes to the peer's internal QUIC endpoint, which paces what the server sends there, such as the content it stores at the peer: `bbr` or `cubic`. It applies to every connection the store establishes, including those that replace a connection at a periodic refresh or after a failure. A connection already established is reused as it is, with the controller it was established with. What the peer sends back follows the `congestion_algorithm` of the peer's `[server.quic_internal]`. Any other value fails startup. `LORE_QUIC_CONGESTION_ALGORITHM` doesn't apply to it. |
+
+```toml
+[immutable_store]
+mode = "replicated"
+
+[immutable_store.replicated]
+# remote_url and the store's other settings, not covered here
+congestion_algorithm = "bbr"
+```
 
 ## Topology settings
 
@@ -521,6 +677,17 @@ peers = [{ address = "192.168.1.10", port = 41340, locality = "SameRegion" }]
 | `address` | Peer hostname or IP address. |
 | `port` | Peer port. |
 | `locality` | Peer locality relative to this server: either `SameRegion` or `OtherRegion`. |
+
+`[topology.fixed]` also takes an optional `self_address`. The server leaves out any peer whose `address` is exactly equal to it. Set it to the server's own address so that every server in a group can share one `peers` list without replicating to itself. As a scalar it can come from the environment, for example `LORE__TOPOLOGY__FIXED__SELF_ADDRESS`, which lets each server name itself while the list stays in a shared file.
+
+```toml
+[topology.fixed]
+peers = [
+    { address = "lore-0.lore-headless", port = 41340, locality = "SameRegion" },
+    { address = "lore-1.lore-headless", port = 41340, locality = "SameRegion" },
+]
+self_address = "lore-0.lore-headless"
+```
 
 ### Rotating-ID fixed topology
 
@@ -576,7 +743,7 @@ When a selector names a plugin rather than a built-in, the server hands that plu
 
 This repository ships two reference plugin implementations as source. Both require a derived server binary that registers them; neither is compiled into `loreserver`.
 
-- **`lore-aws`** backs the immutable store with Amazon S3 and DynamoDB, and the mutable and lock stores with DynamoDB. AWS credentials come from the SDK's default credential chain (environment, profile, instance role), not from the config file.
+- **`lore-aws`** backs the immutable store with Amazon S3 and DynamoDB, and the mutable and lock stores with DynamoDB. AWS credentials do not come from the config file. They resolve from, in order: the `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` environment variables, container credentials (ECS and EKS Pod Identity), web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN`, as EKS IRSA sets them), the EC2 instance metadata service, and static keys in `~/.aws/credentials`, or `AWS_SHARED_CREDENTIALS_FILE`, for the profile `AWS_PROFILE` names (`default` when unset). `~/.aws/config` is not read, and a profile that takes its credentials from `role_arn`, SSO or `credential_process` does not resolve. Each store takes its region from its region setting, `AWS_REGION` or `AWS_DEFAULT_REGION`, and otherwise from the EC2 instance metadata service, unless `AWS_EC2_METADATA_DISABLED` is `true`. A store that finds no region fails to start.
 - **`lore-hashicorp`** provides a Consul topology that discovers peers from a service catalog. It only *reads* the catalog — each server must be registered in Consul externally (by your orchestrator or a Consul agent) — returns only passing or healthy nodes, and re-polls on a fixed interval.
 
 > [!NOTE]
@@ -593,6 +760,8 @@ Hooks fire at these points:
 - **`BranchDelete`** — before a branch is deleted.
 - **`RepositoryCreate`** — before a new repository is created.
 - **`Obliterate`** — before content is obliterated.
+
+A hook's pre-handler runs before the operation, and the operation waits for it. A pre-handler still running after 1 second, or after the timeout the hook sets for itself, is cancelled and the operation fails with `UNAVAILABLE`, so the client can retry. On the v1 `BranchPush`, `BranchCreate`, and `BranchDelete` RPCs, a pre-handler sees the branch name and whether the caller is a service account.
 
 A hook can veto an operation by returning an error, log or audit it, or trigger an external notification. The example below sketches a compliance hook that denies pushes to protected branch patterns and posts to a webhook on failure. It is illustrative — `deny_patterns`, `allowed_users`, and `webhook_url` are fields a *custom* compliance hook would define; the stock `loreserver` ships no such hook (see note below):
 

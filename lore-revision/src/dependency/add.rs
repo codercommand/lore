@@ -12,8 +12,10 @@ use super::load_dependency_data;
 use super::resolve;
 use super::store_dependency_data;
 use crate::errors::FileNotFound;
+use crate::errors::NotSupported;
 use crate::lore::Hash;
 use crate::node::NodeID;
+use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
@@ -54,9 +56,10 @@ pub async fn add_file_dependencies(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<DependencyError>("deserializing state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<DependencyError>("deserializing state")?;
 
     // Resolve all paths to NodeIDs upfront
     type ResolvedDep<'a> = (NodeID, Vec<&'a str>);
@@ -151,6 +154,8 @@ pub async fn add_file_dependencies(
     Ok(AddResult { added })
 }
 
+/// The node of the file at `path` in `state`'s own tree. Returns `NotSupported` when `path` is
+/// inside a link.
 pub async fn resolve_path(
     repository: &Arc<RepositoryContext>,
     state: &State,
@@ -161,21 +166,46 @@ pub async fn resolve_path(
             resource: path.to_string(),
         })?;
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
-        .await
-        .map_err(|_e| FileNotFound {
-            resource: path.to_string(),
-        })?;
+    find_own_node(repository, state, relative_path.as_str())
+        .await?
+        .ok_or_else(|| {
+            NotSupported {
+                operation: format!("file dependencies on `{path}`, which is inside a link"),
+            }
+            .into()
+        })
+}
 
-    if !node_link.is_valid() {
+/// The node at the repository path `path` in `state`'s own tree, or `None` where `path` is inside
+/// a link. A path `state` does not hold is `FileNotFound`, and any other failure of the lookup
+/// keeps its variant.
+pub(crate) async fn find_own_node(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    path: &str,
+) -> Result<Option<NodeID>, DependencyError> {
+    let found = match state.locate_node(repository.clone(), path).await {
+        Ok(found) => found,
+        Err(err) if err.is_node_not_found() => {
+            return Err(DependencyError::FileNotFound(
+                FileNotFound {
+                    resource: path.to_string(),
+                }
+                .chain_err_from(err, "path not found in state"),
+            ));
+        }
+        Err(err) => return Err(err).forward_any::<DependencyError>("finding the path"),
+    };
+    let Some(node) = found.own_node() else {
+        return Ok(None);
+    };
+    if !node.is_valid_node_id() {
         return Err(FileNotFound {
             resource: path.to_string(),
         }
         .into());
     }
-
-    Ok(node_link.node)
+    Ok(Some(node))
 }
 
 pub(super) async fn flush_state(

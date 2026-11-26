@@ -9,6 +9,7 @@ use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use tonic::Request;
@@ -19,14 +20,22 @@ use tracing::info;
 use tracing::warn;
 
 use super::branch_record::build_branch;
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::BranchWriteFollowUp;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::check_request_cancelled;
+use crate::grpc::delete_branch_detached;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_action;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
+use crate::hooks::context::METADATA_BRANCH_NAME;
+use crate::hooks::context::METADATA_IS_SERVICE_ACCOUNT;
 use crate::util::setup_execution;
 
 /// `lore.revision.v1.RevisionService.BranchDelete` handler.
@@ -37,16 +46,19 @@ use crate::util::setup_execution;
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRevisionService`
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchDelete::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchDeleteRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
-    hook_dispatcher: &HookDispatcher,
-    instrument_provider: &impl InstrumentProvider,
+    hook_dispatcher: &Arc<HookDispatcher>,
+    instrument_provider: &(impl InstrumentProvider + Clone + Send + 'static),
 ) -> Result<Response<BranchDeleteResponse>, Status> {
+    require_action(authorizer, &request, Action::Write).await?;
     let caller_context = CallerContext::from_original_request(&request)?;
     let req = request.into_inner();
     if let Some(forwarded_requests) = forwarded_requests
@@ -94,11 +106,12 @@ pub async fn branch_delete_implementation(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
-    hook_dispatcher: &HookDispatcher,
-    instrument_provider: &impl InstrumentProvider,
+    hook_dispatcher: &Arc<HookDispatcher>,
+    instrument_provider: &(impl InstrumentProvider + Clone + Send + 'static),
 ) -> Result<Response<BranchDeleteResponse>, Status> {
     let repository_id = caller_context.repository_id;
     let user_id = caller_context.user_id;
+    let is_service_account = caller_context.is_service_account;
     let correlation_id = caller_context.correlation_id;
     let branch_id = BranchId::from(req.id);
 
@@ -107,22 +120,11 @@ pub async fn branch_delete_implementation(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
-            let hook_ctx = HookContext::builder()
-                .correlation_id(correlation_id)
-                .hook_point(HookPoint::BranchDelete)
-                .repository(repository_id)
-                .user(user_id)
-                .branch(branch_id)
-                .build();
-
-            hook_dispatcher
-                .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
-                .map_err(hook_error_to_status)?;
-
             // Load before delete so the idempotent already-deleted path
             // can still build the response from the preserved metadata.
             let pre_metadata = branch::metadata(repository.clone(), branch_id)
@@ -130,16 +132,43 @@ pub async fn branch_delete_implementation(
                 .filter_slow_down()?
                 .map_err(|_err| Status::not_found(format!("Branch {branch_id} not found")))?;
 
+            let hook_ctx = HookContext::builder()
+                .correlation_id(correlation_id)
+                .hook_point(HookPoint::BranchDelete)
+                .repository(repository_id)
+                .user(user_id)
+                .branch(branch_id)
+                .metadata(
+                    METADATA_BRANCH_NAME,
+                    branch::name(&pre_metadata).unwrap_or_default(),
+                )
+                .metadata(METADATA_IS_SERVICE_ACCOUNT, is_service_account.to_string())
+                .build();
+
+            hook_dispatcher
+                .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
+                .await
+                .map_err(hook_error_to_status)?;
+
             debug!({BRANCH_ID} = %branch_id, "Deleting branch");
 
-            let delete_result = branch::delete(repository.clone(), branch_id)
-                .await
-                .filter_slow_down()?;
-            let actually_deleted = match delete_result {
-                Ok(()) => true,
+            check_request_cancelled()?;
+            match delete_branch_detached(
+                repository.clone(),
+                branch_id,
+                BranchWriteFollowUp {
+                    notification_sender,
+                    hook_dispatcher: hook_dispatcher.clone(),
+                    hook_context: hook_ctx,
+                    instrument_provider: instrument_provider.clone(),
+                },
+            )
+            .await?
+            .filter_slow_down()?
+            {
+                Ok(()) => debug!({BRANCH_ID} = %branch_id, "Branch deleted"),
                 Err(err) if err.is_branch_not_found() => {
                     info!({BRANCH_ID} = %branch_id, "Branch already deleted");
-                    false
                 }
                 Err(err) if err.is_delete_protected() => {
                     info!({BRANCH_ID} = %branch_id, "Branch is delete-protected");
@@ -159,17 +188,6 @@ pub async fn branch_delete_implementation(
                     warn!({BRANCH_ID} = %branch_id, error = ?err, "Failed to delete branch");
                     return Err(Status::internal(err.to_string()));
                 }
-            };
-
-            if actually_deleted {
-                debug!({BRANCH_ID} = %branch_id, "Branch deleted");
-                instrument_provider
-                    .counter("num_branches_deleted")
-                    .add(1, &[]);
-                notification_sender
-                    .branch_deleted(repository_id, branch_id)
-                    .await;
-                hook_dispatcher.spawn_post(HookPoint::BranchDelete, hook_ctx);
             }
 
             // no filter_slow_down()? usage here: the delete has already

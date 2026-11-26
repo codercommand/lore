@@ -270,6 +270,150 @@ mod open_tests {
         assert_opened_before_complete(&events, 0);
     }
 
+    /// Whether this process holds the claim on one of a repository's own stores. A lock
+    /// opened on a store directory shares that directory's state with every other lock
+    /// in the process, so it reports what the command or handle under test holds.
+    fn store_held(repository: &Path, store: &str) -> bool {
+        lore_storage::local::store_lock::StoreLock::new(repository.join(".lore").join(store), false)
+            .expect("a repository store directory")
+            .is_held()
+    }
+
+    /// Waits for both of a repository's stores to be released, for up to five seconds.
+    async fn both_stores_released(repository: &Path) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while store_held(repository, "immutable") || store_held(repository, "mutable") {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// **A disk-backed handle claims both stores from open to close.** The handle is a
+    /// span of use: while it is open no other process may use the stores, and once it
+    /// closes, one may.
+    #[tokio::test]
+    async fn a_disk_backed_handle_claims_its_stores_until_it_closes() {
+        let repo_dir = tempdir("claims");
+        let repo_path = repo_dir.path();
+        create_repo(repo_path).await;
+        assert!(
+            both_stores_released(repo_path).await,
+            "creation let go of the stores"
+        );
+
+        let (sink, callback) = make_sink();
+        let status = open::open(
+            globals(),
+            LoreStorageOpenArgs {
+                repository_path: LoreString::from(repo_path.display().to_string().as_str()),
+                in_memory: 0,
+                ..Default::default()
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+        let id = take_opened(&sink.lock().unwrap()).expect("open emitted Opened");
+        assert!(
+            store_held(repo_path, "immutable") && store_held(repo_path, "mutable"),
+            "an open handle holds both stores"
+        );
+
+        let (_close_sink, close_callback) = make_sink();
+        let status = close_handle(
+            lore::storage::handle::LoreStore { handle_id: id },
+            close_callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert!(
+            both_stores_released(repo_path).await,
+            "closing the handle releases both stores"
+        );
+    }
+
+    /// **A repository command claims its stores before the repository lock.** Taken the
+    /// other way round, a command waiting on the repository lock would hold no store
+    /// claim, and a storage handle — which takes store claims and never a repository
+    /// lock — could wait on the command while the command waits on the handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repository_command_claims_its_stores_before_the_repository_lock() {
+        let repo_dir = tempdir("containment");
+        let repo_path = repo_dir.path().to_path_buf();
+        create_repo(&repo_path).await;
+        assert!(
+            both_stores_released(&repo_path).await,
+            "creation let go of the stores"
+        );
+
+        // A second open file description on the repository lock, which excludes the one
+        // the command takes.
+        let repository_lock =
+            lore_base::fs::lock::FSLock::acquire_directory_lock(repo_path.join(".lore"))
+                .await
+                .expect("takes the repository lock");
+        assert!(
+            !store_held(&repo_path, "immutable"),
+            "nothing holds the store before the command starts"
+        );
+
+        let command = {
+            let mut command_globals = globals();
+            command_globals.repository_path = repo_path.as_path().into();
+            command_globals.offline = 1;
+            command_globals.local = 1;
+            lore_spawn!(async move {
+                repository::status(
+                    command_globals,
+                    repository::LoreRepositoryStatusArgs {
+                        staged: 0,
+                        scan: 0,
+                        check_dirty: 0,
+                        reset: 0,
+                        sync_point: 0,
+                        revision_only: 1,
+                        count: 0,
+                        paths: lore_revision::interface::LoreArray::default(),
+                    },
+                    None,
+                )
+                .await
+            })
+        };
+
+        let both_held = || store_held(&repo_path, "immutable") && store_held(&repo_path, "mutable");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !both_held() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command must claim both stores while it waits for the repository lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Long enough for a command that was not waiting on the repository lock to have
+        // finished, and for one that let its claims go while waiting to have done so.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(both_held(), "the command keeps both claims while it waits");
+        assert!(
+            !command.is_finished(),
+            "and it is still waiting on the repository lock"
+        );
+
+        drop(repository_lock);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), command)
+            .await
+            .expect("the command finishes once the repository lock is free")
+            .expect("the command task completes");
+        assert_eq!(status, 0);
+        assert!(
+            both_stores_released(&repo_path).await,
+            "and releases both stores once it is done"
+        );
+    }
+
     async fn open_in_memory(callback: LoreEventCallback) -> i32 {
         open::open(
             globals(),
@@ -289,7 +433,10 @@ mod open_tests {
     ) -> i32 {
         lore::storage::close::close(
             globals(),
-            lore::storage::close::LoreStorageCloseArgs { handle },
+            lore::storage::close::LoreStorageCloseArgs {
+                handle,
+                ..Default::default()
+            },
             callback,
         )
         .await
@@ -388,6 +535,7 @@ mod open_tests {
             data,
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
 
@@ -449,6 +597,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
 
@@ -509,6 +658,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
             lore::storage::put::LoreStoragePutItem {
@@ -521,6 +671,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
         ];
@@ -616,6 +767,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
 
@@ -677,6 +829,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
             lore::storage::put::LoreStoragePutItem {
@@ -689,6 +842,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
         ];
@@ -846,6 +1000,7 @@ mod open_tests {
             data,
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let sink: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1648,6 +1803,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
             lore::storage::put::LoreStoragePutItem {
@@ -1660,6 +1816,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
         ];
@@ -1752,6 +1909,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let (put_status, put_completes) =
@@ -3300,6 +3458,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 64 * 1024,
         };
         let (put_status, put_completes) = put_items(handle, vec![item]).await;
@@ -3431,6 +3590,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk,
         };
         let (put_status, completes) = put_items(handle, vec![item]).await;
@@ -3925,6 +4085,8 @@ mod open_tests {
                     path: LoreString::from(file.path().display().to_string().as_str()),
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk: 0,
                 },
                 lore::storage::put_file::LoreStoragePutFileItem {
@@ -3934,6 +4096,8 @@ mod open_tests {
                     path: LoreString::default(),
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk: 0,
                 },
             ],
@@ -3986,6 +4150,8 @@ mod open_tests {
             path: LoreString::from(file.path().display().to_string().as_str()),
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
+            skip_holes: 0,
             fixed_size_chunk: 0,
         };
         let (status, completes) = put_file_items(handle, vec![item]).await;
@@ -4041,6 +4207,8 @@ mod open_tests {
                 path: LoreString::from(file.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4074,6 +4242,8 @@ mod open_tests {
                 path: LoreString::from(missing.display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4106,6 +4276,8 @@ mod open_tests {
                 path: LoreString::from(file.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4147,6 +4319,8 @@ mod open_tests {
                 path: LoreString::from(file.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 64 * 1024,
             }],
         )
@@ -4499,6 +4673,8 @@ mod open_tests {
                     path: LoreString::from(source.path().display().to_string().as_str()),
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk,
                 },
             ],
@@ -5173,6 +5349,8 @@ mod open_tests {
                 path: LoreString::from(directory.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -5336,6 +5514,8 @@ mod open_tests {
                     path: LoreString::from(source.path().display().to_string().as_str()),
                     remote_write: 1,
                     local_cache: 0,
+                    remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk: 0,
                 },
             ],
@@ -5382,6 +5562,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 64 * 1024,
         };
         let (put_status, put_completes) = put_items(handle, vec![item]).await;
@@ -5455,6 +5636,7 @@ mod open_tests {
                     },
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 0,
                 };
                 let (status, completes) = put_items(handle, vec![item]).await;
@@ -5786,6 +5968,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             };
             let (status, completes) = put_items(handle, vec![item]).await;
@@ -5909,6 +6092,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             })
             .collect();
@@ -5998,6 +6182,7 @@ mod open_tests {
                     },
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 0,
                 })
                 .collect();
@@ -6268,6 +6453,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let (_sink, cb) = make_sink();
@@ -6293,9 +6479,8 @@ mod open_tests {
     ///
     /// 1. Every open + close completes without panic under contention.
     /// 2. While at least one handle holds the path's backend Arc, the `Weak` upgrades.
-    /// 3. After every handle closes AND every spawned flush task drops its Arc clone, the
-    ///    `Weak` no longer upgrades — proving the cache holds only a `Weak` and the backend
-    ///    really tears down on last-strong-ref-drop.
+    /// 3. After every handle closes, the `Weak` no longer upgrades — proving the cache holds
+    ///    only a `Weak` and the backend really tears down on last-strong-ref-drop.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_open_and_close_against_same_path_converges_cleanly() {
         use std::sync::Arc;
@@ -6313,8 +6498,8 @@ mod open_tests {
 
         // Open one anchor handle outside the race so we can grab the path-shared backend Arc
         // and downgrade it to a `Weak`. The backend cache holds only a `Weak`, so when this
-        // local Arc, every per-handle clone, and every close-spawned flush task's clone all
-        // drop, the `Weak` fails to upgrade — that's the last-strong-ref-drop signal.
+        // local Arc and every per-handle clone drop, the `Weak` fails to upgrade — that's the
+        // last-strong-ref-drop signal.
         let (anchor_sink, anchor_cb) = make_sink();
         assert_eq!(
             open::open(
@@ -6382,8 +6567,7 @@ mod open_tests {
             assert_eq!(result.expect("task panic"), 0, "open/close race");
         }
 
-        // Close the anchor. After this, no `StoreInternal` references the backend; only the
-        // close-spawned flush task's Arc clones can keep it alive. Poll until they drop and
+        // Close the anchor. After this, no `StoreInternal` references the backend. Poll until
         // the Weak fails to upgrade — bounded so a regression doesn't hang.
         let (_, anchor_close_cb) = make_sink();
         assert_eq!(close_handle(anchor_handle, anchor_close_cb).await, 0);
@@ -6399,7 +6583,7 @@ mod open_tests {
         }
         assert!(
             released,
-            "backend Arc must be released after all handles + flush tasks drop their refs",
+            "backend Arc must be released after all handles close",
         );
     }
 
@@ -6448,6 +6632,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             };
             let (_sink, cb) = make_sink();

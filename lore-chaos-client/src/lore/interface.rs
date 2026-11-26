@@ -107,6 +107,8 @@ impl LoreInterface {
                 branch: other_branch.clone(),
                 message: Default::default(),
                 no_commit: 0,
+                link_paths: Default::default(),
+                link_messages: Default::default(),
                 link: Default::default(),
                 ignore_links: 0,
                 inherit_metadata: Default::default(),
@@ -268,11 +270,7 @@ impl LoreInterface {
         lore::runtime().block_on(branch::info(
             self.global_args.clone(),
             LoreBranchInfoArgs {
-                branch: operation
-                    .name
-                    .clone()
-                    .map(LoreString::from)
-                    .unwrap_or_default(),
+                branch: operation.name.clone().map_or_default(LoreString::from),
                 link: LoreString::default(),
             },
             Some(Box::new(move |event| error_and_log!(span, event))),

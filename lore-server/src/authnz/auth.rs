@@ -6,6 +6,7 @@ use lore_proto::auth::CheckUserPermissionResponse;
 use lore_proto::auth::LookupUserPermissionsRequest;
 use lore_proto::auth::LookupUserPermissionsResponse;
 use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
+use lore_proto::lore::user::v1::repository_registry_service_client::RepositoryRegistryServiceClient;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
@@ -13,13 +14,14 @@ use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
 use lore_transport::auth::ucs_auth::grpc_endpoint;
 use lore_transport::grpc::CorrelationInterceptor;
+use lore_transport::tls::grpc_client_tls_config;
 use opentelemetry::KeyValue;
 use smallvec::SmallVec;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::codegen::InterceptedService;
-use tonic::transport::ClientTlsConfig;
+use tonic::transport::Channel;
 
 use crate::grpc::ServerResultExt;
 
@@ -38,25 +40,33 @@ fn auth_endpoint(auth_url: &str) -> Result<tonic::transport::Endpoint, Status> {
         .warn_map_err(|_| Status::internal("Failed to create lore auth endpoint"))?;
     if auth_url.starts_with("https://") {
         endpoint = endpoint
-            .tls_config(
-                ClientTlsConfig::new()
-                    .assume_http2(true)
-                    .with_native_roots(),
-            )
+            .tls_config(grpc_client_tls_config())
             .warn_map_err(|_| Status::internal("Failed to configure TLS for lore auth"))?;
     }
     Ok(endpoint)
 }
 
+/// Dials `url`. A dial that fails answers `dial_failure` with its message.
+async fn connect(
+    url: &str,
+    service: &str,
+    dial_failure: fn(String) -> Status,
+) -> Result<Channel, Status> {
+    let endpoint = auth_endpoint(url)?;
+    // Connect from net so the hyper/h2 driver tasks this spawns bind there
+    // rather than to the core runtime the caller runs on.
+    lore_spawn_net!(async move { endpoint.connect().await })
+        .await
+        .warn_map_err(|_| Status::internal(format!("{service} connection task failed")))?
+        .warn_map_err(|_| dial_failure(format!("Failed to connect to {service}")))
+}
+
 impl LoreAuthClientHelper {
-    async fn new(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
-        let endpoint = auth_endpoint(&auth_url)?;
-        // Connect from net so the hyper/h2 driver tasks this spawns bind there
-        // rather than to the core runtime the caller runs on.
-        let channel = lore_spawn_net!(async move { endpoint.connect().await })
-            .await
-            .warn_map_err(|_| Status::internal("lore auth connection task failed"))?
-            .warn_map_err(|_| Status::internal("Failed to connect to lore auth service"))?;
+    async fn new(
+        auth_url: String,
+        dial_failure: fn(String) -> Status,
+    ) -> Result<LoreAuthClientHelper, Status> {
+        let channel = connect(&auth_url, "lore auth service", dial_failure).await?;
         let client = UrcAuthApiClient::with_interceptor(channel, CorrelationInterceptor);
         Ok(LoreAuthClientHelper { client })
     }
@@ -87,7 +97,28 @@ impl LoreAuthClientHelper {
 }
 
 pub async fn grpc_get_auth_client(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
-    LoreAuthClientHelper::new(auth_url).await
+    LoreAuthClientHelper::new(auth_url, Status::internal).await
+}
+
+/// [`grpc_get_auth_client`] for permission checks: a dial that fails is
+/// `UNAVAILABLE`, which the check reads as a failure that can clear.
+pub async fn grpc_get_permission_client(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
+    LoreAuthClientHelper::new(auth_url, Status::unavailable).await
+}
+
+/// A `lore.user.v1.RepositoryRegistryService` client for `user_url`, dialed
+/// like `auth_url`.
+pub async fn grpc_get_repository_registry_client(
+    user_url: &str,
+) -> Result<
+    RepositoryRegistryServiceClient<InterceptedService<Channel, CorrelationInterceptor>>,
+    Status,
+> {
+    let channel = connect(user_url, "repository registry", Status::internal).await?;
+    Ok(RepositoryRegistryServiceClient::with_interceptor(
+        channel,
+        CorrelationInterceptor,
+    ))
 }
 
 impl InstrumentProvider for LoreAuthClientHelper {

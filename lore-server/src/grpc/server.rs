@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +43,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::lock_service::LoreLockService;
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
 use crate::auth::jwt_interceptor::JWTInterceptor;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
@@ -205,13 +206,28 @@ pub struct FeatureSettings {
     pub revision_diff_source_cap: Option<usize>,
     /// Permit count for the semaphore gating parallel
     /// `is_last_change_merged` history walks inside
-    /// `revision::diff3`. Defaults to
+    /// `revision::diff3`, and for the revision comparisons the walks
+    /// of the history lines for deleted paths keep in flight between
+    /// them. Defaults to
     /// `lore_revision::revision::DEFAULT_HISTORY_WALK_CONCURRENCY`
     /// (24, set empirically — see comments in `revision::diff3`).
     /// Higher values cost RSS per concurrent walk because each
-    /// holds an `Arc<State>` over a deserialised revision blob;
-    /// the wall-clock benefit saturates well below 64.
+    /// holds an `Arc<State>` over a deserialised revision blob, and
+    /// each comparison two; the wall-clock benefit saturates well
+    /// below 64. Each comparison keeps up to 64 path lookups in
+    /// flight, so the comparisons keep up to 64 times this many.
     pub revision_diff_history_walk_concurrency: Option<usize>,
+    /// Number of branches the v1 `BranchList` handler loads at once.
+    /// Defaults to 100.
+    pub branch_list_concurrency: Option<NonZeroUsize>,
+}
+
+impl FeatureSettings {
+    /// The configured `branch_list_concurrency`, or its default when unset.
+    pub fn branch_list_concurrency(&self) -> NonZeroUsize {
+        self.branch_list_concurrency
+            .unwrap_or(crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY)
+    }
 }
 
 /// Toggles for `RevisionList` acceleration features. Resolved once at
@@ -315,16 +331,21 @@ pub struct WantsImmutableStore {
 }
 
 impl GrpcServerBuilder<WantsImmutableStore> {
+    /// `local_store` is the store this node holds its own copy of content in, or `immutable_store`
+    /// itself where it holds none. `local_tier` is the store that reads through `immutable_store`
+    /// fill with what they read, and `None` where they fill none.
     pub fn with_immutable_store(
         self,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
+        local_tier: Option<Arc<dyn ImmutableStore>>,
     ) -> GrpcServerBuilder<WantsMutableStore> {
         GrpcServerBuilder(WantsMutableStore {
             environment: self.0.environment,
             feature: self.0.feature,
             immutable_store,
             local_store,
+            local_tier,
         })
     }
 }
@@ -334,6 +355,7 @@ pub struct WantsMutableStore {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
 }
 
 impl GrpcServerBuilder<WantsMutableStore> {
@@ -346,6 +368,7 @@ impl GrpcServerBuilder<WantsMutableStore> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store,
         })
     }
@@ -356,6 +379,7 @@ pub struct MaybeLockStore {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
 }
 
@@ -369,6 +393,7 @@ impl GrpcServerBuilder<MaybeLockStore> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store,
         })
@@ -380,6 +405,7 @@ pub struct WantsNotification {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
 }
@@ -395,6 +421,7 @@ impl GrpcServerBuilder<WantsNotification> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
             notification_sender: sender,
@@ -408,6 +435,7 @@ pub struct MaybeHookDispatcher {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -424,6 +452,7 @@ impl GrpcServerBuilder<MaybeHookDispatcher> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
             notification_sender: self.0.notification_sender,
@@ -438,6 +467,7 @@ pub struct WantsTlsConfig {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -471,6 +501,7 @@ impl GrpcServerBuilder<WantsTlsConfig> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
             hook_dispatcher: self.0.hook_dispatcher,
@@ -486,6 +517,7 @@ pub struct WantsAdminEndpoints {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -513,6 +545,7 @@ impl GrpcServerBuilder<WantsAdminEndpoints> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
             notification_sender: self.0.notification_sender,
@@ -529,6 +562,7 @@ pub struct WantsHttp2Config {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -569,6 +603,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             feature: self.0.feature,
             immutable_store: self.0.immutable_store,
             local_store: self.0.local_store,
+            local_tier: self.0.local_tier,
             mutable_store: self.0.mutable_store,
             lock_store: self.0.lock_store,
             notification_sender: self.0.notification_sender,
@@ -592,6 +627,7 @@ pub struct MaybeJwtVerifier {
     feature: FeatureSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
+    local_tier: Option<Arc<dyn ImmutableStore>>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -654,9 +690,9 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         )
     }
 
-    pub fn with_jwt_verifier(
+    pub fn with_token_verification(
         self,
-        jwt_verifier: Option<JwtVerifier>,
+        token_verification: TokenVerification,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         repository_catalog: Arc<dyn RepositoryCatalog>,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
@@ -727,7 +763,10 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         );
 
         let mut admin_svc = self.0.admin_svc;
-        admin_svc.set_jwt_verifier(jwt_verifier.clone());
+        admin_svc.set_auth(
+            token_verification.verifier().cloned(),
+            repository_authorizer.clone(),
+        );
         admin_svc.set_rpc_timeout(rpc_timeout);
 
         let storage_svc = LoreStorageService::new(
@@ -738,6 +777,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         );
         let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
             self.0.immutable_store.clone(),
+            self.0.local_tier.clone(),
             self.0.mutable_store.clone(),
             self.0.notification_sender.clone(),
             self.0.hook_dispatcher.clone(),
@@ -748,13 +788,16 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         ));
         let revision_v1_svc = LoreRevisionV1Service::new(
             self.0.immutable_store.clone(),
+            self.0.local_tier.clone(),
             self.0.mutable_store.clone(),
             self.0.notification_sender.clone(),
             self.0.hook_dispatcher.clone(),
+            repository_authorizer.clone(),
             history_step_size,
             acceleration,
             self.0.forwarded_requests.clone(),
             rpc_timeout,
+            self.0.feature.branch_list_concurrency(),
         );
         let repository_svc = LoreRepositoryService::new(
             self.0.environment.clone(),
@@ -783,14 +826,15 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                 lock_store,
                 self.0.notification_sender.clone(),
                 repository_authorizer.clone(),
+                self.0.forwarded_requests.clone(),
                 rpc_timeout,
             )
         });
 
         let notification_service = self.0.notification_service;
 
-        let authenticated = jwt_verifier.is_some();
-        let jwt_interceptor = JWTInterceptor::new(jwt_verifier.as_ref());
+        let authenticated = token_verification.verifier().is_some();
+        let jwt_interceptor = JWTInterceptor::new(token_verification);
 
         if check_enabled(&services.admin_service, "admin_service") {
             router = router.add_service(AdminServiceServer::new(admin_svc));

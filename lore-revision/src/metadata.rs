@@ -12,10 +12,14 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use bytes::BytesMut;
+use futures::FutureExt;
+use futures::future::Either;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_error_set::prelude::*;
 use lore_storage::ContentSource;
+use lore_storage::ReadOptions;
 use zerocopy::IntoBytes;
 
 use crate::errors::*;
@@ -28,7 +32,9 @@ use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
+use crate::node::NodeID;
 use crate::repository::RepositoryContext;
+use crate::state::State;
 use crate::util::path::RelativePath;
 use crate::util::path::is_path_inside_repository;
 use crate::util::path::make_absolute;
@@ -39,12 +45,14 @@ use crate::util::path::make_absolute;
 /// value in the metadata.
 ///
 /// A single entry larger than this is refused when it is set, since no amount of
-/// removing other keys could make it fit. The total is checked when the metadata
-/// is serialized, which is the only point at which it is known.
+/// removing other keys could make it fit. The total is checked by
+/// [`Metadata::check_size`], which every serialize calls.
 pub const METADATA_MAX_SIZE: usize = 1024 * 1024;
 
 #[error_set]
 pub enum MetadataErrors {
+    Cancelled,
+    LinkPinsDiverge,
     InvalidArguments,
     FileNotFound,
     Oversized,
@@ -210,6 +218,42 @@ where
     let outside =
         make_absolute(&user_path).forward_any::<E>("Failed to resolve the binary metadata path")?;
     store(ContentSource::owned_file(outside)).await
+}
+
+/// The node the user path `path` names in `state`, refused where `path` is inside a link: a node
+/// reached through a link is numbered in the linked tree, so `state` holds another file's metadata
+/// under it.
+pub(crate) async fn file_node_outside_links(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    path: &str,
+) -> Result<NodeID, MetadataErrors> {
+    let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path)
+        .forward_any::<MetadataErrors>("resolving user path")?;
+    let found = state
+        .locate_node(repository.clone(), relative_path.as_str())
+        .await
+        .map_matched_err("finding node", |m| match m {
+            MatchedStateErrors::NodeNotFound(traced) => MetadataErrors::FileNotFound(
+                FileNotFound {
+                    resource: path.to_string(),
+                }
+                .chain_err(traced, "the revision does not hold the path"),
+            ),
+            other => other.forward::<MetadataErrors>("finding node"),
+        })?;
+    if !found.is_valid() {
+        return Err(FileNotFound {
+            resource: path.to_string(),
+        }
+        .into());
+    }
+    found.own_node().ok_or_else(|| {
+        NotSupported {
+            operation: format!("file metadata on `{relative_path}`, which is inside a link"),
+        }
+        .into()
+    })
 }
 
 /// Which of a source revision's keys a merge or cherry-pick carries onto the
@@ -407,34 +451,79 @@ impl Metadata {
         Self { buffer }
     }
 
-    /// Read a stored metadata blob.
+    /// Read a stored metadata blob as [`Self::deserialize_with`] does, with the read options of
+    /// `repository` and the cache on.
     ///
-    /// This is the only way bytes this process did not write become a
-    /// [`Metadata`], so it is the one place the entry chain has to be checked —
-    /// a buffer built by [`Self::set`] is correct by construction and pays
-    /// nothing. The check is one pass of integer arithmetic over the entries,
-    /// against a fetch that dominates it.
-    pub async fn deserialize(
+    /// Returns the future of [`Self::deserialize_with`], without a future of its own.
+    #[inline]
+    pub fn deserialize(
         repository: Arc<RepositoryContext>,
         hash: Hash,
-    ) -> Result<Self, MetadataError> {
+    ) -> impl Future<Output = Result<Self, MetadataError>> {
+        let options = immutable::read_options_from_repository(&repository).with_cache();
+        Self::deserialize_with(repository, hash, options)
+    }
+
+    /// Read a stored metadata blob with `options`, refusing one larger than
+    /// [`METADATA_MAX_SIZE`] and checking it with [`Self::from_stored`].
+    ///
+    /// Returns the read's future, built at the call, with the check mapped onto its output, so it
+    /// holds nothing beside the read.
+    #[inline]
+    pub fn deserialize_with(
+        repository: Arc<RepositoryContext>,
+        hash: Hash,
+        options: ReadOptions,
+    ) -> impl Future<Output = Result<Self, MetadataError>> {
+        Self::read_stored(repository, hash, options).map(|read| -> Result<Self, MetadataError> {
+            Self::from_stored(read.forward::<MetadataError>("reading metadata")?)
+        })
+    }
+
+    /// [`Self::deserialize_with`], keeping a failed read apart from bytes that aren't metadata:
+    /// the outer result is the read's, and the inner one the check of [`Self::from_stored`].
+    ///
+    /// Returns the read's future with the check mapped onto its output, as
+    /// [`Self::deserialize_with`] does.
+    #[inline]
+    pub(crate) fn read_with(
+        repository: Arc<RepositoryContext>,
+        hash: Hash,
+        options: ReadOptions,
+    ) -> impl Future<Output = Result<Result<Self, MetadataError>, immutable::ImmutableError>> {
+        Self::read_stored(repository, hash, options).map(|read| read.map(Self::from_stored))
+    }
+
+    /// The read of the stored blob `hash` names, with `options`, refusing one larger than
+    /// [`METADATA_MAX_SIZE`].
+    #[inline]
+    fn read_stored(
+        repository: Arc<RepositoryContext>,
+        hash: Hash,
+        options: ReadOptions,
+    ) -> impl Future<Output = Result<Bytes, immutable::ImmutableError>> {
         let address = Address {
             hash,
             context: Context::default(),
         };
-        let options = immutable::read_options_from_repository(&repository)
-            .with_cache()
-            .with_max_content_size(METADATA_MAX_SIZE as u64);
-        let buffer = immutable::read(
-            repository, address, None, /* No range, read all */
-            options,
+        immutable::read(
+            repository,
+            address,
+            None, /* No range, read all */
+            options.with_max_content_size(METADATA_MAX_SIZE as u64),
         )
-        .await
-        .forward::<MetadataError>("reading metadata")?;
+    }
 
+    /// The metadata that the stored blob `buffer` holds, refusing a buffer whose entry chain
+    /// [`Self::check_buffer`] doesn't accept.
+    ///
+    /// This is the only way bytes this process did not write become a [`Metadata`], so it is the
+    /// one place the entry chain has to be checked: a buffer built by [`Self::set`] is correct by
+    /// construction and pays nothing. The check is one pass of integer arithmetic over the entries,
+    /// against a fetch that dominates it.
+    fn from_stored(buffer: Bytes) -> Result<Self, MetadataError> {
         let metadata = Metadata::new_with_buffer(BytesMut::from(buffer));
         metadata.check_buffer()?;
-
         Ok(metadata)
     }
 
@@ -457,15 +546,7 @@ impl Metadata {
             return Ok(Hash::default());
         }
 
-        if self.buffer.len() > METADATA_MAX_SIZE {
-            return Err(MetadataError::from(Oversized {
-                context: format!(
-                    "metadata size {} exceeds {METADATA_MAX_SIZE} byte limit; store \
-                     large values as separate blobs and reference them via hash",
-                    self.buffer.len()
-                ),
-            }));
-        }
+        self.check_size()?;
 
         let buffer = self.buffer.clone();
         let address = immutable::write_with_tracker(
@@ -491,15 +572,7 @@ impl Metadata {
             return Ok(Hash::default());
         }
 
-        if self.buffer.len() > METADATA_MAX_SIZE {
-            return Err(MetadataError::from(Oversized {
-                context: format!(
-                    "metadata size {} exceeds {METADATA_MAX_SIZE} byte limit; store \
-                     large values as separate blobs and reference them via hash",
-                    self.buffer.len()
-                ),
-            }));
-        }
+        self.check_size()?;
 
         let buffer = self.buffer.clone();
         let address = immutable::write(
@@ -514,6 +587,80 @@ impl Metadata {
         .forward::<MetadataError>("writing metadata (local)")?;
 
         Ok(address.hash)
+    }
+
+    /// Write the metadata through the immutable data pipeline, over the store and the storage
+    /// session of `repository`, with `options`, and answer its hash: zero for empty metadata, which
+    /// writes nothing, and before any write, [`Oversized`] over [`METADATA_MAX_SIZE`].
+    ///
+    /// The write reads the buffer in place where it fits one fragment, and copies it otherwise
+    /// ([`immutable::write_borrowed`]), where [`Self::serialize`] copies it whole first.
+    ///
+    /// Returns the write's future mapped to the hash, without a future of its own.
+    #[inline]
+    pub fn serialize_borrowed(
+        &self,
+        repository: Arc<RepositoryContext>,
+        options: lore_storage::WriteOptions,
+    ) -> impl Future<Output = Result<Hash, MetadataError>> + '_ {
+        if self.is_empty() {
+            return Either::Left(std::future::ready(Ok(Hash::default())));
+        }
+        if let Err(err) = self.check_size() {
+            return Either::Left(std::future::ready(Err(err)));
+        }
+        Either::Right(
+            immutable::write_borrowed(repository, Context::default(), &self.buffer, options).map(
+                |written| {
+                    written
+                        .map(|address| address.hash)
+                        .forward::<MetadataError>("writing metadata")
+                },
+            ),
+        )
+    }
+
+    /// Write the metadata at the remote as [`Self::serialize_borrowed`] does, and answer its hash:
+    /// zero for empty metadata, which writes nothing; before any write, [`Oversized`] over
+    /// [`METADATA_MAX_SIZE`], and [`NoRemote`] for a context without a remote.
+    ///
+    /// It asks to keep no payload, so the store it writes through records each fragment the upload
+    /// makes durable without a payload it didn't already hold. That store still keeps the payload
+    /// of a fragment list, and of a fragment whose upload failed. The hash is answered whatever
+    /// the upload's outcome, since the pipeline doesn't say why an upload failed: the caller learns
+    /// at the remote whether the blob arrived. Unlike [`Self::serialize`], it uploads in a dry run
+    /// too.
+    ///
+    /// Returns the write's future, without a future of its own.
+    #[inline]
+    pub fn serialize_remote(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> impl Future<Output = Result<Hash, MetadataError>> + '_ {
+        if repository.is_offline() && !self.is_empty() {
+            let refused = self
+                .check_size()
+                .and_then(|()| Err::<Hash, _>(MetadataError::from(NoRemote)));
+            return Either::Left(std::future::ready(refused));
+        }
+        Either::Right(self.serialize_borrowed(
+            repository,
+            lore_storage::WriteOptions::default().with_remote_write(),
+        ))
+    }
+
+    /// Refuse metadata larger than [`METADATA_MAX_SIZE`] with [`Oversized`].
+    pub fn check_size(&self) -> Result<(), MetadataError> {
+        if self.buffer.len() > METADATA_MAX_SIZE {
+            return Err(MetadataError::from(Oversized {
+                context: format!(
+                    "metadata size {} exceeds {METADATA_MAX_SIZE} byte limit; store \
+                     large values as separate blobs and reference them via hash",
+                    self.buffer.len()
+                ),
+            }));
+        }
+        Ok(())
     }
 
     pub fn set_branch(&mut self, branch: BranchId) -> Result<(), MetadataError> {
@@ -745,7 +892,8 @@ impl Metadata {
     }
 
     pub fn set_string(&mut self, key: &str, value: &str) -> Result<(), MetadataError> {
-        self.set(key.as_bytes(), value.as_bytes(), MetadataType::String)
+        self.set(key.as_bytes(), value.as_bytes(), MetadataType::String)?;
+        Ok(())
     }
 
     pub fn set_u64(&mut self, key: &str, value: u64) -> Result<(), MetadataError> {
@@ -753,19 +901,23 @@ impl Metadata {
             key.as_bytes(),
             value.to_le_bytes().as_slice(),
             MetadataType::Numeric,
-        )
+        )?;
+        Ok(())
     }
 
     pub fn set_context(&mut self, key: &str, value: Context) -> Result<(), MetadataError> {
-        self.set(key.as_bytes(), value.as_bytes(), MetadataType::Context)
+        self.set(key.as_bytes(), value.as_bytes(), MetadataType::Context)?;
+        Ok(())
     }
 
     pub fn set_hash(&mut self, key: &str, value: Hash) -> Result<(), MetadataError> {
-        self.set(key.as_bytes(), value.as_bytes(), MetadataType::Hash)
+        self.set(key.as_bytes(), value.as_bytes(), MetadataType::Hash)?;
+        Ok(())
     }
 
     pub fn set_address(&mut self, key: &str, value: Address) -> Result<(), MetadataError> {
-        self.set(key.as_bytes(), value.as_bytes(), MetadataType::Address)
+        self.set(key.as_bytes(), value.as_bytes(), MetadataType::Address)?;
+        Ok(())
     }
 
     pub fn set_bool(&mut self, key: &str, value: bool) -> Result<(), MetadataError> {
@@ -773,15 +925,19 @@ impl Metadata {
             key.as_bytes(),
             if value { &[1u8] } else { &[0u8] },
             MetadataType::Boolean,
-        )
+        )?;
+        Ok(())
     }
 
     pub fn set_binary(&mut self, key: &str, value: &[u8]) -> Result<(), MetadataError> {
-        self.set(key.as_bytes(), value, MetadataType::Binary)
+        self.set(key.as_bytes(), value, MetadataType::Binary)?;
+        Ok(())
     }
 
     /// Stores already-encoded value bytes under `key` with an explicit
-    /// [`MetadataType`], the write-side mirror of [`Self::get_typed`].
+    /// [`MetadataType`], the write-side mirror of [`Self::get_typed`], and
+    /// answers whether the buffer changed: `false` where `key` already holds
+    /// `value` under `value_type`, which writes nothing.
     ///
     /// The typed setters above cover values Rust code holds as Rust types. A
     /// caller that arrives with encoded bytes and a separate type tag — anything
@@ -791,7 +947,7 @@ impl Metadata {
         key: &str,
         value: &[u8],
         value_type: MetadataType,
-    ) -> Result<(), MetadataError> {
+    ) -> Result<bool, MetadataError> {
         self.set(key.as_bytes(), value, value_type)
     }
 
@@ -885,23 +1041,30 @@ impl Metadata {
         Self::HEADER_SIZE + Self::ITEM_SIZE + key_length + value_length
     }
 
-    /// Whether metadata could ever hold this pair, given [`METADATA_MAX_SIZE`].
+    /// Whether metadata could ever hold these pairs together, given
+    /// [`METADATA_MAX_SIZE`]. The pairs' keys are taken to be distinct.
     ///
-    /// Answers about the pair alone, not about what a buffer already carries: a
-    /// pair this refuses cannot be stored however much else is removed, while
-    /// one it accepts may still push a particular buffer past the limit. That
-    /// total is only known when the metadata is serialized.
-    pub fn can_hold(key: &str, value: &[u8]) -> bool {
-        Self::stored_size(key.len(), value.len()) <= METADATA_MAX_SIZE
+    /// Answers about the pairs alone, not about what a buffer already carries:
+    /// pairs this refuses cannot be stored together however much else is
+    /// removed, while pairs it accepts may still push a particular buffer past
+    /// the limit. That total is checked by [`Self::check_size`], which every
+    /// serialize calls.
+    pub fn can_hold<'a>(pairs: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> bool {
+        let entries = pairs.into_iter().fold(0usize, |size, (key, value)| {
+            size.saturating_add(Self::ITEM_SIZE + key.len() + value.len())
+        });
+        Self::HEADER_SIZE.saturating_add(entries) <= METADATA_MAX_SIZE
     }
 
+    /// Store `value` under `key` with `value_type`, answering whether the
+    /// buffer changed.
     #[lore_macro::test_pub]
     fn set(
         &mut self,
         key: &[u8],
         value: &[u8],
         value_type: MetadataType,
-    ) -> Result<(), MetadataError> {
+    ) -> Result<bool, MetadataError> {
         let header_size = std::mem::size_of::<u32>() * 2;
         let item_size = std::mem::size_of::<u32>() * 3;
 
@@ -935,8 +1098,11 @@ impl Metadata {
 
             if key == key_slice {
                 if value_length == value.len() {
+                    let tag = value_type as u32;
+                    if item.value_type == tag && buffer[offset..offset + value_length] == *value {
+                        return Ok(false);
+                    }
                     unsafe {
-                        let tag = value_type as u32;
                         std::ptr::copy_nonoverlapping(
                             std::ptr::addr_of!(tag).cast::<u8>(),
                             buffer
@@ -950,7 +1116,7 @@ impl Metadata {
                             value.len(),
                         );
                     }
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 // Erase the current key-value pair by moving remaining items
@@ -1024,7 +1190,7 @@ impl Metadata {
 
         unsafe { self.buffer.set_len(next_size) };
 
-        Ok(())
+        Ok(true)
     }
 
     fn set_header(&mut self) -> Result<(), MetadataError> {
@@ -1053,7 +1219,8 @@ impl Metadata {
     }
 
     /// Establish that the buffer is a metadata blob this build can read, and
-    /// that its entry chain stays inside it.
+    /// that its entry chain stays inside it. A blob of a version this build
+    /// doesn't read fails as not supported.
     ///
     /// Every accessor walks the chain with raw pointers and takes the stored
     /// lengths at their word, which is only sound because a buffer that reached
@@ -1082,7 +1249,10 @@ impl Metadata {
         }
         if header.version != VERSION {
             // Handle version change when modifying VERSION.
-            return Err(MetadataError::internal("bad metadata header"));
+            return Err(NotSupported {
+                operation: format!("reading metadata of version {}", header.version),
+            }
+            .into());
         }
 
         // Each bound is checked against the room left before it is consumed, so
@@ -1121,15 +1291,26 @@ impl Metadata {
     /// rather than ending the walk: the keys either side of it are still
     /// readable, and a kind that cannot be named here is not one a caller could
     /// have acted on. A caller that must know a specific key was unreadable
-    /// asks for it by name through [`Self::get_typed`], which refuses it.
-    ///
-    /// Cannot fail: a buffer read from the store was checked on the way in and
-    /// one built here is written entry by entry, so there is nothing left for
-    /// the walk itself to reject.
+    /// asks for it by name through [`Self::get_typed`], which refuses it, and
+    /// one that must count such entries walks them with [`Self::walk_tags`].
     pub fn walk<F>(&self, mut work: F)
     where
         F: FnMut(&[u8], &[u8], MetadataType),
     {
+        self.walk_tags(|key, value, tag| {
+            if let Ok(value_type) = MetadataType::try_from(tag) {
+                work(key, value, value_type);
+            }
+        });
+    }
+
+    /// Visit every entry in stored order, with the type tag it is stored under,
+    /// whether or not [`MetadataType`] defines it.
+    ///
+    /// Cannot fail: a buffer read from the store was checked on the way in and
+    /// one built here is written entry by entry, so there is nothing left for
+    /// the walk itself to reject.
+    pub fn walk_tags(&self, mut work: impl FnMut(&[u8], &[u8], u32)) {
         let header_size = std::mem::size_of::<u32>() * 2;
         let item_size = std::mem::size_of::<u32>() * 3;
 
@@ -1141,7 +1322,6 @@ impl Metadata {
 
             let key_length = item.key_length as usize;
             let value_length = item.value_length as usize;
-            let value_type = item.value_type;
             offset += item_size;
 
             if offset + key_length + value_length > buffer.len() {
@@ -1156,11 +1336,24 @@ impl Metadata {
             let value_slice = unsafe { std::slice::from_raw_parts(value_data, value_length) };
             offset += value_length;
 
-            let Ok(value_type) = MetadataType::try_from(value_type) else {
-                continue;
-            };
-            work(key_slice, value_slice, value_type);
+            work(key_slice, value_slice, item.value_type);
         }
+    }
+
+    /// The addresses the address values name, in stored order. An address with a zero hash names
+    /// empty content, which is stored as no blob, so it is left out.
+    pub fn address_values(&self) -> Vec<Address> {
+        let mut addresses = Vec::new();
+        self.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
+            if value_type == MetadataType::Address && value.len() == std::mem::size_of::<Address>()
+            {
+                let address: Address = value.into();
+                if !address.hash.is_zero() {
+                    addresses.push(address);
+                }
+            }
+        });
+        addresses
     }
 
     pub fn is_empty(&self) -> bool {

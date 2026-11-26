@@ -1,10 +1,10 @@
 # lore-aws-migrate
 
-Migrates every fragment in an AWS immutable store onto the fragment state table, the layout Lore has read since v0.8.7.
+Migrates every fragment in an AWS immutable store onto the fragment state table, the layout Lore has read since v0.9.0.
 
-A fragment used to be described by its own DynamoDB row: flags and sizes in the metadata table, payload in S3. It now travels on the S3 object carrying the payload, and DynamoDB keeps only a state row recording that the hash exists. A store holding objects written before v0.8.7 needs each one rewritten with its metadata attached and a state row published.
+A fragment used to be described by its own DynamoDB row: flags and sizes in the metadata table, payload in S3. It now travels on the S3 object carrying the payload, and DynamoDB keeps only a state row recording that the hash exists. A store holding objects written before v0.9.0 needs each one rewritten with its metadata attached and a state row published.
 
-A standalone crate, outside the Lore workspace: it reaches `lore-aws` by path, restates the workspace's `quinn-proto` patch, and pins its dependencies in a committed `Cargo.lock`.
+A standalone crate, outside the Lore workspace: it reaches `lore-aws` by path, restates the workspace's `quinn-proto` and `glob-match` patches, and pins its dependencies in a committed `Cargo.lock`.
 
 ## Migrating a production store
 
@@ -33,10 +33,10 @@ aws ecs describe-services --cluster lore-cluster --services lore lore-edge \
 
 ## Prerequisites
 
-- Rust 1.85 or later, for edition 2024. Nothing in the tree uses a nightly feature and no toolchain is pinned.
-- A checkout of this repository: the crate depends on `../../lore-aws` and `../../vendor/quinn-proto` by path.
+- The current stable Rust, as for Lore itself. Nothing in the tree uses a nightly feature and no toolchain is pinned.
+- An instance of this repository: the crate depends on `../../lore-aws`, `../../vendor/quinn-proto` and `../../vendor/glob-match` by path.
 - Network access for the first build, or a warm cargo cache and `--offline`.
-- AWS credentials from the standard chain.
+- AWS credentials from the environment, the ECS or EKS Pod Identity container endpoint, EKS IRSA web identity, the EC2 instance profile, or static keys in `~/.aws/credentials`, tried in that order. A profile that chains roles, runs a `credential_process` or signs in through SSO is not resolved: export its credentials into the shell first, with `eval "$(aws configure export-credentials --profile <name> --format env)"`.
 
 ## Build
 

@@ -82,7 +82,7 @@ def test_store_compaction(new_lore_repo, lore_executable_path):
     # tasks and runs a full pass) collects to completion and emits the eviction and
     # compaction event series. No stage/commit runs after this point: gc evicts local
     # fragments and the later verifies re-fetch them from the remote.
-    _set_store_caps(repo, "100", "100")
+    repo.set_store_caps("100", "100")
     gc_out = repo.repository_gc(json=True)
     # Expect: both event series fired end-to-end (begin + end for each).
     assert parse_jsonl(gc_out, "compactionBegin"), "compaction should begin"
@@ -101,7 +101,7 @@ def test_store_compaction(new_lore_repo, lore_executable_path):
 
     # Restore realistic caps so the remaining commands don't keep aggressively
     # evicting the re-fetched store (client defaults: 10 GiB / 2M fragments).
-    _set_store_caps(repo, "10_737_418_240", "2_000_000")
+    repo.set_store_caps("10_737_418_240", "2_000_000")
 
     repo.status()
     repo.history()
@@ -155,7 +155,7 @@ def test_repository_info_local_survives_gc(new_lore_repo):
     fragments are protected from GC."""
     repo: Lore = new_lore_repo()
     _seed_committed_data(repo, count=8)
-    _set_store_caps(repo, "100", "100")
+    repo.set_store_caps("100", "100")
     repo.repository_gc()
     out = repo.repository_info(local=True)
     assert "Remote URL:" in out, out
@@ -171,18 +171,6 @@ def _seed_committed_data(repo: Lore, count: int = 8) -> None:
     repo.commit("Seed data", local=True)
 
 
-def _set_store_caps(repo: Lore, max_size: str, max_capacity: str) -> None:
-    """Rewrite the repository's [store] GC caps in config.toml."""
-    config_path = Path(os.path.join(repo.dot_path(), "config.toml"))
-    lines = config_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    for i, line in enumerate(lines):
-        if line.strip().startswith("max_size"):
-            lines[i] = f"max_size = {max_size}\n"
-        elif line.strip().startswith("max_capacity"):
-            lines[i] = f"max_capacity = {max_capacity}\n"
-    config_path.write_text("".join(lines), encoding="utf-8")
-
-
 @pytest.mark.smoke
 def test_repository_gc_emits_event_series(new_lore_repo):
     """`repository gc --json` emits the eviction and compaction event series when the
@@ -193,7 +181,7 @@ def test_repository_gc_emits_event_series(new_lore_repo):
     # fragments, so only durable data drives the eviction event series.
     repo.push(max_connections=16)
     # Tiny caps so both passes do real work and emit their begin/end events.
-    _set_store_caps(repo, max_size="100", max_capacity="100")
+    repo.set_store_caps(max_size="100", max_capacity="100")
 
     out = repo.repository_gc(json=True)
 
@@ -216,7 +204,7 @@ def test_repository_gc_applies_each_cap_to_its_own_pass(new_lore_repo):
     repo: Lore = new_lore_repo()
     _seed_committed_data(repo, count=64)
     repo.push(max_connections=16)
-    _set_store_caps(repo, max_size="10_737_418_240", max_capacity="100")
+    repo.set_store_caps(max_size="10_737_418_240", max_capacity="100")
 
     out = repo.repository_gc(json=True)
 
@@ -345,8 +333,7 @@ class _DeduplicatedStore:
         self.mirror.repository_create(use_shared_store=True)
         self.local: Lore = new_lore_repo(create_repo=False)
         self.local.repository_create(use_shared_store=True)
-        for repo in (self.pushing, self.mirror, self.local):
-            _set_store_caps(repo, max_size="1048576", max_capacity="1000")
+        self.pushing.set_store_caps(max_size="1048576", max_capacity="1000")
         self.store_root = _shared_store_path(self.pushing)
         self._windows: dict[tuple[str, str], float] = {}
         self.local_files: dict[str, str] = {}
@@ -480,6 +467,11 @@ class _DeduplicatedStore:
         self.assert_files_whole()
         return killed
 
+    def time_step(self, repo: Lore, step: str, seconds: float) -> None:
+        """Take `seconds` as the last run of `step` in `repo` that finished, the window
+        `killed_step` kills its next run within."""
+        self._windows[(repo.path, step)] = max(seconds, 0.1)
+
     def killed_step(self, repo: Lore, step: str, args: list[str]) -> bool:
         """As `killed`, within 1.5 times the last run of `step` in `repo` that finished."""
         key = (repo.path, step)
@@ -560,7 +552,8 @@ def test_killed_repository_gc_loses_no_local_content(new_lore_repo):
     in durability and in holding a payload, as `_DeduplicatedStore` describes. Each round
     collects after the first pushes, and kills collections after the second, which orphans
     payloads beside local-only ones, so compaction rewrites packfiles holding local-only
-    content when the kill lands."""
+    content when the kill lands. Each collection is killed within 1.5 times the last one that
+    finished, as a collection that finds the work done ends much sooner than one that does it."""
     _seed_random()
     store = _DeduplicatedStore(new_lore_repo)
     kills = 0
@@ -572,7 +565,7 @@ def test_killed_repository_gc_loses_no_local_content(new_lore_repo):
             repo.push(max_connections=16, no_gc=True)
         start = time.monotonic()
         out = gc_repo.repository_gc(json=True)
-        full_pass = time.monotonic() - start
+        store.time_step(gc_repo, "gc", time.monotonic() - start)
         assert parse_jsonl(out, "compactionBegin"), "the full pass compacts"
         store.fetch(round_index)
         store.write_local(round_index)
@@ -584,11 +577,10 @@ def test_killed_repository_gc_loses_no_local_content(new_lore_repo):
         _commit(store.pushing, f"Pending {round_index}", no_gc=True)
 
         for _ in range(4):
-            kills += store.killed(
-                gc_repo, ["repository", "gc"], max(full_pass, 0.5) * 1.5
-            )
+            kills += store.killed_step(gc_repo, "gc", ["repository", "gc"])
         store.assert_intact()
 
+    logger.info("%d of 80 passes were killed", kills)
     assert kills >= 16, f"only {kills} of 80 passes were killed"
     store.local.repository_gc()
     store.assert_intact()
@@ -621,3 +613,49 @@ def test_killed_commands_lose_no_local_content(new_lore_repo):
         store.assert_intact()
 
     assert kills >= 48, f"only {kills} of 192 commands were killed"
+
+
+def _store_files(repo: Lore) -> dict[str, bytes]:
+    store = Path(repo.dot_path()) / "immutable"
+    return {
+        str(path.relative_to(store)): path.read_bytes()
+        for path in store.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.own_vfs(
+    "reads the store in the repository's own .lore, where a virtual clone uses a shared store"
+)
+@pytest.mark.smoke
+def test_repository_gc_dry_run_collects_nothing(new_lore_repo):
+    """`repository gc --dry-run` leaves a store that is over its caps as it was, where
+    `repository gc` evicts and compacts it."""
+    repo: Lore = new_lore_repo()
+    _seed_committed_data(repo, count=64)
+    repo.push(max_connections=16)
+    repo.set_store_caps(max_size="100", max_capacity="100")
+    store = _store_files(repo)
+
+    out = repo.repository_gc(dry_run=True)
+
+    assert "Garbage collection skipped in a dry run" in out, out
+    assert _store_files(repo) == store, "a dry run collected garbage"
+
+    repo.repository_gc()
+    assert _store_files(repo) != store
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_repository_gc_failure_reports_no_result(new_lore_repo, dry_run):
+    """`repository gc` that fails, here on an unreadable config, reports neither a skipped
+    nor a completed collection."""
+    repo: Lore = new_lore_repo()
+    _seed_committed_data(repo)
+    Path(repo.dot_path(), "config.toml").write_text("not = [valid", encoding="utf-8")
+
+    out = repo.run(["repository", "gc"], dry_run=dry_run, check=False)
+
+    assert "Garbage collection skipped" not in out, out
+    assert "Garbage collection complete" not in out, out

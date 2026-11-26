@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
 use lore::auth::LoreAuthUserInfoArgs;
@@ -71,13 +70,13 @@ pub struct FileLockStatusArgs {
 
 #[derive(Args)]
 pub struct FileLockQueryArgs {
-    /// Branch to query locks on
+    /// Branch to query locks on: every branch by default, or the current branch with `--path`
     #[arg(long, value_name = "branch-name")]
     branch: Option<String>,
-    /// Owner to query locks belonging to them
+    /// Owner to query locks belonging to them. Can't be combined with `--path`
     #[arg(long, value_name = "owner-id")]
     owner: Option<String>,
-    /// Path to query lock information on
+    /// Path to query lock information on. Can't be combined with `--owner`
     #[arg(long, value_name = "path")]
     path: Option<String>,
 }
@@ -156,7 +155,7 @@ fn handle_lock_status(globals: LoreGlobalArgs, args: &FileLockStatusArgs) -> u8 
                 );
             }
             LoreEvent::LockFileStatus(data) => {
-                let timestamp = parse_timestamp(data.locked_at);
+                let timestamp = util::rfc2822_display(data.locked_at).unwrap_or_default();
 
                 status_data_clone.lock().push(LockEventData {
                     branch: String::default(),
@@ -210,7 +209,7 @@ fn handle_lock_query(globals: LoreGlobalArgs, args: &FileLockQueryArgs) -> u8 {
                 println!("{}Locks found:{}", CommonStyles::HEADERS, anstyle::Reset);
             }
             LoreEvent::LockFileQuery(data) => {
-                let timestamp = parse_timestamp(data.locked_at);
+                let timestamp = util::rfc2822_display(data.locked_at).unwrap_or_default();
 
                 query_data_clone.lock().push(LockEventData {
                     branch: data.branch.to_string(),
@@ -294,12 +293,6 @@ pub fn handle_lock_file_commands(globals: LoreGlobalArgs, cmd: &LockFileCommands
         LockFileCommands::Query(args) => handle_lock_query(globals, args),
         LockFileCommands::Release(args) => handle_lock_release(globals, args),
     }
-}
-
-fn parse_timestamp(timestamp: u64) -> String {
-    DateTime::from_timestamp_millis(timestamp as i64)
-        .map(|time| time.to_rfc2822())
-        .unwrap_or_default()
 }
 
 fn resolve_user_ids(

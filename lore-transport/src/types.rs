@@ -23,6 +23,13 @@ impl EnvironmentConfig {
         self.config.as_ref().and_then(|c| c.max_query_batch)
     }
 
+    /// The most resources the server takes in one lock, unlock or status request.
+    ///
+    /// `None` when the server advertises no limit.
+    pub fn max_lock_batch(&self) -> Option<usize> {
+        self.config.as_ref().and_then(|c| c.max_lock_batch)
+    }
+
     /// The compression mode the server states it prefers, as the number it sent. The codec that
     /// number names is `lore_storage::CompressionMode`, which this crate does not depend on.
     pub fn compression_mode(&self) -> Option<u32> {
@@ -77,15 +84,6 @@ impl EnvironmentConfig {
             fallback,
         )
     }
-
-    /// User directory endpoint: resolves user IDs to display names and back.
-    /// Falls back to `auth_url` if empty.
-    pub fn user_url<'a>(&'a self, fallback: &'a str) -> &'a str {
-        service_url_or(
-            self.endpoint.as_ref().and_then(|e| e.user_url.as_deref()),
-            fallback,
-        )
-    }
 }
 
 fn service_url_or<'a>(override_url: Option<&'a str>, fallback: &'a str) -> &'a str {
@@ -118,7 +116,7 @@ pub struct Oidc {
     pub issuer: String,
     /// The public client ID presented to the provider.
     pub client_id: String,
-    /// Default scopes to request at login. Empty leaves the choice to the client.
+    /// Default scopes to request at an interactive (device) login. Empty leaves the choice to the client.
     pub scopes: Vec<String>,
     /// Whether a client takes the OIDC path by default rather than `auth_url`.
     pub preferred: bool,
@@ -128,20 +126,8 @@ pub struct Oidc {
     pub scope_template: Option<String>,
     /// The issuer of the RFC 8693 token-exchange endpoint that mints partition-scoped tokens.
     pub token_exchange_issuer: Option<String>,
-    pub identity_claim: Option<String>,
-}
-
-impl Oidc {
-    pub const DEFAULT_IDENTITY_CLAIM: &'static str = "sub";
-
-    /// The claim recorded as the user identity: the advertised one, or `sub` when the server
-    /// names none.
-    pub fn identity_claim(&self) -> &str {
-        match self.identity_claim.as_deref() {
-            Some(claim) if !claim.is_empty() => claim,
-            _ => Self::DEFAULT_IDENTITY_CLAIM,
-        }
-    }
+    /// Scopes to request with the client credentials grant. Empty requests none.
+    pub client_credentials_scopes: Vec<String>,
 }
 
 /// A compression mode as it arrives from a server, held as the number it was sent as: the codec
@@ -165,6 +151,7 @@ impl ServerCompressionMode {
 pub struct EnvironmentServerConfig {
     pub max_query_batch: Option<usize>,
     pub compression_mode: Option<ServerCompressionMode>,
+    pub max_lock_batch: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -182,26 +169,55 @@ pub struct BranchPushResponse {
     pub message: Option<String>,
 }
 
-pub struct BranchQueryResponse {
-    /// Branch ID
+/// A branch as Lore Server records it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BranchRecord {
+    /// Branch identifier.
     pub id: BranchId,
-    /// Latest revision
+    /// Branch name.
+    pub name: String,
+    /// Category the branch belongs to.
+    pub category: String,
+    /// Identity that created the branch.
+    pub creator: String,
+    /// Creation time, in milliseconds since the Unix epoch.
+    pub created: u64,
+    /// Latest revision on the branch.
     pub latest: Hash,
-    /// Metadata hash
+    /// Hash of the branch's metadata blob.
     pub metadata: Hash,
-    /// Whether the branch has been deleted (name->id mapping removed)
+    /// Whether the branch is archived: the record remains, and its name no longer maps to it.
     pub deleted: bool,
+    /// Branch points the branch is built on, from its parent's to the root's.
+    pub stack: Vec<BranchPoint>,
 }
+
+/// The answer to a branch query: the branch's record.
+pub type BranchQueryResponse = BranchRecord;
 
 pub struct BranchListResponse {
     /// Branch list
-    pub list: Vec<BranchMetadata>,
+    pub list: Vec<BranchRecord>,
 }
 
 pub struct RevisionListResponse {
     pub items: Vec<RevisionItem>,
     pub next_revision: Hash,
     pub previous_revision: Hash,
+}
+
+impl RevisionListResponse {
+    /// The items from the revision `anchor` down to the oldest in the page.
+    ///
+    /// A page holds the anchor it was asked for, but not necessarily first: a page aligned on
+    /// a wider boundary also holds revisions newer than the anchor, which are not its
+    /// ancestors. Empty when the page does not hold `anchor`.
+    pub fn items_from(&self, anchor: Hash) -> &[RevisionItem] {
+        self.items
+            .iter()
+            .position(|item| item.signature == anchor)
+            .map_or(&[], |first| &self.items[first..])
+    }
 }
 
 #[derive(Debug)]
@@ -301,12 +317,18 @@ pub struct AuthenticationToken {
     pub user_name: String,
     /// Expiry as milliseconds since UNIX epoch.
     pub expires_ms: u64,
+    /// Remaining lifetime reported by the issuer at receipt (`expires_in`), in milliseconds,
+    /// when the protocol reports one.
+    pub lifetime_ms: Option<u64>,
     /// Root domains this token is valid for.
     pub acceptable_root_domains: Vec<String>,
     /// One-time-use refresh token for obtaining a new authentication token
     /// without re-authenticating. `None` if the auth backend does not support
     /// refresh. Consumed on use -- the next refresh returns a new one.
     pub refresh_token: Option<String>,
+    /// When `refresh_token` stops working, in milliseconds since the UNIX epoch. 0
+    /// if there is no refresh token, or if the provider did not give a deadline.
+    pub refresh_expires_ms: u64,
     /// The scope the backend granted, space-delimited as RFC 6749 §3.3 has
     /// it. `None` when the backend reports no scope.
     pub scope: Option<String>,
@@ -314,7 +336,7 @@ pub struct AuthenticationToken {
 
 /// Authorization token scoped to a specific resource.
 ///
-/// Returned from `exchange_for_repository` or `exchange_for_custom_resource`.
+/// Returned from `exchange_for_repository` or `exchange_for_custom_resources`.
 /// Shorter-lived than the authentication token and re-obtained via exchange
 /// when expired.
 #[derive(Clone, Debug)]
@@ -323,6 +345,9 @@ pub struct AuthorizationToken {
     pub token: String,
     /// Expiry as milliseconds since UNIX epoch.
     pub expires_ms: u64,
+    /// Remaining lifetime reported by the issuer at receipt (`expires_in`), in milliseconds,
+    /// when the protocol reports one.
+    pub lifetime_ms: Option<u64>,
     /// Root domains this token is valid for.
     pub acceptable_root_domains: Vec<String>,
 }

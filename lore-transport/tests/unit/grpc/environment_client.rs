@@ -49,7 +49,8 @@ fn an_advertised_provider_maps_empty_strings_to_none() {
         resource_template: "https://lore.example.com/partitions/{id}".to_string(),
         scope_template: String::new(),
         token_exchange_issuer: "https://auth.example.com".to_string(),
-        identity_claim: String::new(),
+        client_credentials_scopes: vec!["lore".to_string()],
+        ..Default::default()
     }));
     assert_eq!(
         environment.oidc,
@@ -61,7 +62,52 @@ fn an_advertised_provider_maps_empty_strings_to_none() {
             resource_template: Some("https://lore.example.com/partitions/{id}".to_string()),
             scope_template: None,
             token_exchange_issuer: Some("https://auth.example.com".to_string()),
-            identity_claim: None,
+            client_credentials_scopes: vec!["lore".to_string()],
         })
     );
+}
+
+/// An older server still fills the deprecated `identity_claim` (8); the client
+/// decodes the message and reads nothing from it.
+#[test]
+#[allow(deprecated)]
+fn an_advertised_identity_claim_is_ignored() {
+    let environment = environment_with(Some(proto::Oidc {
+        issuer: "https://auth.example.com".to_string(),
+        client_id: "lore-cli".to_string(),
+        identity_claim: "oid".to_string(),
+        ..Default::default()
+    }));
+    assert_eq!(
+        environment.oidc,
+        Some(Oidc {
+            issuer: "https://auth.example.com".to_string(),
+            client_id: "lore-cli".to_string(),
+            ..Default::default()
+        })
+    );
+}
+
+fn environment_advertising(config: proto::Config) -> EnvironmentConfig {
+    proto::Environment {
+        endpoint: None,
+        config: Some(config),
+        oidc: None,
+    }
+    .into()
+}
+
+#[test]
+fn an_advertised_lock_batch_limit_maps_to_some() {
+    let environment = environment_advertising(proto::Config {
+        max_lock_batch: 42,
+        ..Default::default()
+    });
+    assert_eq!(environment.max_lock_batch(), Some(42));
+}
+
+#[test]
+fn a_zero_lock_batch_limit_maps_to_none() {
+    let environment = environment_advertising(proto::Config::default());
+    assert_eq!(environment.max_lock_batch(), None);
 }

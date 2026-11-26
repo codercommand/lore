@@ -7,6 +7,8 @@ mod tests {
     use bytes::Bytes;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::lore::*;
+    use lore_revision::records::InstanceRecords;
+    use lore_revision::repository::InMemoryStores;
     use lore_revision::repository::cache_in_memory_stores;
     use lore_revision::repository::create_client_memory_stores;
     use lore_revision::repository::get_cached_in_memory_stores;
@@ -85,6 +87,68 @@ mod tests {
         repository_release(&path);
     }
 
+    /// **Releasing a repository leaves its live disk-backed stores to be reused.** The
+    /// disk-backed caches hold weak references that expire once nothing uses a store.
+    /// Removing them early would make the next open build a second store over the same
+    /// files — which the store epoch keeps coherent for reads, but not for writes one of
+    /// the two has not flushed.
+    #[tokio::test]
+    async fn release_keeps_live_disk_backed_stores_for_the_next_open() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let dir = lore_base::test_util::TempDir::new("lore-release-disk-");
+                let repository = dir.path().to_path_buf();
+                let dot_path = repository.join(".lore");
+                std::fs::create_dir_all(&dot_path).expect("a .lore directory");
+                let options =
+                    lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none();
+
+                let immutable = lore_revision::repository::create_immutable_store_at_path(
+                    dot_path.clone(),
+                    options,
+                    false,
+                )
+                .await
+                .expect("creates the immutable store")
+                .0;
+                let mutable = lore_revision::repository::create_mutable_store_at_path(
+                    dot_path.clone(),
+                    immutable.clone(),
+                )
+                .await
+                .expect("creates the mutable store")
+                .0;
+
+                repository_release(&repository);
+
+                let immutable_again = lore_revision::repository::create_immutable_store_at_path(
+                    dot_path.clone(),
+                    options,
+                    false,
+                )
+                .await
+                .expect("opens the immutable store")
+                .0;
+                let mutable_again = lore_revision::repository::create_mutable_store_at_path(
+                    dot_path,
+                    immutable_again.clone(),
+                )
+                .await
+                .expect("opens the mutable store")
+                .0;
+                assert!(
+                    std::sync::Arc::ptr_eq(&immutable, &immutable_again),
+                    "a live immutable store is reused, not built again over its files"
+                );
+                assert!(
+                    std::sync::Arc::ptr_eq(&mutable, &mutable_again),
+                    "and so is a live mutable store"
+                );
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn release_clears_cached_in_memory_store_data() {
         let execution = setup_test_execution();
@@ -130,7 +194,14 @@ mod tests {
                 .expect("Failed to put immutable value");
 
                 // Cache the stores
-                cache_in_memory_stores(dot_path.clone(), imm, mut_);
+                cache_in_memory_stores(
+                    dot_path.clone(),
+                    InMemoryStores {
+                        immutable: imm,
+                        mutable: mut_,
+                        records: InstanceRecords::in_memory(),
+                    },
+                );
 
                 // Verify the cache is populated
                 assert!(
@@ -151,7 +222,14 @@ mod tests {
                 let (new_imm, new_mut) = create_client_memory_stores()
                     .await
                     .expect("Failed to create new in-memory stores");
-                cache_in_memory_stores(dot_path.clone(), new_imm.clone(), new_mut.clone());
+                cache_in_memory_stores(
+                    dot_path.clone(),
+                    InMemoryStores {
+                        immutable: new_imm.clone(),
+                        mutable: new_mut.clone(),
+                        records: InstanceRecords::in_memory(),
+                    },
+                );
 
                 // Mutable store should not contain the previously stored value
                 let load_result = new_mut

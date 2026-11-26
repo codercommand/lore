@@ -34,6 +34,7 @@ use lore_server::plugins::traits::NotificationPluginContext;
 use lore_server::plugins::traits::NotificationPluginFactory;
 use lore_server::plugins::traits::PluginError;
 use lore_server::plugins::traits::TopologyPluginFactory;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::KeyValueStream;
 use lore_storage::MutableStore;
@@ -59,6 +60,16 @@ struct MockImmutableStore;
 
 #[async_trait]
 impl ImmutableStore for MockImmutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn query(
         self: Arc<Self>,
         _partition: Partition,
@@ -131,7 +142,7 @@ impl ImmutableStore for MockImmutableStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -156,6 +167,16 @@ struct MockMutableStore;
 
 #[async_trait]
 impl MutableStore for MockMutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn load(
         self: Arc<Self>,
         _partition: Partition,
@@ -194,7 +215,7 @@ impl MutableStore for MockMutableStore {
         Err(StoreError::internal("Not implemented"))
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 }

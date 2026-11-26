@@ -18,6 +18,7 @@ use tracing::debug;
 use tracing::info;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterCancelledExt;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
@@ -57,13 +58,15 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository,
+        can_read,
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
-            tree(repository.clone(), revision, path, max_depth, can_read)
+            tree(repository.clone(), revision, path, max_depth, false)
                 .await
                 .filter_slow_down()?
+                .filter_cancelled()?
                 .map(|result| {
                     debug!("Got tree");
                     Response::new(RevisionTreeResponse {
@@ -71,10 +74,7 @@ pub async fn handler(
                             .paths
                             .iter()
                             .map(|tree_path| Path {
-                                address: tree_path
-                                    .address
-                                    .map(|address| address.into())
-                                    .unwrap_or_default(),
+                                address: tree_path.address.map_or_default(|address| address.into()),
                                 path: tree_path.path.to_string(),
                                 r#type: super::path_diff::node_flags_to_type(tree_path.flags),
                                 tracking: tree_path.tracking,

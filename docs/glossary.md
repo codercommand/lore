@@ -6,23 +6,101 @@ For the rules used to maintain this file, see [`developing/doc-standards/operati
 
 ## A
 
+### Abort
+
+To stop merging, cherry-picking, or reverting partway through and discard the conflict state (`lore branch merge abort`, `lore revision cherry-pick abort`, `lore revision revert abort`).
+
+Compare to: resolve.
+
+Also see: conflict.
+
+### Access token
+
+A token that grants access to a repository, normally obtained by exchanging an identity token with the authentication service. It's a JWT that carries the user's permissions and an expiry time.
+
+Compare to: identity token.
+
+Also see: authentication service, JWT.
+
 ### Address
 
 The pair (hash, context) that identifies a fragment in the immutable store: 32 bytes of BLAKE3 hash plus 16 bytes of context, 48 bytes total. Two fragments with the same address are the same fragment.
 
 Also see: hash, context, fragment.
 
+### Adoption
+
+A push that brings an unmergeable file to the content its chain latest already holds, normally by merging the branch that concluded it. It needs no lock and doesn't move the chain latest, so a branch that's behind can catch up even while another branch holds the file's lock.
+
+Also see: chain latest, behind, caught up.
+
+### Ahead
+
+A branch's relation to an unmergeable file's chain latest when the file's history on the branch holds the chain latest's content and the branch has changed the file since. A branch that's ahead contains every concluded edit to the file, so the caught-up check grants it a lock.
+
+Compare to: caught up, behind.
+
+Also see: chain latest.
+
+### Amend
+
+To replace a branch's latest revision with a new revision that has the same content and a different message (`lore revision amend`). The new revision gets a new hash signature, and the original stays in the store.
+
+Compare to: commit.
+
+### Anchor
+
+An instance's local record of the branch and revision it's on, and of its staged changes. It never leaves the machine.
+
+Also see: bare, repository instance.
+
+### Archive
+
+To retire a branch so it no longer appears in branch listings and its name can be reused, keeping its history (`lore branch archive`). Archived branches can still be listed with `lore branch list --archived`. Archiving a scope (`lore scope archive`) likewise drops its name and keeps its state, and restoring it brings the name back.
+
+Also see: branch, scope, purge.
+
+### Authentication service
+
+The service that authenticates users and issues the tokens Lore uses to prove identity and authorize access to repositories. A repository's remote names it through an auth URL, such as `ucs-auth://auth.example.com`.
+
+Also see: identity token, access token.
+
 ### Auto-follow
 
-The behavior by which a link or layer grows or switches a matching branch in its target repository when the parent does, keeping multi-repository workflows in step. It's enabled by default for links and disabled for vendored content.
+The behavior by which a link or layer creates or switches the matching branch in its target repository when the parent repository does. It's on by default.
 
 Compare to: link, layer.
 
 ## B
 
+### Bare
+
+A way of cloning or switching branches that records the revision without writing or checking any working files (`--bare`). The instance's anchor moves to the revision, but no files on disk are written or changed.
+
+Also see: anchor, working tree.
+
+### Base revision
+
+The nearest common ancestor of two branches' latest revisions, from which a branch diff or a three-way merge operation calculates the changes on each side.
+
+Also see: three-way merge, branch point.
+
+### Behind
+
+A branch's relation to an unmergeable file's chain latest when the file's history on the branch, walked back to the revision that produced the chain latest's content, never holds that content, so the branch is missing a concluded edit. Under strict chain enforcement, the branch's lock request for the file is denied until it merges that content in.
+
+Compare to: caught up, ahead.
+
+Also see: chain latest, adoption.
+
 ### Binary-first
 
 Lore's design principle that all content is handled as opaque byte streams on the storage and transport paths — no line-ending translation, encoding inference, or clean/smudge filters. Text-aware behavior is layered on top, never assumed below.
+
+### Bisect
+
+To binary-search a range of revisions for the one that introduced a change (`lore revision bisect`). The start revision is the latest known not to have the change, exclusive; the end revision is the earliest known to have it, inclusive.
 
 ### BLAKE3
 
@@ -33,9 +111,15 @@ BLAKE3 <https://github.com/BLAKE3-team/BLAKE3-specs>
 
 ### Branch
 
-A named, mutable pointer to its latest revision in the revision graph — Lore's analog of Git's `HEAD`, but per-branch. A branch has a stable opaque ID separate from its human-readable name, so a name can be archived, restored, or reused without losing history. Branch state lives in the mutable store.
+A named, movable pointer to its latest revision. A branch has a stable ID, so its name can be reused without losing history.
 
-Also see: latest, revision graph.
+Also see: branch ID, latest, revision graph.
+
+### Branch ID
+
+A 16-byte opaque identifier, written in hexadecimal, that identifies a branch independently of its name. It's generated when a branch is created, or set explicitly with `lore branch create --id`.
+
+Also see: branch.
 
 ### Branch point
 
@@ -45,19 +129,43 @@ Also see: branch, revision identifier.
 
 ## C
 
+### Case handling
+
+The policy for staging a path whose name changed only in letter case (`lore stage --case`). It decides whether Lore stops, keeps the repository's case, or takes the file system's.
+
+Also see: stage.
+
+### Caught up
+
+A branch's relation to an unmergeable file's chain latest when the file's content at the branch's latest revision equals the chain latest's content. The caught-up check settles it with a single comparison and grants the branch a lock.
+
+Compare to: ahead, behind.
+
+Also see: chain latest.
+
 ### CDC
 
 See content-defined chunking.
 
+### Chain latest
+
+The record of an unmergeable file's edit chain in one scope: the file's content when the last session on it there concluded, or the content backfill seeded it with, and the revision that produced that content — the one that authored it, not a later revision that only carried it. When that session deleted the file, the record is a tombstone that keeps the last concluded content and marks the file deleted. It's stored as the file's latest entry in the lock store.
+
+Compare to: latest.
+
+Also see: caught up, ahead, behind, conclude, scope, lock (n).
+
 ### Change request
 
-A change request (CR) is a proposed set of revisions submitted for peer review before merging. The Lore equivalent of a pull request in other version control systems.
+A change request (CR) is a proposed set of revisions submitted for review before merging. Reviewers comment on it and approve it, and it's then merged into its target branch.
 
 ### Cherry-pick
 
-To replay a single revision (or a contiguous range) onto a different parent, producing a freshly written revision; the original is unchanged.
+To apply one revision's changes on top of the current revision, creating a new revision (`lore revision cherry-pick`). The original revision is unchanged, and conflicts are resolved the same way as when merging.
 
-Compare to: rebase, squash.
+Compare to: revert.
+
+Also see: conflict.
 
 ### Chunking
 
@@ -65,21 +173,51 @@ Splitting a file into a sequence of smaller fragments, each addressed independen
 
 Also see: fragment, content-defined chunking, fixed-size chunking.
 
+### Claim
+
+A name and value in the payload of a JWT, such as the subject, the expiry or a role list. The server reads the identity and the permissions of a token from its claims.
+
+Also see: JWT, access token.
+
 ### CLI
 
 A command-line interface (CLI) is the text-based way to drive Lore, through the `lore` binary and its subcommands.
 
 ### Clone
 
-The act of creating a local repository instance from a remote URL (`lore clone`), and the resulting repository instance. Lore-native — not a Git-ism.
+To create a new repository instance, either from a repository on a remote (`lore clone`) or from another instance on the machine (`lore repository instance clone`). What cloning creates is an instance.
 
 Compare to: repository instance.
 
 ### Commit
 
-To record the staged changes as a new revision (`lore commit`).
+To record the staged changes as a new revision (`lore commit`). The new revision becomes the branch's local latest; pushing sends it to the remote.
 
 Compare to: revision.
+
+### Commit intent
+
+The revision a commit of a repository instance publishes as its branch's latest, recorded in the mutable store before the commit publishes it and cleared once the anchors the commit writes are on disk. The next commit or amend uses it to finish a commit killed in between.
+
+Also see: commit, latest.
+
+### Compaction
+
+The background process that keeps the local store under its maximum size by removing the least recently used content and rewriting its packfiles. Like eviction, it removes only content the remote also holds.
+
+Also see: eviction, garbage collection.
+
+### Conclude
+
+To end a session by releasing its lock and recording the file's content, and the revision that produced it, as the file's chain latest. A push to the branch that holds the lock concludes by default when the session changed the file, unless it keeps the lock (`lore push --keep-lock`), and a push that deletes the file concludes even then; a push to another branch concludes only the files it names (`lore push --unlock`), and `lore lock release --conclude` concludes at the holding branch's latest revision. A client that predates causal locks concludes when it releases the lock, if its branch isn't behind. Releasing a lock without concluding leaves the chain latest where it was, and before a repository's backfill completes a conclusion releases the lock and records nothing.
+
+Also see: session, chain latest, lock (n).
+
+### Conflict
+
+A path that both sides changed in ways Lore can't combine automatically when merging, cherry-picking, or reverting, left for the user to resolve. A path can be resolved, marked unresolved again, or restarted, and the whole operation can be aborted.
+
+Also see: resolve, unresolve, abort, three-way merge.
 
 ### Content addressing
 
@@ -95,11 +233,19 @@ Compare to: fixed-size chunking.
 
 ### Context
 
-A 16-byte opaque tag carried alongside a content hash to track identity — typically a file's stable ID across moves and copies, and the scope for obliteration. It's a deduplication and identity construct, not an access boundary.
+A 16-byte opaque tag carried alongside a content hash to track identity — typically a file's stable ID across moves and copies, and the unit obliteration acts on. It's a deduplication and identity construct, not an access boundary.
 
 Compare to: partition.
 
 Also see: address.
+
+### Convergent
+
+The status of a branch whose local latest is known to be on the remote's history line for the branch: the remote latest, or a revision the remote latest reaches by following each revision's first parent.
+
+Compare to: divergent.
+
+Also see: latest, sync.
 
 ### CR
 
@@ -119,13 +265,65 @@ The automatic storage of identical content only once. Because fragments are addr
 
 Also see: content addressing, fragment.
 
+### Dependency
+
+A recorded edge from a source file to a file it depends on, optionally labeled with tags (`lore file dependency add`). Lore uses dependency edges to clone or sync only chosen files and the files they need.
+
+Also see: dependent, dependency tag, root file, selective sync.
+
+### Dependency tag
+
+A label on a dependency edge. A tag filters which edges are listed, removed, or followed when cloning or syncing by dependency.
+
+Also see: dependency.
+
+### Dependent
+
+A file that depends on a given file. `lore file dependency list --reverse` lists dependents instead of dependencies.
+
+Also see: dependency.
+
+### Diff
+
+A comparison that reports what changed between two revisions, two branches, or a revision and the working tree (`lore diff`, `lore revision diff`, `lore branch diff`). A file diff is a two-way unified diff by default, or a three-way output with conflict markers with `--diff3`.
+
+Also see: base revision, three-way merge.
+
+### Direct write
+
+A setting that writes files in place instead of through a temporary file, which is faster but not atomic. An error while writing can leave a file incomplete. On Windows it also writes each file of one fragment past the file cache, so the first read of such a file comes from the device.
+
 ### Dirty
 
-A flag on a working-tree node indicating that the file at that path differs from the committed revision. It's orthogonal to staged — a file can be dirty, staged, or both — and strictly local: never committed or sent to the remote.
+To mark a file or directory as changed — modified, moved, copied, or deleted — so Lore picks up the change without scanning the file system (`lore dirty`). The mark is local and never committed or pushed.
 
 Compare to: stage.
 
+Also see: scan.
+
+### Divergent
+
+The status of a branch whose local latest isn't known to be on the remote's history line for the branch, as after a commit the remote doesn't have yet. The remote's history line for a branch is the remote latest and the revisions it reaches by following each revision's first parent.
+
+Compare to: convergent.
+
+Also see: latest, push, sync.
+
+## E
+
+### Eviction
+
+The removal of the least recently used content from the local store to keep it under its capacity. Lore evicts only content the remote also holds, and fetches it again when needed.
+
+Also see: compaction, lazy fetch.
+
 ## F
+
+### Fast-forward merge
+
+A push option that has the server merge the pushed revision into the branch when the branch's latest has moved (`lore push --fast-forward-merge`). The server merges only if there are no conflicts; otherwise pushing fails.
+
+Compare to: merge.
 
 ### FastCDC
 
@@ -142,21 +340,23 @@ A chunking strategy that places fragment boundaries at fixed byte offsets regard
 
 Compare to: content-defined chunking.
 
-### Fork
-
-A separate partition with its own access control that shares a source repository's initial content but evolves independently, distinct from a branch. It's a [planned future capability](roadmap.md), filled in lazily through copy-on-read.
-
-Compare to: branch, partition.
-
 ### Fragment
 
 The content-addressed unit of storage in Lore. Files are split into fragments and the repository tracks fragments by hash; identical fragments are deduplicated across the store.
 
 ### Fragment reference
 
-An entry in a fragment list recording the hash of a child fragment and the byte offset it represents in the reassembled content; the offset is what makes sparse, range-based reads possible.
+An entry in a fragment list recording the hash of a child fragment and the byte offset it represents in the reassembled content; the offset is what makes sparse, range-based reads possible. An entry with the zero hash stands for a hole.
 
-Also see: fragment, chunking.
+Also see: fragment, chunking, hole.
+
+## G
+
+### Garbage collection
+
+The reclaiming of space in the local repository store. An incremental pass runs in the background after writes, unless suppressed with `--no-gc`, and `lore repository gc` always runs a full pass.
+
+Also see: compaction, eviction.
 
 ## H
 
@@ -166,11 +366,49 @@ A 32-byte BLAKE3 hash of a content payload, Lore's content address throughout. T
 
 Also see: address, BLAKE3, partition.
 
+### Hash signature
+
+The hash that identifies a revision, derived from its serialized state, including its parent revision hashes and the hashes of the data it contains. Its whole 64-character form is accepted as a revision identifier.
+
+Also see: revision, revision identifier.
+
+### Heal
+
+To repair a problem that verify found (`lore repository verify --heal`). A damaged fragment is fetched again from the remote.
+
+Also see: verify.
+
+### History
+
+The ordered list of revisions reachable from a starting revision, newest first, for a repository, branch, or file (`lore history`, `lore file history`).
+
+Also see: revision graph.
+
+### Hole
+
+A range of a file the file system records as holding no written data: one never written, which it maps to no storage, or one it records as allocated and never written. It reads as zeros, and content stored with its holes skipped records each as a fragment reference with the zero hash.
+
+Also see: fragment reference.
+
 ## I
+
+### Identity
+
+The user identity Lore records on the revisions committed from a repository. It's set when the repository is created or cloned.
+
+Also see: identity token.
+
+### Identity token
+
+A token that proves who a user is to the authentication service, kept on the machine after login. Lore exchanges it for access tokens to reach repositories.
+
+Compare to: access token.
+
+Also see: authentication service, JWT.
 
 ### Ignore file
 
-An outbound filter (`.loreignore`) declaring which paths are excluded from staging and committing. It applies only to new content; a file already in the committed revision keeps flowing through until explicitly removed.
+A list of path patterns for new files that Lore leaves out of staging and committing: `.loreignore` in the repository, and `.lore/ignore` for one instance only. Files already in the repository aren't affected. For the rule syntax, see [Write view filters and ignore files](how-to/write-view-filters-and-ignore-files.md).
 
 Compare to: view filter.
 
@@ -180,9 +418,27 @@ The content-addressed data store that holds every byte Lore persists, keyed by B
 
 Compare to: mutable store.
 
+### Indeterminate
+
+The caught-up check's result when its walk through a file's history runs out of budget before it can place the branch as ahead or behind. Under strict chain enforcement the lock request is denied, and an `Owner` or `Admin` can grant past it (`lore lock acquire --override-indeterminate`); under advisory chain enforcement it's granted with a warning.
+
+Also see: caught up, ahead, behind.
+
+### Inherited metadata
+
+Metadata keys carried from a source revision onto the revision that merging or cherry-picking creates (`--inherit-metadata <key>`, or `*` for every key not reserved to the operation). Nothing is carried unless requested.
+
+Also see: metadata, merge.
+
 ### Instance
 
 See repository instance.
+
+### Instance registration
+
+The entry in the mutable store that points to a repository instance's ID and path, kept in a metadata blob in the local store, so each instance over the store can find the others. `lore repository instance list` lists the registered instances, and `lore repository instance prune` removes the registrations whose instance is gone or whose data is missing from the local store or malformed.
+
+Also see: repository instance, mutable store.
 
 ## J
 
@@ -197,47 +453,85 @@ JWT <https://datatracker.ietf.org/doc/html/rfc7519>
 
 ### Latest
 
-The pointer to the most recent revision on a branch, held in the mutable store. Lore's analog to Git's `HEAD`, but per-branch and never a roving pointer that can detach; a client's latest and the remote's may diverge until a sync.
+The pointer to a branch's most recent revision. The local and remote latest can differ until the next sync.
 
-Also see: branch, mutable store, sync.
+Compare to: chain latest.
+
+Also see: branch, mutable store, sync, reset.
+
+### Latest entry
+
+The lock store's record of a file's chain latest in one scope, keyed by the scope and the file: the concluded content, the revision that produced it, and, while one is set, the off-protocol marker. A concluded delete turns it into a tombstone.
+
+Also see: chain latest, tombstone, off-protocol edit.
 
 ### Layer
 
-A local overlay of a subset of one repository's content onto another at a path, applied at materialization time and not stored in any revision. It's configured per machine and absent from every clone — two machines on the same revision can layer differently. One of two Lore analogs to a Git submodule.
+A per-machine overlay of part of another repository at a mount path in this one, not recorded in any revision. One of two Lore analogs to a Git submodule.
 
 Compare to: link.
+
+Also see: mount path.
 
 ### Lazy fetch
 
 The default model in which a client pulls only the fragments it needs, on demand, leaving the rest on the remote.
 
+Compare to: prefetch.
+
 Also see: sparse working tree, fragment.
+
+### Lease
+
+How long a held lock lasts without work on it. The holder's own work on the file renews it — marking the file dirty, committing a change to it, or pushing a change to it — and a lock left untouched for the whole lease is released without concluding. A lock taken through the original lock service lasts 30 days, renewed by any call its owner makes to that service.
+
+Also see: lock (n), session.
 
 ### Link
 
-A reference from one repository to a specific revision and subtree of another, mounted at a path and recorded in the parent's revision — so it travels with every clone of that revision. Each linked repository is its own partition with its own access control, which is how Lore expresses per-directory access policy. The other Lore analog to a Git submodule.
+A reference from one repository to a revision of another, mounted at a path and recorded in the parent's revisions, so every instance cloned from them has it. The other Lore analog to a Git submodule.
 
 Compare to: layer.
 
-Also see: partition.
+Also see: mount path, pin, partition.
 
-### Lock
+### Lock (n)
 
-A server-recorded, exclusive, file-level claim meant to facilitate coordinated edits to content that can't be merged automatically, such as a binary asset or a serialized scene. Acquiring a lock fails if another user already holds one on the same resource, but locks are *advisory*: the storage, push, and merge paths never consult them, so holding a lock does not stop another user from committing or pushing a change to that file — honoring locks is the responsibility of the client application.
+An exclusive hold on a file in one scope, held by a branch and the authenticated user who took it until its session concludes or the lock is released. A push from that user to that branch concludes the session by default when the session changed the file. That user can move the lock to another branch in the scope without ending the session (`lore lock acquire --from`). For an unmergeable file, repository policy decides whether a push that changes the file without its lock is refused or lands with a warning.
 
-Also see: binary-first.
+Also see: scope, session, unmergeable file, binary-first.
+
+### Lock (v)
+
+To take a file's lock for a branch and the authenticated user (`lore lock acquire`), so no other branch in its scope, and no other user on the branch, can lock the file until the session ends. Locking fails while another branch in the scope holds the lock, or another user does on the branch unless the caller holds the conclude-on-behalf permission, `Owner` or `Admin`; and, for an unmergeable file under strict chain enforcement, when the branch is behind on it or the check is indeterminate.
+
+### Lock scope
+
+See scope.
 
 ### Lore
 
 The product, the system, the project, and the open-source project. Capital `L` when referring to any of these. Lowercase `lore` (in a code span) refers to the CLI binary or a command.
 
+### Lore directory
+
+The `.lore/` folder of a repository instance that holds the instance's local state: its instance ID, repository config, view filter, ignore file, modified-time records, and, unless a shared store is used, its local stores. A virtual instance keeps it outside its working tree, in its external directory.
+
+Also see: repository instance, view filter.
+
 ## M
 
-### Merge revision
+### Machine server
 
-A revision with two parents instead of one, recording both parent state hashes; its tree combines the two parent trees. Lore produces a merge revision when reconciling divergent branch history, including by sync.
+A Lore server on a build machine that caches content for the containers on that machine and passes their requests on to the upstream. Containers on the machine share one cache instead of each fetching from the remote.
 
-Also see: revision, sync.
+Also see: upstream, remote.
+
+### Merge
+
+To combine two separate lines of history into one new merged revision (`lore branch merge`). If both sides changed the same content in incompatible ways, merging stops so the user can resolve the conflicts.
+
+Also see: conflict, three-way merge.
 
 ### Merkle tree
 
@@ -248,13 +542,33 @@ Merkle tree <https://en.wikipedia.org/wiki/Merkle_tree>
 
 ### Metadata
 
-A typed key-value blob attached to a file, revision, branch, or repository — the primary extension point for built-in system data (commit message, timestamps) and arbitrary application data. Revision and file metadata are part of immutable history; branch and repository metadata are mutable annotations.
+Typed key-value data attached to a file, revision, branch, or repository, used by Lore and by applications. Revision and file metadata are part of history; branch and repository metadata can change.
 
-Also see: immutable store, mutable store.
+Also see: immutable store, mutable store, inherited metadata.
+
+### Mine
+
+In conflict resolution, the local side: the changes already on the current branch. Resolving a path as mine keeps them (`resolve mine`).
+
+Compare to: theirs.
+
+Also see: conflict, resolve.
+
+### Modified-time record
+
+The time at which a file of an instance last held its revision's content, kept so a scan can skip hashing a file whose time has not moved. Cloning an instance carries over its source's records.
+
+Also see: repository instance, scan.
+
+### Mount path
+
+The path in a repository at which a link or layer is placed. Commands that act on a single link or layer identify it by its mount path (`--link`, `--layer`).
+
+Also see: link, layer.
 
 ### Multi-tenancy
 
-Hosting many unrelated repositories on one backend deployment without cross-tenant content leakage, even when tenants can guess each other's content hashes. It's enforced by partition-scoped access.
+Hosting many unrelated repositories on one backend deployment without cross-tenant content leakage, even when tenants can guess each other's content hashes. It's enforced by per-partition access.
 
 Also see: partition.
 
@@ -264,71 +578,197 @@ The small key-value store holding state that content addressing can't express �
 
 Compare to: immutable store.
 
+## N
+
+### Notification
+
+An event the remote publishes about a repository, such as a branch push or a lock, that clients can subscribe to (`lore notification subscribe`). Tools can use them to react to changes without polling the remote.
+
+Also see: remote.
+
 ## O
 
 ### Obliteration
 
-The removal of a fragment's payload bytes while its address is preserved in the store's index, so revisions that reference it stay structurally valid. A read of an obliterated fragment returns a typed absence rather than data or corruption; the scope is a file's context, so obliterating one file never disturbs another that shares bytes.
+The permanent removal of stored content, while the revisions that reference it stay valid (`lore file obliterate`). Reading obliterated content finds nothing, and other files that share the same bytes are unaffected.
 
 Also see: context, address.
+
+### Off-protocol edit
+
+A change to an unmergeable file that landed without the protocol's approval: a push that changed the file without its lock under advisory lock enforcement or while the lock store couldn't be reached, or a conclusion from a branch that's behind under advisory chain enforcement. The latest entry records the most recent one until a conclusion from a branch that isn't behind clears it, and the audit trail records each.
+
+Also see: latest entry, chain latest.
+
+### Offline mode
+
+A mode in which commands work only with what's on the machine, without contacting the remote (`--offline`). Commands that can't work without the remote fail instead of trying to connect.
+
+Also see: remote URL.
 
 ## P
 
 ### Partition
 
-A 16-byte opaque identifier that scopes content in the storage subsystem and is Lore's access boundary: every fragment and mutable-store key belongs to exactly one partition, and a session is authorized per partition. Each repository corresponds to one partition.
+A 16-byte opaque identifier that namespaces content in the storage subsystem and is Lore's access boundary: every fragment and mutable-store key belongs to exactly one partition, and a connection is authorized per partition. Each repository corresponds to one partition.
 
 Also see: multi-tenancy, context.
 
+### Pin
+
+The branch or specific revision a link tracks in its target repository. A pin is set when the link is added and changed with `lore link update`.
+
+Also see: link.
+
+### Prefetch
+
+Fetching a listed set of files while cloning, before they're needed (`lore clone --prefetch <file>`).
+
+Compare to: lazy fetch.
+
+### Protected branch
+
+A branch that only users with the push-protected permission can push to (`lore branch protect`). Other branches need only the write permission. From the CLI, protecting or unprotecting a branch needs the write permission and the set-protected, admin or owner permission, or only the write permission for the repository's creator.
+
+Also see: branch, push.
+
+### Purge
+
+To permanently remove what the default form of an operation leaves in place. The `--purge` option of resetting paths or removing a layer also deletes files Lore doesn't track, and `lore scope purge` removes a scope's metadata and latest entries, which archiving the scope keeps.
+
+Also see: reset, layer, scope.
+
+### Push
+
+To send local revisions on a branch to the remote (`lore push`, `lore branch push`). Without a branch argument, the current branch is pushed.
+
+Compare to: sync.
+
+Also see: remote, protected branch.
+
 ## R
-
-### Rebase
-
-To replay a chain of revisions onto a different parent, writing fresh revisions and advancing the branch's latest pointer to the final replayed revision; the original chain still exists in the immutable store.
-
-Compare to: cherry-pick, squash.
 
 ### Remote
 
 The collective server-side environment for a repository — one or more Lore server processes with optional cache, replica, and storage tiers, operated as a unit and serving as the source of truth. The terms remote, backend, and deployment are used interchangeably.
 
-Also see: sync.
+Also see: sync, remote URL.
+
+### Remote URL
+
+The URL that locates a repository on a remote, such as `lore://127.0.0.1:41337/my-project`. It's written to the repository's `config.toml` as `remote_url` when the repository is created or cloned, and is treated as fixed afterwards.
+
+Also see: remote.
+
+### Repository
+
+The versioned collection of a project's files and directories, together with its revisions, branches, and metadata, identified by a name or ID on a remote. Each repository corresponds to one partition.
+
+Also see: partition, repository instance, remote.
 
 ### Repository instance
 
-A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`. Closest Git analog: worktree, but every instance is a peer and none is a main repository; see [Run parallel instances over a shared store](how-to/run-parallel-instances-over-a-shared-store.md).
+A local working directory of a repository, with its own working tree, view filter and staged changes, identified by an ID in `.lore/instance`. Several instances can share one shared store, so content is fetched and stored only once. The closest Git analog is a worktree, but every instance is an equal peer; see [Run parallel instances over a shared store](how-to/run-parallel-instances-over-a-shared-store.md).
 
-Also see: shared store, working tree.
+Also see: shared store, working tree, Lore directory.
+
+### Reset
+
+To return something to an earlier state, discarding what changed since. Resetting files discards their local changes and returns them to a revision's content, by default the current revision's (`lore reset`). Resetting a branch moves its local latest to another revision without creating a new revision (`lore branch reset`).
+
+Compare to: unstage.
+
+Also see: purge, latest.
+
+### Resolve
+
+To mark a conflicted path as settled, either after editing it or by taking one side with `resolve mine` or `resolve theirs` (`lore branch merge resolve`). Staging the file alone doesn't resolve it.
+
+Compare to: unresolve.
+
+Also see: conflict, mine, theirs.
+
+### Restore
+
+To make an earlier revision's content the branch's newest state by committing it as a new revision (`lore revision restore`). History is kept: the new revision's parent is the branch's latest. Restoring an archived scope (`lore scope restore`) brings back its name instead.
+
+Compare to: revert, reset.
+
+Also see: archive.
+
+### Revert
+
+To undo a revision's changes by applying their inverse to the current revision (`lore revision revert`). Conflicts are resolved the same way as when merging or cherry-picking.
+
+Compare to: cherry-pick, restore.
+
+Also see: conflict.
 
 ### Revision
 
-A frozen snapshot of the entire repository tree, identified by the hash of its serialized state and forming a node in the revision graph; each revision has one parent, or two on a merge. Lore-distinctive — not collapsed into "commit": committing changes produces a revision.
+A frozen snapshot of the whole repository tree, identified by its hash signature. Each revision has one parent, or two when two lines of history were merged into it. Committing creates a revision.
 
 Compare to: commit.
 
-Also see: revision graph, merge revision.
+Also see: revision graph, merge, hash signature.
 
 ### Revision graph
 
-The directed acyclic graph (DAG) of revisions, in which every edge is a cryptographic parent link. Branches are named pointers into this graph; merge, rebase, and cherry-pick produce new nodes in it.
+The directed acyclic graph (DAG) of revisions, in which every edge is a cryptographic parent link. Branches are named pointers into this graph; merging and cherry-picking produce new nodes in it.
 
 Also see: revision, branch.
 
 ### Revision identifier
 
-How a revision is named to a command or across the API: its whole 64-character hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch the instance is on.
+A string that names a revision to a command: its full hash signature, or a branch followed by `@` and a revision number, `LATEST`, or a hash, such as `main@5` or `main@LATEST`. Leaving out the branch means the current branch, and a `~<count>` suffix steps back that many parent revisions.
 
-A revision identifies the branch it was created on. A branch point can also identify the child branch by naming that child branch.
+Also see: revision, branch, latest, revision number, hash signature.
 
-A `~<count>` suffix walks that many parent revisions from the revision named. A partial hash signature is not an identifier.
+### Revision number
 
-Also see: revision, branch, latest.
+A sequential number that identifies a revision on a branch, used in the `[branch]@<number>` form of a revision identifier. `lore revision find number` looks a revision up by number.
+
+Also see: revision identifier.
+
+### Root file
+
+A file named as the starting point when cloning or syncing by dependency (`--root-file`). Lore transfers the root files and, following their dependencies, the files they need.
+
+Also see: dependency, selective sync.
 
 ## S
 
+### Scan
+
+A walk of the file system under given paths that reconciles each file against the current revision, setting dirty flags on detected modifications, adds, and deletes and clearing stale ones (`lore status --scan`, `lore stage --scan`). Without a scan, Lore reports only files already marked dirty.
+
+Also see: dirty, stage.
+
+### Scope
+
+A server-side unit of lock causality in a repository, with its own ID, name and lifecycle (`lore scope`). Each branch belongs to one scope, set when the branch is created — its parent's unless it names another — and branches in one scope share each file's lock and each unmergeable file's chain latest.
+
+Also see: chain latest, lock (n), branch.
+
+### Selective sync
+
+Cloning or syncing limited to chosen root files and the files they depend on (`--root-file`). Dependency tags and a depth limit narrow which dependencies are followed.
+
+Also see: dependency, root file, sparse working tree.
+
+### Service process
+
+A long-running `lore` process that carries out CLI commands for the processes that issue them, so one service process handles every command a user runs on a machine (`lore service`). Commands use it automatically once it's configured.
+
+### Session
+
+The life of one lock, from acquiring it to concluding or releasing it; moving the lock to another branch in its scope continues the session. A push to the branch that holds the lock concludes the session by default when the session changed the file, so a session lasts one push unless the holder keeps the lock across several. Only a session that concludes moves the file's chain latest.
+
+Also see: conclude, lock (n).
+
 ### Shared store
 
-A single on-disk immutable and mutable store referenced by one or more instances on a machine. Instances over the same shared store share fragment storage and cache while keeping independent working trees, views, and staged state.
+A single on-disk immutable and mutable store referenced by one or more instances on a machine. Instances over the same shared store share fragment storage and cache while keeping independent working trees, views, and staged state. A shared store is backed by a remote, can be registered as the machine's default, and is managed with `lore shared-store`.
 
 Also see: repository instance, immutable store, mutable store.
 
@@ -338,36 +778,88 @@ A working tree that materializes only the subset of the repository the user has 
 
 Also see: view filter, lazy fetch.
 
-### Squash
+### Stage
 
-To collapse a chain of revisions into one revision whose tree is the chain's final state and whose parent is the revision before the chain. The squashed revision is freshly written; the collapsed chain remains in the store but unreachable from the branch.
+To mark a file or directory for inclusion in the next committed revision (`lore stage`). Staging records the path, not its content, which is read when committing. Staging a directory includes only the files in it already marked dirty.
 
-Compare to: rebase, cherry-pick.
+Compare to: unstage.
 
-### Stage (v)
+### Staged revision
 
-To record the intent to include a file's change in the next revision (`lore stage <path>`). Staging pins the path, not the content: the commit captures whatever the file looks like at commit time, and fragments are produced at commit, not at stage.
+The pending revision assembled from the staged changes, which `lore commit` records as a new revision. `lore status` reports it together with the dirty files.
 
-### Stage (n)
+Also see: stage, commit.
 
-The set of file paths marked for inclusion in the next revision.
+### SWFS
 
-Compare to: dirty.
+Epic's Split Write File System (SWFS), a virtual file system that can provide a repository's directory instead of files materialized directly on disk (`--vfs swfs`).
+
+Also see: VFS.
 
 ### Sync
 
-Lore's analog to Git's `pull`: fetch the new remote revisions on a branch and merge them with the local latest, producing a merge revision (`lore sync`).
+To fetch a branch's new remote revisions and merge them with the local latest (`lore sync`). It can also move the instance to any given revision. It's Lore's analog to Git's `pull`.
 
-Also see: merge revision, remote.
+Compare to: push.
+
+Also see: merge, remote, revision identifier.
 
 ## T
 
+### Targets file
+
+A file listing the paths a command acts on, passed with `--targets` instead of naming each path on the command line.
+
+### Theirs
+
+In conflict resolution, the incoming side: the source branch in a merge operation, or the revision being cherry-picked or reverted. Resolving a path as theirs takes those changes (`resolve theirs`).
+
+Compare to: mine.
+
+Also see: conflict, resolve.
+
 ### Three-way merge
 
-A merge that uses a common ancestor revision plus the two revisions being merged, preserving changes from both sides where they don't conflict. Lore ships a default three-way text merge in the revision control subsystem; applications can replace it.
+A merge operation that uses the base revision of the two revisions being merged, preserving changes from both sides where they don't conflict. Lore ships a default three-way text merge algorithm in the version control subsystem; applications can replace it.
+
+Also see: base revision.
 
 For more information, see:
 Three-way merge <https://en.wikipedia.org/wiki/Merge_(version_control)>
+
+### Tombstone
+
+The latest entry a concluded delete leaves in place of a file's chain latest. It keeps the file's last concluded content, so a branch that still has the file is judged against that content, and a branch that carries the delete can lock the file to bring it back.
+
+Also see: chain latest, latest entry.
+
+## U
+
+### Unmergeable file
+
+A file whose divergent edits can't be combined, such as a binary asset, so changing it takes its lock. The repository defines which files are unmergeable.
+
+Also see: lock (n), chain latest.
+
+### Unresolve
+
+To mark a previously resolved path as conflicted again so it can be resolved differently (`lore branch merge unresolve` and the matching cherry-pick and revert commands).
+
+Compare to: resolve.
+
+### Unstage
+
+To remove a path's change from the staged set so it's left out of the next revision (`lore unstage`).
+
+Compare to: stage, reset.
+
+### Upstream
+
+The remote that another Lore server, such as a machine server, reaches through a `remote` store: it reads the content it lacks from there and writes content through to it.
+
+Compare to: remote.
+
+Also see: machine server.
 
 ## V
 
@@ -375,9 +867,25 @@ Three-way merge <https://en.wikipedia.org/wiki/Merge_(version_control)>
 
 A version control system (VCS) is software that records and manages changes to files over time. Lore is a VCS.
 
+### Verify
+
+To check a repository's state, or a single fragment in the local store, for consistency (`lore repository verify`). Problems can be repaired with `--heal`.
+
+Also see: heal, fragment.
+
+### VFS
+
+A virtual file system (VFS) presents a repository's files without writing them all to disk (`--vfs`). Lore can use the system's preferred VFS or a specific one, such as SWFS.
+
+Also see: SWFS.
+
+### View
+
+See view filter.
+
 ### View filter
 
-A client-side, glob-based inbound filter (`.lore/view`) declaring which paths are materialized to disk. It's applied on every materialization — clone, sync, branch switch, restore — not only at clone time, and local to an instance so it never travels with a clone. Mechanically close to a Perforce stream view but per-instance; closest Git analog: sparse-checkout.
+A per-instance list of path patterns (`.lore/view`) that decides which of the repository's files are written to disk. It applies every time files are written, such as when cloning, syncing, or switching branches, and isn't shared through the remote. The closest Git analog is sparse-checkout. For the rule syntax, see [Write view filters and ignore files](how-to/write-view-filters-and-ignore-files.md).
 
 Compare to: ignore file.
 

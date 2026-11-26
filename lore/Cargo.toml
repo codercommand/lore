@@ -11,14 +11,15 @@ test = false
 [dependencies]
 bitcode = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
+smallvec = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
@@ -35,23 +36,50 @@ lore-notification = { workspace = true }
 [target.'cfg(target_family = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
-    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_Threading",
 ] }
 
 [features]
 default = []
 oodle = ["lore-revision/oodle"]
-swfs = ["lore-revision/swfs"]
-test-util = []
+test-util = ["lore-revision/test-util"]
+# The `revision_tree_bench` example, built only on demand.
+revision-tree-bench = ["test-util", "lore-base/test-util", "lore-revision/bench"]
+# The C API's scenarios of the State's node operations (`tests/state_scenarios`), which drive
+# lore-revision's scheduling points and so run only by hand.
+state-stress = ["lore-revision/state-stress"]
 
 [dev-dependencies]
+async-trait = { workspace = true }
 # The unit-test binary's process sandbox, set up before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+# The scratch directories on a verified volume that the external root's tests move in.
+lore-io = { workspace = true, features = ["test-util"] }
+lore-storage = { workspace = true, features = ["test-util"] }
+# The tests that write node blocks directly (`NodeBlock::write_for_tests`).
+lore-revision = { workspace = true, features = ["test-util"] }
+# The connections the revision graph's context tests connect over (`Connection::detached`).
+lore-transport = { workspace = true, features = ["test-util"] }
+# The futures of the State node harness the C API's scenarios include.
+pin-project = { workspace = true }
 rand = { workspace = true }
 serial_test = { workspace = true }
 lore = { workspace = true, features = ["test-util"] }
+
+[[example]]
+name = "revision_tree_bench"
+path = "examples/revision_tree_bench/main.rs"
+required-features = ["revision-tree-bench"]
+
+# The C API's scenarios of the State's node operations, run by hand: naming the feature keeps a
+# plain `cargo test` testing the build that ships, without lore-revision's scheduling points.
+[[test]]
+name = "state_scenarios"
+path = "tests/state_scenarios/main.rs"
+required-features = ["state-stress"]
 
 [lints]
 workspace = true

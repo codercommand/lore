@@ -6,7 +6,6 @@ use lore_error_set::prelude::*;
 use serde::Serialize;
 
 use super::MetadataErrors;
-use crate::errors::FileNotFound;
 use crate::event;
 use crate::interface::LoreString;
 use crate::lore::Hash;
@@ -16,11 +15,10 @@ use crate::node::NodeFileMetadataBlock;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
-use crate::util::path::RelativePath;
 
 /// Data for an event reporting that revision metadata was cleared.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataClearRevisionEventData {
     /// Hash of the revision whose metadata was cleared.
@@ -29,7 +27,7 @@ pub struct LoreMetadataClearRevisionEventData {
 
 /// Data for an event reporting that a file's metadata was cleared.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataClearFileEventData {
     /// Path of the file whose metadata was cleared.
@@ -49,9 +47,10 @@ pub(crate) async fn clear_revision(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<MetadataErrors>("deserializing state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<MetadataErrors>("deserializing state")?;
 
     state.set_metadata_hash(Hash::default());
 
@@ -99,25 +98,14 @@ pub async fn clear_file(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<MetadataErrors>("deserializing state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<MetadataErrors>("deserializing state")?;
 
-    let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
-        .forward::<MetadataErrors>("resolving user path")?;
+    let node = super::file_node_outside_links(&state, &repository, &path).await?;
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
-        .await
-        .forward::<MetadataErrors>("finding node")?;
-    if !node_link.is_valid() {
-        return Err(FileNotFound {
-            resource: path.clone(),
-        }
-        .into());
-    }
-
-    let metadata_node = node::node_to_file_metadata(node_link.node);
+    let metadata_node = node::node_to_file_metadata(node);
     let block_index = NodeFileMetadataBlock::index(metadata_node);
     let node_index = NodeFileMetadata::index(metadata_node);
 
@@ -137,7 +125,6 @@ pub async fn clear_file(
 
     if dirtied {
         state.block_file_metadata_modified(metadata_block, block_index);
-        state.mark_dirty();
     }
 
     // Serialize the new current state

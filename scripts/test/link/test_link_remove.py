@@ -8,6 +8,10 @@ from link_helpers import DEFAULT_PARENT_FILE, make_parent_with_link
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_remove_keeps_uncommitted_local_edit(new_lore_repo):
@@ -51,7 +55,8 @@ def test_link_remove_keeps_staged_local_edit(new_lore_repo):
 
 @pytest.mark.smoke
 def test_link_remove_keeps_untracked_file_under_mount(new_lore_repo):
-    """Unlinking deletes the mount wholesale, untracked files included."""
+    """Unlinking deletes the files the link tracks and keeps an untracked one,
+    as deleting a folder does, and says so."""
     link_path = "libs/shared"
     untracked_file = f"{link_path}/deep/scratch.txt"
     parent_repo, _link_repo = make_parent_with_link(
@@ -60,10 +65,12 @@ def test_link_remove_keeps_untracked_file_under_mount(new_lore_repo):
 
     parent_repo.write_files({untracked_file: "not tracked yet\n"})
 
-    with pytest.raises(LocalModificationsError):
-        parent_repo.link_remove(link_path)
+    output = parent_repo.link_remove(link_path)
 
-    assert parent_repo.file_exists(untracked_file)
+    assert f"Kept 1 untracked entry in link mount {link_path}" in output
+    assert not parent_repo.file_exists(f"{link_path}/deep/inner.txt")
+    with parent_repo.open_file(untracked_file) as f:
+        assert f.read() == "not tracked yet\n"
 
 
 @pytest.mark.smoke
@@ -103,6 +110,39 @@ def test_link_remove_force_discards_local_edit(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_remove_takes_a_case_variant_of_a_pinned_file(new_lore_repo):
+    """A file spelled in another case holding the pinned content is no local work."""
+    link_path = "libs/shared"
+    parent_repo, _link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    parent_repo.move(f"{link_path}/deep/inner.txt", f"{link_path}/deep/Inner.txt")
+
+    parent_repo.link_remove(link_path)
+
+    assert "No links found in this repository" in parent_repo.link_list()
+
+
+@pytest.mark.smoke
+def test_link_remove_keeps_a_modified_case_variant_of_a_pinned_file(new_lore_repo):
+    """A file spelled in another case holding other content than the pinned file is local work."""
+    link_path = "libs/shared"
+    parent_repo, _link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    variant = f"{link_path}/deep/Inner.txt"
+    parent_repo.move(f"{link_path}/deep/inner.txt", variant)
+    parent_repo.write_files({variant: "locally edited\n"})
+    with pytest.raises(LocalModificationsError):
+        parent_repo.link_remove(link_path)
+
+    with parent_repo.open_file(variant) as f:
+        assert f.read() == "locally edited\n"
+
+
+@pytest.mark.smoke
 def test_link_remove_ignores_changes_outside_the_mount(new_lore_repo):
     """The guard scans the whole working tree, so it must filter to the mount."""
     link_path = "libs/shared"
@@ -126,13 +166,16 @@ def test_link_remove_ignores_changes_outside_the_mount(new_lore_repo):
 @pytest.mark.smoke
 def test_link_remove_keeps_ignored_file_under_mount(new_lore_repo):
     """Ignoring a file says it is not Lore's to track, not that it is worthless
-    - a key or a local config is exactly the sort of thing that gets ignored,
-    and removal takes the whole mount with it.
+    - a key or a local config is exactly the sort of thing that gets ignored.
+    Removal takes the link's content and the folders it leaves empty, keeps the
+    ignored file, and says so.
     """
     link_path = "libs/shared"
     ignored_file = f"{link_path}/deep/local.key"
     parent_repo, _link_repo = make_parent_with_link(
-        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+        new_lore_repo,
+        link_path,
+        {"deep/inner.txt": "pinned content\n", "other/file.txt": "pinned\n"},
     )
 
     with parent_repo.open_file(parent_repo.ignore_file(), "w+") as ignore_file:
@@ -140,12 +183,15 @@ def test_link_remove_keeps_ignored_file_under_mount(new_lore_repo):
     parent_repo.write_commit_push("Add ignore file", {"placeholder.txt": "x\n"})
     parent_repo.write_files({ignored_file: "secret\n"})
 
-    with pytest.raises(LocalModificationsError):
-        parent_repo.link_remove(link_path)
+    output = parent_repo.link_remove(link_path)
 
-    assert parent_repo.file_exists(ignored_file), (
-        "An ignored file must survive a refused remove"
+    assert f"Kept 1 ignored entry in link mount {link_path}" in output
+    assert not parent_repo.file_exists(f"{link_path}/deep/inner.txt")
+    assert not parent_repo.file_exists(f"{link_path}/other"), (
+        "A folder the removal leaves empty must go"
     )
+    with parent_repo.open_file(ignored_file) as f:
+        assert f.read() == "secret\n", "An ignored file must survive the remove"
 
 
 @pytest.mark.smoke
@@ -191,3 +237,22 @@ def test_link_remove_of_committed_link_deletes_the_mount_directory(new_lore_repo
     assert not parent_repo.file_exists(link_path), (
         "Removing a committed link must delete the mount directory"
     )
+
+
+@pytest.mark.smoke
+def test_link_remove_then_replace_at_the_mount_commits(new_lore_repo):
+    """Removing a link and staging a folder at its mount commits both in one revision."""
+    replacement = {"shared/a.txt": "folder\n", "shared/sub/b.txt": "nested\n"}
+    parent, _ = make_parent_with_link(new_lore_repo, "shared")
+
+    parent.link_remove("shared")
+    parent.write_files(replacement)
+    parent.stage("shared", scan=True)
+    parent.commit("Replace the link")
+    parent.push()
+
+    clone = parent.clone()
+    for path, content in replacement.items():
+        with clone.open_file(path) as f:
+            assert f.read() == content, f"{path} must hold the replacement content"
+    assert "No links found" in clone.link_list()

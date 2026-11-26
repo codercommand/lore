@@ -25,7 +25,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Result of a query against the immutable store for a single fragment.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStoreImmutableQueryEventData {
     /// Address of fragment
@@ -98,7 +98,6 @@ async fn immutable_query_address(
     })
     .send();
 
-    // Verify the local payload
     if has_local_payload
         && let Ok((fragment, payload)) = repository
             .immutable_store()
@@ -116,13 +115,12 @@ async fn immutable_query_address(
     }
 
     if !local
-        && let Ok(remote) = repository.remote().await
         && let Ok(remote_storage) = {
             let correlation_id = crate::lore::execution_context()
                 .globals()
                 .correlation_id
                 .to_string();
-            remote.session(repository.id, &correlation_id).await
+            crate::immutable::pooled_session(&repository, &correlation_id).await
         }
         && let Ok(result) = remote_storage
             .query(&[address])
@@ -135,8 +133,10 @@ async fn immutable_query_address(
             let fragment = if status == QueryStatus::ExistFullMatch
                 && let Ok((fragment, payload)) = remote_storage.get(&address).await
             {
-                maybe_fragment.replace(fragment);
-                maybe_payload.replace(payload);
+                if passes_receipt(&repository, address, fragment, &payload) {
+                    maybe_fragment.replace(fragment);
+                    maybe_payload.replace(payload);
+                }
                 fragment
             } else {
                 Fragment::default()
@@ -173,7 +173,11 @@ async fn immutable_query_address(
     {
         // Query the subfragments
         let payload = payload.to_aligned::<FragmentReference>();
-        for reference in payload.as_type_slice::<FragmentReference>() {
+        for reference in payload
+            .as_type_slice::<FragmentReference>()
+            .iter()
+            .filter(|reference| !reference.is_hole())
+        {
             let repository = repository.clone();
             let reference_address = Address {
                 hash: reference.hash,
@@ -198,6 +202,25 @@ async fn immutable_query_address(
     }
 
     Ok(())
+}
+
+/// Whether the payload the remote served for `address` passes the check on receipt, as the
+/// command's trust of its remote asks ([`lore_storage::read::check_receipt`]). A payload that fails
+/// is logged, and the query reports it as served without walking it.
+fn passes_receipt(
+    repository: &RepositoryContext,
+    address: Address,
+    fragment: Fragment,
+    payload: &bytes::Bytes,
+) -> bool {
+    let options = crate::immutable::read_options_from_repository(repository).no_decompress();
+    match lore_storage::read::check_receipt(&(fragment, payload.clone()), address, options) {
+        Ok(_) => true,
+        Err(err) => {
+            lore_error!("Fragment {address} as the remote serves it fails its check: {err}");
+            false
+        }
+    }
 }
 
 fn immutable_query_subfragment(

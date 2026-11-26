@@ -50,6 +50,10 @@ pub struct Config {
     /// has no opinion; the client's local configuration wins.
     #[prost(enumeration = "CompressionMode", optional, tag = "2")]
     pub compression_mode: ::core::option::Option<i32>,
+    /// Maximum number of resources the server accepts in a single lock, unlock or
+    /// lock-status request. `0` or absent means no advertised limit.
+    #[prost(uint32, tag = "3")]
+    pub max_lock_batch: u32,
 }
 impl ::prost::Name for Config {
     const NAME: &'static str = "Config";
@@ -90,9 +94,17 @@ pub struct Oidc {
     /// partition-scoped tokens.
     #[prost(string, tag = "7")]
     pub token_exchange_issuer: ::prost::alloc::string::String,
-    /// The claim clients record as the user identity.
+    /// Deprecated and left empty: the user identity is read from the token
+    /// itself, its `identity` claim or else `sub`. Kept so older peers decode.
+    #[deprecated]
     #[prost(string, tag = "8")]
     pub identity_claim: ::prost::alloc::string::String,
+    /// Scopes to request with the client credentials grant. Empty requests none,
+    /// leaving the client's default scopes to the provider.
+    #[prost(string, repeated, tag = "9")]
+    pub client_credentials_scopes: ::prost::alloc::vec::Vec<
+        ::prost::alloc::string::String,
+    >,
 }
 impl ::prost::Name for Oidc {
     const NAME: &'static str = "Oidc";

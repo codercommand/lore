@@ -56,6 +56,9 @@ message Config {
   // Preferred compression mode for new payloads. Unset means the server
   // has no opinion; the client's local configuration wins.
   optional CompressionMode compression_mode = 2;
+  // Maximum number of resources the server accepts in a single lock, unlock or
+  // lock-status request. `0` or absent means no advertised limit.
+  uint32 max_lock_batch = 3;
 }
 
 // The OpenID Connect provider clients log in at. An empty string means
@@ -79,8 +82,12 @@ message Oidc {
   // The issuer of the RFC 8693 token-exchange endpoint that mints
   // partition-scoped tokens.
   string token_exchange_issuer = 7;
-  // The claim clients record as the user identity.
-  string identity_claim = 8;
+  // Deprecated and left empty: the user identity is read from the token
+  // itself, its `identity` claim or else `sub`. Kept so older peers decode.
+  string identity_claim = 8 [deprecated = true];
+  // Scopes to request with the client credentials grant. Empty requests none,
+  // leaving the client's default scopes to the provider.
+  repeated string client_credentials_scopes = 9;
 }
 
 // Composite environment record returned by EnvironmentGet.

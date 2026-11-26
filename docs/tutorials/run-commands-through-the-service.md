@@ -12,7 +12,7 @@ The service and both settings are per user: the config is your user-level `confi
 
 ## Step 1 — Name the build that serves your commands
 
-Lore never guesses which executable to start as the service, so you name it once. Use the absolute path of the `lore` you want serving your commands.
+A command that the setting sends to the service starts one only from an executable you name, so the build serving your machine is one you chose. Name it once, with the absolute path of the `lore` you want serving your commands.
 
 <!-- tabs:start -->
 
@@ -50,7 +50,7 @@ lore service set-use-automatically true
 Lore commands will be carried out by the service
 ```
 
-Both settings are needed. With the setting on and no executable named, Lore tells you so and keeps running commands in the process you ran.
+Both settings are needed. With the setting on and no executable named, commands go to a service that's already running and fail with exit code 32 when none is, and Lore warns you of that when you turn the setting on.
 
 ## Step 3 — Run a command
 
@@ -77,7 +77,7 @@ Lore service is running
 
 ## Step 5 — See what the service is doing
 
-`lore service status` reports on the service without changing it. It names the build that is serving the machine, how long that service has been up, how many clients are connected to it, and how many SWFS mounts it holds. With nothing running it says so and still succeeds, so a script can branch on the output rather than on a connection failing.
+`lore service status` reports on the service without changing it. It names the build that is serving the machine, how long that service has been up, how many clients are connected to it, how many SWFS mounts it holds, its process ID, whether it runs inside another program, and the virtual instances it mounts with their global data directories. With nothing running it says so and still succeeds, so a script can branch on the output rather than on a connection failing. Either way it reports where the external directories of your virtual instances are, whether they can be used, and how many old directories are left to remove.
 
 ```bash
 lore service status
@@ -89,13 +89,20 @@ Lore service is running
   Uptime: 1h 4m 12s
   Connections: 1
   SWFS mounts: 0
+  Process ID: 4242
+  Runs inside another program: no
+  Mounted virtual instances: none
+  Global data directories of the mounts: none
+External directories: /home/you/.local/share/lore/external
+  State: can be used
+  Old directories to remove: 0
 ```
 
 The command counts its own connection, so a service nothing else is talking to reports one.
 
 Trouble the service ran into while no command was running is buffered and printed under the status that reports it: failures while it was initializing, failures in the loop that accepts connections, and errors raised by SWFS callbacks. A service that has hit none of those reports none, so a status with no messages under it is the healthy reading rather than a missing one.
 
-The buffer holds the most recent messages and is emptied as it is read, so each call shows what has arrived since the last one, and a call that finds messages were dropped says how many. These messages are the answer to the command that asked for them rather than diagnostics about it, so they are printed whatever `--log-level` is set to.
+The buffer holds the most recent messages and is emptied as it is read, so each call shows what has arrived since the last one, and a call that finds messages were dropped says how many. These messages are the answer to the command that asked for them rather than diagnostics about it, so they are printed whatever `--log-level` is set to. `lore service start` reads the buffer too, once a service is reachable, and prints its messages as logs of their level.
 
 ## Step 6 — Override the setting for one command
 
@@ -167,16 +174,13 @@ use_automatically = true
 
 ## Troubleshooting
 
-### Commands still run in the process that ran them
-
-Lore prints a warning naming what is missing:
+### A warning that no service executable is set
 
 ```text
-[Warn] No service executable is named, so commands will keep running in the process
-that runs them.
+[Warn] No service executable is set. Commands will use a service that is already running, but will fail if none is running. To let commands start a service when needed, set an executable with `lore service set-executable <path>`, or under [service] executable in the global config.
 ```
 
-Relaying needs the setting *and* an executable. Run `lore service set-executable <path>` to complete the pair. Clearing the executable with `lore service set-executable ""` is the other way back to a pair that does not relay.
+You turned the service on without naming an executable. Commands go to a service that's already running, and fail with exit code 32 when none is. Run `lore service set-executable <path>` so that they start one when needed.
 
 ### `Lore service unavailable`, exit code 32
 
@@ -187,9 +191,17 @@ starting /opt/lore/bin/lore failed: No such file or directory (os error 2)
 
 The command never ran, because no service could be reached and none could be started from the executable that is named. Check that the path in `[service] executable` still exists — this is what you see after a build directory is cleaned or a version is uninstalled. Exit code `32` means the service was unreachable, distinct from the command itself having run and failed, so a script can retry it after starting a service.
 
+### A service of another build refuses the command, exit code 32
+
+```text
+[Error] Failed to send command to Lore service because: Lore service unavailable: the Lore service is of a build whose messages differ from the client's (...); stop it with `lore service stop` to use a service of the client's build
+```
+
+The command never ran. A client and the service exchange commands only when they come from builds whose commands and events match, and the service running on the socket comes from another build than the `lore` you ran, typically one from before an update. `lore service status` is refused the same way. `lore service stop` still stops it, so name the build you want serving with `lore service set-executable <path>` if it changed, then run `lore service stop`. The next command starts a service from the named build. A service from a build that predates this check closes the connection on any command from a newer `lore`, the stop included: stop it with the `lore` it came from, or end its process.
+
 ### A command reached a service, but not the one you expected
 
-A build directory that is still on the machine keeps serving commands after you have moved on to another one, because the executable is resolved from the stored setting rather than from the client you ran. `lore service status` names the build that is actually serving the socket, so compare its `Executable` against the client you meant to use and re-run `lore service set-executable <path>` followed by `lore service stop` if they differ. The next command starts a service from the newly named build.
+A build directory that is still on the machine keeps serving commands after you have moved on to another one, because the executable is resolved from the stored setting rather than from the client you ran. Unless that build refuses your client's commands, as the previous section describes, `lore service status` names the build that is actually serving the socket, so compare its `Executable` against the client you meant to use and re-run `lore service set-executable <path>` followed by `lore service stop` if they differ. The next command starts a service from the newly named build.
 
 ### A test run or a second checkout keeps stopping your service
 

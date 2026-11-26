@@ -11,15 +11,13 @@ test = false
 [dependencies]
 async-trait = { workspace = true }
 bitcode = { workspace = true }
-bitflags = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
-crossbeam = { workspace = true }
+crossbeam-queue = { workspace = true }
 dashmap = { workspace = true }
 fastcdc = { workspace = true }
 futures = { workspace = true }
 lore-base = { workspace = true }
-hex = { workspace = true }
 libc = { workspace = true }
 lore-io = { workspace = true }
 lore-macro = { workspace = true }
@@ -32,13 +30,11 @@ pin-project = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 lore-error-set = { workspace = true }
 lore-telemetry = { workspace = true }
-uuid = { workspace = true, features = ["zerocopy"] }
 xxhash-rust = { workspace = true }
 zerocopy = { workspace = true }
 
@@ -46,13 +42,26 @@ zerocopy = { workspace = true }
 default = []
 failure_generator = []
 oodle = []
+store-stress = []
 test-util = []
 trace_log = []
+
+# The stress harness, run by hand through `scripts/store-stress/stress.py`, which enables
+# `store-stress`. Naming the feature here keeps `cargo test` and builds of all targets from
+# building it at all: it builds on Unix only, and is not part of any test run.
+[[example]]
+name = "store_stress"
+path = "examples/store_stress/main.rs"
+required-features = ["store-stress"]
 
 [dev-dependencies]
 # The shared test temp-directory helper.
 lore-base = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true, features = ["test-util"] }
+# A session over a stub peer, with no live connection behind it.
+lore-transport = { workspace = true, features = ["test-util"] }
+# `test-util` for paused time, so a retry ladder is asserted rather than spent.
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_family = "windows")'.dependencies]
 # `Win32_Storage_FileSystem` does not imply `Win32_Foundation`, and the packstore reads its error
@@ -62,6 +71,10 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
+
+# The hole tests write a file through a memory mapping.
+[target.'cfg(target_family = "windows")'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Memory"] }
 
 [lints]
 workspace = true

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use lore_base::env::CallEnvironment;
 use lore_base::error::RepositoryNotFound;
+use lore_base::error::ServiceUnavailable;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
 use lore_error_set::HasTrace;
@@ -26,16 +27,33 @@ use lore_revision::repository::get_dot_lore_path;
 use lore_revision::util;
 
 use crate::interface::LoreEventCallback;
+use crate::remote::call::EXTERNAL_ROOT_MOVING;
+use crate::remote::call::ServiceCallError;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
 
 tokio::task_local! {
     /// The environment of the process a call running in this task was relayed from.
     static RELAYED_ENVIRONMENT: CallEnvironment;
+    /// Set for a call the service socket answered with a move of the external root, which runs in
+    /// this process instead.
+    static EXTERNAL_ROOT_MOVE: ();
+}
+
+/// Runs `call`, handed back by the move reply, here: an open that finds no Lore directory fails
+/// with the move's `ServiceUnavailable`, as the stopped service has unmounted its instances.
+pub(crate) fn during_external_root_move<F: Future>(call: F) -> impl Future<Output = F::Output> {
+    EXTERNAL_ROOT_MOVE.scope((), call)
+}
+
+/// Whether the running call is one the move reply handed back, which runs here.
+pub(crate) fn runs_during_external_root_move() -> bool {
+    EXTERNAL_ROOT_MOVE.try_with(|()| ()).is_ok()
 }
 
 /// Runs `call`, relayed from a process with `environment`, so that the execution context it sets
 /// up reads that environment in place of this process's.
+#[lore_macro::test_pub]
 pub(crate) fn with_relayed_environment<F: Future>(
     environment: CallEnvironment,
     call: F,
@@ -43,11 +61,21 @@ pub(crate) fn with_relayed_environment<F: Future>(
     RELAYED_ENVIRONMENT.scope(environment, call)
 }
 
+/// The client execution context for a call whose events all go to `callback`.
 pub fn setup_execution(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Arc<ExecutionContext> {
-    let execution = ExecutionContext::new_client(globals, EventDispatcher::new(callback));
+    setup_execution_with(globals, EventDispatcher::new(callback))
+}
+
+/// The client execution context for a call whose events go through `dispatcher`. It reads the
+/// environment of the process the call was relayed from, if any, in place of this process's.
+pub fn setup_execution_with(
+    globals: LoreGlobalArgs,
+    dispatcher: EventDispatcher,
+) -> Arc<ExecutionContext> {
+    let execution = ExecutionContext::new_client(globals, dispatcher);
     Arc::new(match RELAYED_ENVIRONMENT.try_with(Clone::clone) {
         Ok(environment) => execution.with_environment(environment),
         Err(_) => execution,
@@ -105,8 +133,8 @@ where
                     Ok(repository) => repository,
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
-                let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
-                (detail, Some(post_command_cleanup(repository).await))
+                let detail = LoreErrorDetail::from_result(&command(repository.clone(), args).await);
+                (detail, Some(post_command_cleanup(repository)))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -122,8 +150,8 @@ where
 /// leaf-fetch writes (mtime cache, status flush) still see it.
 ///
 /// Acquiring the token serializes writes in-process on a per-path
-/// `tokio::sync::Mutex`; reads skip this. Cross-process exclusion is the
-/// `FSLock` in `load_and_connect`.
+/// `tokio::sync::Mutex`; reads skip this. Cross-process exclusion is the store
+/// claims `load_and_connect` takes, and the repository `FSLock` it takes inside them.
 pub async fn repository_call_write<Arg, T, F, Fut, ResT, ErrT>(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
@@ -162,11 +190,116 @@ where
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
                 let detail =
-                    LoreErrorDetail::from_result(command(repository.clone(), token, args).await);
-                (detail, Some(post_command_cleanup(repository).await))
+                    LoreErrorDetail::from_result(&command(repository.clone(), token, args).await);
+                (detail, Some(post_command_cleanup(repository)))
             };
 
             check_no_lingering_repository(weak_repository);
+
+            log_command_done(&caller, time_start);
+            execution_context().dispatcher.complete(detail).await
+        })
+        .await
+}
+
+/// Write repository call that holds the instance's repository lock alone, in three steps.
+///
+/// - `plan` runs on the instance opened without stores, before the instance's repository lock
+///   is taken, and keeps nothing of that opened instance. `None` ends the call there.
+///   An instance whose instance file is missing is first opened with its stores, which recovers
+///   its ID as a write command does. That step is boxed, as only that cold path makes it large, so
+///   the call's future holds its box alone.
+/// - `command` runs with the plan, holding the lock alone: it waits for the other commands of
+///   this process that hold the instance's repository lock to finish and keeps them out until
+///   it is done, as the lock keeps out other processes. Otherwise as [`repository_call_write`].
+/// - `finish` runs with the plan after `command`, whatever it returned, and where the instance
+///   could not be opened for it, without the call's hold of the lock. The flush that ends
+///   `command` may still hold it. Where the call's future is dropped first, `finish` does not
+///   run, so what it cleans up needs another way to be cleaned up too.
+///
+/// The locked steps repeat [`repository_call_write`]'s body rather than sharing a helper with it:
+/// a helper holds the call's arguments a second time, which grew the future of every write
+/// command by 72 to 136 bytes.
+pub async fn repository_call_exclusive_planned<Arg, T, P, FutP, FutF, ResT, ErrT>(
+    globals: LoreGlobalArgs,
+    callback: LoreEventCallback,
+    args: Arg,
+    caller: T,
+    plan: impl FnOnce(Arc<RepositoryContext>, Arg) -> FutP,
+    command: impl AsyncFnOnce(Arc<RepositoryContext>, RepositoryWriteToken, &P) -> Result<ResT, ErrT>,
+    finish: impl FnOnce(P) -> FutF,
+) -> i32
+where
+    ErrT: EventError + FfiError + HasTrace,
+    Arg: std::fmt::Debug,
+    FutP: Future<Output = Result<Option<P>, ErrT>> + 'static,
+    FutF: Future<Output = ()> + 'static,
+{
+    let (repository_path, execution) = match prepare_repository_call(globals, callback).await {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            log_command_info(&caller, &args);
+            let time_start = Instant::now();
+
+            let detail = 'call: {
+                if let Err(err) =
+                    Box::pin(repository::recover_missing_instance_file(&repository_path)).await
+                {
+                    break 'call LoreErrorDetail::from_error(&err);
+                }
+                let planned = {
+                    let unlocked = match repository::load_and_connect_with_token(
+                        &repository_path,
+                        RepositoryAccess::NoStore,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(repository) => repository,
+                        Err(err) => break 'call LoreErrorDetail::from_error(&err),
+                    };
+                    let planned = plan(unlocked.clone(), args).await;
+                    let weak = Arc::downgrade(&unlocked);
+                    drop(unlocked);
+                    check_no_lingering_repository(Some(weak));
+                    planned
+                };
+                let plan = match planned {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => break 'call LoreErrorDetail::default(),
+                    Err(err) => break 'call LoreErrorDetail::from_error(&err),
+                };
+
+                let token = RepositoryWriteToken::acquire(&repository_path).await;
+                let (detail, weak_repository) = 'locked: {
+                    let context_token = token.share();
+                    let repository = match repository::load_and_connect_exclusive(
+                        &repository_path,
+                        context_token,
+                    )
+                    .await
+                    {
+                        Ok(repository) => repository,
+                        Err(err) => {
+                            // Released before `finish`, as the command releases it when it ends.
+                            drop(token);
+                            break 'locked (LoreErrorDetail::from_error(&err), None);
+                        }
+                    };
+                    let detail = LoreErrorDetail::from_result(
+                        &command(repository.clone(), token, &plan).await,
+                    );
+                    (detail, Some(post_command_cleanup(repository)))
+                };
+                check_no_lingering_repository(weak_repository);
+
+                finish(plan).await;
+                detail
+            };
 
             log_command_done(&caller, time_start);
             execution_context().dispatcher.complete(detail).await
@@ -211,8 +344,8 @@ where
                     Ok(repository) => repository,
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
-                let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
-                (detail, Some(post_command_cleanup(repository).await))
+                let detail = LoreErrorDetail::from_result(&command(repository.clone(), args).await);
+                (detail, Some(post_command_cleanup(repository)))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -247,43 +380,42 @@ async fn prepare_repository_call(
 
     let execution = setup_execution(globals, callback);
 
-    let dotpath = get_dot_lore_path(&repository_path).map_err(|err| err.ffi_code())?;
-    if !dotpath.is_dir() {
-        let err = RepositoryError::from(RepositoryNotFound {
+    // Inside the call's scope, so the external root of a virtual instance is the one of the global
+    // data directory the call carries: a service relaying calls for another global data directory
+    // would otherwise look in its own.
+    let found = LORE_CONTEXT
+        .scope(execution.clone(), async {
+            get_dot_lore_path(&repository_path)
+        })
+        .await;
+    let failure = match found {
+        Ok(dotpath) if dotpath.is_dir() => return Ok((repository_path, execution)),
+        Ok(_) if runs_during_external_root_move() => {
+            LoreErrorDetail::from_error(&ServiceCallError::from(ServiceUnavailable {
+                reason: format!(
+                    "{} holds no Lore directory, and {EXTERNAL_ROOT_MOVING}",
+                    repository_path.display()
+                ),
+            }))
+        }
+        Ok(_) => LoreErrorDetail::from_error(&RepositoryError::from(RepositoryNotFound {
             repository: repository_path.display().to_string(),
-        });
-        // A pre-command failure reports the same status, return value, and
-        // detail as a command failure. Complete inside the execution scope so
-        // the failure log routes to the dispatcher.
-        let status = LORE_CONTEXT
-            .scope(execution, async move {
-                execution_context()
-                    .dispatcher
-                    .complete(LoreErrorDetail::from_error(&err))
-                    .await
-            })
-            .await;
-        return Err(status);
-    }
-
-    Ok((repository_path, execution))
+        })),
+        Err(err) => LoreErrorDetail::from_error(&err),
+    };
+    // A pre-command failure reports the same status, return value, and
+    // detail as a command failure. Complete inside the execution scope so
+    // the failure log routes to the dispatcher.
+    let status = LORE_CONTEXT
+        .scope(execution, async move {
+            execution_context().dispatcher.complete(failure).await
+        })
+        .await;
+    Err(status)
 }
 
-async fn post_command_cleanup(
-    repository: Arc<RepositoryContext>,
-) -> std::sync::Weak<RepositoryContext> {
-    // Snapshot the state so we don't force a pending connect to resolve
-    // just for teardown. session_stop fires when the last Arc ref drops;
-    // local-only commands never connect and have nothing to release.
-    if let lore_revision::repository::RemoteStatus::Connected(remote) =
-        repository.remote_status().await
-    {
-        let correlation_id = execution_context().globals().correlation_id.to_string();
-        remote.release_session(repository.id, &correlation_id);
-    }
-
-    let sync_data = execution_context().globals().sync_data();
-    repository.try_spawn_post_command_flush(sync_data);
+fn post_command_cleanup(repository: Arc<RepositoryContext>) -> std::sync::Weak<RepositoryContext> {
+    repository.try_spawn_post_command_flush(execution_context().globals().flush_options());
 
     if let Some(duration) = execution_context().globals().store_keep_alive_duration() {
         repository.spawn_keep_alive(duration);
@@ -327,7 +459,7 @@ where
 
             let time_start = Instant::now();
 
-            let detail = LoreErrorDetail::from_result(command(args).await);
+            let detail = LoreErrorDetail::from_result(&command(args).await);
 
             log_command_done(&caller, time_start);
             execution_context().dispatcher.complete(detail).await

@@ -4,10 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use lore_base::lore_debug;
+use lore_base::lore_warn;
 use lore_base::types::BranchId;
-use lore_base::types::BranchMetadata;
 use lore_base::types::BranchPoint;
-use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::RepositoryId;
 use lore_proto::lore::model::v1 as model_v1;
@@ -22,11 +21,14 @@ use super::GRPCAuthRef;
 use super::REVISION_LIST_STRATEGY_HEADER;
 use super::RequestScopedCounter;
 use super::grpc_retry;
+use super::handle_branch_push_error;
 use super::handle_error;
+use crate::error::BranchPushError;
 use crate::error::ProtocolError;
 use crate::types::BranchListResponse;
 use crate::types::BranchPushResponse;
 use crate::types::BranchQueryResponse;
+use crate::types::BranchRecord;
 use crate::types::MetadataSetResult;
 use crate::types::RevisionItem;
 use crate::types::RevisionListResponse;
@@ -51,6 +53,8 @@ impl RevisionService {
         }
     }
 
+    /// Creates the branch `branch` at the remote with the given name, category, creator and stack,
+    /// and returns the remote's record of it.
     pub async fn branch_create(
         &self,
         branch: BranchId,
@@ -58,7 +62,7 @@ impl RevisionService {
         category: &str,
         creator: &str,
         stack: &[BranchPoint],
-    ) -> Result<Hash, ProtocolError> {
+    ) -> Result<BranchRecord, ProtocolError> {
         lore_debug!("Creating remote branch {name} ({branch}) with stack {stack:?}");
         let _ = RequestScopedCounter::new(self.request_inflight.clone());
 
@@ -87,7 +91,7 @@ impl RevisionService {
         let branch_record = response
             .branch
             .ok_or_else(|| ProtocolError::internal("BranchCreate response missing branch"))?;
-        Ok(Hash::from(branch_record.latest))
+        Ok(branch_record_from_v1(branch_record))
     }
 
     pub async fn branch_delete(&self, branch: BranchId) -> Result<(), ProtocolError> {
@@ -113,52 +117,67 @@ impl RevisionService {
         Ok(())
     }
 
-    pub async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
-        lore_debug!("List branches");
+    /// The records of the remote's live branches, and its archived ones when `include_deleted` is
+    /// set, limited to those `creator` created when it is given.
+    pub async fn branch_list(
+        &self,
+        creator: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<BranchListResponse, ProtocolError> {
+        self.branch_list_with_limit(creator, include_deleted, None)
+            .await
+            .and_then(|response| {
+                response.ok_or_else(|| {
+                    ProtocolError::internal("unbounded branch listing exceeded a limit")
+                })
+            })
+    }
+
+    /// The records of the remote's live branches, or `None` when it has more than `limit`.
+    pub async fn branch_list_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        self.branch_list_with_limit(None, false, Some(limit)).await
+    }
+
+    async fn branch_list_with_limit(
+        &self,
+        creator: Option<&str>,
+        include_deleted: bool,
+        limit: Option<usize>,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        lore_debug!("List branches: creator[{creator:?}] / include_deleted[{include_deleted}]");
         let _ = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let list = loop {
             let request = revision_v1::BranchListRequest {
-                creator: None,
-                include_deleted: false,
+                creator: creator.map(str::to_string),
+                include_deleted,
             };
 
             let mut client = self.client.clone();
 
-            match client.branch_list(request).await {
-                Ok(response) => {
-                    let mut stream = response.into_inner();
-                    let mut entries: Vec<BranchMetadata> = Vec::new();
-                    let mut stream_err: Option<tonic::Status> = None;
-                    while let Some(item) = stream.next().await {
-                        match item {
-                            Ok(message) => {
-                                if let Some(branch) = message.branch {
-                                    entries.push(branch_metadata_from_v1(branch));
-                                }
-                            }
-                            Err(status) => {
-                                stream_err = Some(status);
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(status) = stream_err {
-                        handle_error(&mut retry, status).await?;
-                        continue;
-                    }
-                    break entries;
-                }
-                Err(status) => {
-                    handle_error(&mut retry, status).await?;
-                }
+            let status = match client.branch_list(request).await {
+                Ok(response) => match collect_branch_list(response.into_inner(), limit).await {
+                    Ok(response) => break response,
+                    Err(status) => status,
+                },
+                Err(status) => status,
+            };
+            // Not in `handle_error`: a command that sends many calls at once would warn for each.
+            if let Some(reason) = first_throttle_reason(&retry, &status) {
+                lore_warn!("Remote is throttling the branch listing: {reason}");
             }
+            handle_error(&mut retry, status).await?;
         };
 
-        Ok(BranchListResponse { list })
+        Ok(list)
     }
 
+    /// The remote's record of the branch with id `branch`, or of the live branch named `name` when
+    /// `branch` is `None`. The record carries the queried id where the answer has none.
     pub async fn branch_query(
         &self,
         branch: Option<BranchId>,
@@ -196,29 +215,23 @@ impl RevisionService {
             }
         };
 
-        let mut id = Context::from(branch_record.id);
-        if id.is_zero() && branch.is_some() {
-            id = branch.unwrap_or_default();
+        let mut record = branch_record_from_v1(branch_record);
+        if record.id.is_zero()
+            && let Some(branch) = branch
+        {
+            record.id = branch;
         }
-        let latest = branch_record.latest.into();
-        let metadata = branch_record.metadata.into();
-        let deleted = branch_record.deleted;
         lore_debug!(
             "Query branch: id[{:?}] / name[{:?}] in repository {} complete: ID {} latest {} metadata {}",
             branch,
             name,
             self.repository,
-            id,
-            latest,
-            metadata,
+            record.id,
+            record.latest,
+            record.metadata,
         );
 
-        Ok(BranchQueryResponse {
-            id,
-            latest,
-            metadata,
-            deleted,
-        })
+        Ok(record)
     }
 
     pub async fn branch_push(
@@ -227,7 +240,7 @@ impl RevisionService {
         revision: Hash,
         force: bool,
         fast_forward_merge: bool,
-    ) -> Result<BranchPushResponse, ProtocolError> {
+    ) -> Result<BranchPushResponse, BranchPushError> {
         lore_debug!("Pushing branch: {} at {}", branch, revision);
         let _ = RequestScopedCounter::new(self.request_inflight.clone());
 
@@ -245,7 +258,7 @@ impl RevisionService {
                 Ok(response) => {
                     break response.into_inner();
                 }
-                Err(status) => handle_error(&mut retry, status).await?,
+                Err(status) => handle_branch_push_error(&mut retry, status).await?,
             }
         };
 
@@ -313,8 +326,8 @@ impl RevisionService {
                     state: item.state,
                 })
                 .collect(),
-            next_revision: signature_backward.map(Into::into).unwrap_or_default(),
-            previous_revision: signature_forward.map(Into::into).unwrap_or_default(),
+            next_revision: signature_backward.map_or_default(Into::into),
+            previous_revision: signature_forward.map_or_default(Into::into),
         })
     }
 
@@ -381,14 +394,49 @@ impl RevisionService {
     }
 }
 
-fn branch_metadata_from_v1(branch: model_v1::Branch) -> BranchMetadata {
-    BranchMetadata {
+/// The branch record a response carries, taking its strings as they arrived.
+#[lore_macro::test_pub]
+fn branch_record_from_v1(branch: model_v1::Branch) -> BranchRecord {
+    BranchRecord {
         id: BranchId::from(branch.id),
         name: branch.name,
         category: branch.category,
-        latest: branch.latest.into(),
         creator: branch.creator,
         created: branch.created,
+        latest: branch.latest.into(),
+        metadata: branch.metadata.into(),
+        deleted: branch.deleted,
         stack: branch.stack.into_iter().map(BranchPoint::from).collect(),
     }
+}
+
+/// The remote's reason for the first `RESOURCE_EXHAUSTED` answer of a call. `None` for a later
+/// answer of the same call, which would repeat the reason, and where the remote gave none.
+#[lore_macro::test_pub]
+fn first_throttle_reason<'a>(
+    retry: &crate::util::Retry,
+    status: &'a tonic::Status,
+) -> Option<&'a str> {
+    (status.code() == tonic::Code::ResourceExhausted
+        && retry.counter() == 0
+        && !status.message().is_empty())
+    .then(|| status.message())
+}
+
+#[lore_macro::test_pub]
+async fn collect_branch_list(
+    mut stream: impl tokio_stream::Stream<Item = Result<revision_v1::BranchListResponse, tonic::Status>>
+    + Unpin,
+    limit: Option<usize>,
+) -> Result<Option<BranchListResponse>, tonic::Status> {
+    let mut entries = Vec::new();
+    while let Some(item) = stream.next().await {
+        if let Some(branch) = item?.branch {
+            if limit.is_some_and(|limit| entries.len() == limit) {
+                return Ok(None);
+            }
+            entries.push(branch_record_from_v1(branch));
+        }
+    }
+    Ok(Some(BranchListResponse { list: entries }))
 }

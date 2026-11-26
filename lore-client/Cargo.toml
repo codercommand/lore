@@ -7,7 +7,6 @@ publish = false
 [dependencies]
 anstream = { workspace = true }
 anstyle = { workspace = true }
-chrono = { workspace = true }
 clap = { workspace = true }
 clap-markdown = { workspace = true }
 clap_complete = { version = "4.5.47" }
@@ -20,6 +19,7 @@ tokio = { workspace = true }
 toml = { workspace = true }
 
 lore = { workspace = true }
+lore-base = { workspace = true }
 lore-macro = { workspace = true }
 
 [target.'cfg(target_family = "windows")'.dependencies]
@@ -28,7 +28,6 @@ windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_Net
 [features]
 default = []
 oodle = ["lore/oodle"]
-swfs = ["lore/swfs"]
 test-util = []
 
 [dev-dependencies]

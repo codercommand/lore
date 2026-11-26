@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,27 @@ def test_clone_status_behind_remote_not_divergent(new_lore_repo):
         f"Status must NOT report local ahead — clone_a has no local commits "
         f"beyond what the remote has: {entry}"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.own_vfs(
+    "reads the [store] config of an instance with a store of its own, which a virtual clone, "
+    "over a shared store, does not have"
+)
+def test_clone_writes_the_store_limits_it_is_given(new_lore_repo):
+    """`--max-capacity` and `--max-size` are the new instance's store limits."""
+    repo: Lore = new_lore_repo()
+    with repo.open_file("seed.txt", "w+") as f:
+        f.write("seed\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Seed", offline=True)
+    repo.push()
+
+    clone = repo.clone(max_capacity=50_000_000, max_size=1 << 40)
+
+    config = tomllib.loads((Path(clone.dot_path()) / "config.toml").read_text(encoding="utf-8"))
+    assert config["store"]["max_capacity"] == 50_000_000
+    assert config["store"]["max_size"] == 1 << 40
 
 
 @pytest.mark.smoke
@@ -140,10 +162,14 @@ def test_clone_direct_file_write(new_lore_repo):
     Verify that clone with --direct-file-write produces correct files on disk.
 
     --direct-file-write skips the default atomic write strategy (write to temp
-    file then rename) and writes directly to the destination path. The result
-    must be identical to a normal clone.
+    file then rename) and writes directly to the destination path, on Windows
+    past the file cache. The result must be identical to a normal clone, a file
+    of many fragments included. The flag applies to the clone alone: the new
+    instance's `[file] direct_write` stays as it is, and a later sync writes as
+    that says.
     """
     repo: Lore = new_lore_repo()
+    large = bytes((index * 7 + index // 4096) % 251 for index in range(3 * 1024 * 1024 + 777))
 
     repo.write_commit_push(
         "Initial commit",
@@ -151,10 +177,22 @@ def test_clone_direct_file_write(new_lore_repo):
             "text.txt": "hello world\n",
             "subdir/nested.txt": "nested content\n",
             "binary.bin": b"\x00\x01\x02\xff" * 256,
+            "large.bin": large,
         },
     )
 
     clone = repo.clone(direct_file_write=True)
+
+    with clone.open_file("large.bin", "rb") as f:
+        assert f.read() == large, "fragmented file content mismatch"
+    with clone.open_file(".lore/config.toml") as f:
+        config = tomllib.loads(f.read())
+    assert config["file"]["direct_write"] is False, "the flag is not written to the config"
+
+    repo.write_commit_push("Change the large file", {"large.bin": large[::-1]})
+    clone.sync()
+    with clone.open_file("large.bin", "rb") as f:
+        assert f.read() == large[::-1], "a later sync writes the change"
 
     # Verify text files
     with clone.open_file("text.txt") as f:
@@ -171,6 +209,7 @@ def test_clone_direct_file_write(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("re-clones over the files an ordinary clone leaves on disk")
 @pytest.mark.smoke
 def test_reclone_over_existing_files_records_their_modified_times(new_lore_repo):
     """A clone into a directory that already holds identical files retains them rather than
@@ -205,6 +244,7 @@ def test_reclone_over_existing_files_records_their_modified_times(new_lore_repo)
     )
 
 
+@pytest.mark.own_vfs("re-clones over the files an ordinary clone leaves on disk")
 @pytest.mark.smoke
 def test_reclone_over_files_stamped_ahead_records_no_time(new_lore_repo):
     """A clone that retains files whose times are not older than the filesystem clock it read
@@ -272,8 +312,8 @@ def test_clone_keeps_file_metadata_blocks_for_offline_commit(new_lore_repo, flag
 
 @pytest.mark.smoke
 def test_failed_clone_sends_no_clone_end_event(new_lore_repo, scratch_dir):
-    """A clone that fails to write a file fails the command and sends no repositoryCloneEnd
-    event. That event, and the "Clone complete" line the CLI prints for it, are only for a clone
+    """Cloning that fails to write a file fails the command and sends no repositoryCloneEnd
+    event. That event, and the "Cloned in" line the CLI prints for it, are only for cloning
     that succeeded."""
     repo: Lore = new_lore_repo()
     repo.write_commit_push(
@@ -297,3 +337,65 @@ def test_failed_clone_sends_no_clone_end_event(new_lore_repo, scratch_dir):
     assert not parse_jsonl(output, "repositoryCloneEnd"), (
         f"a clone that failed sent a repositoryCloneEnd event: {output}"
     )
+
+
+@pytest.mark.smoke
+def test_clone_dry_run_into_an_existing_directory_leaves_it_empty(
+    new_lore_repo, scratch_dir
+):
+    """`repository clone --dry-run` into an existing directory leaves nothing in it, and a
+    clone without it then succeeds."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("First", {"a.txt": b"first\n"})
+    target = scratch_dir("existing", create=True)
+
+    repo.run(["repository", "clone", repo.remote_path, str(target)], dry_run=True)
+    assert list(target.iterdir()) == [], "clone --dry-run left files in the destination"
+
+    repo.run(["repository", "clone", repo.remote_path, str(target)])
+    assert (target / "a.txt").read_bytes() == b"first\n"
+
+
+@pytest.mark.smoke
+def test_clone_force_dry_run_keeps_the_existing_clone(new_lore_repo, scratch_dir):
+    """`repository clone --force --dry-run` over an existing clone refuses, and the clone
+    keeps working."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("First", {"a.txt": b"first\n"})
+    target = scratch_dir("cloned")
+    repo.run(["repository", "clone", repo.remote_path, str(target)])
+
+    output = repo.run(
+        ["repository", "clone", repo.remote_path, str(target)],
+        dry_run=True,
+        force=True,
+        check=False,
+    )
+    assert "--force would replace the repository" in output, output
+
+    status = repo.run(["status"], path=str(target), no_pager=True)
+    assert "On branch main" in status, status
+
+
+@pytest.mark.smoke
+def test_clone_dry_run_with_swfs_is_refused(new_lore_repo, scratch_dir):
+    """`repository clone --dry-run --vfs swfs` fails before it mounts anything. Not marked
+    `swfs`, since the refusal comes before any SWFS call."""
+    repo: Lore = new_lore_repo()
+    target = scratch_dir("swfs")
+
+    with pytest.raises(LoreException):
+        repo.run(
+            [
+                "repository",
+                "clone",
+                repo.remote_path,
+                str(target),
+                "--vfs",
+                "swfs",
+                "--use-shared-store",
+            ],
+            dry_run=True,
+        )
+
+    assert not target.exists(), "clone --dry-run --vfs swfs created the destination"

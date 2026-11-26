@@ -10,18 +10,14 @@ use async_trait::async_trait;
 use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
+use crossbeam_epoch as epoch;
 use lore_base::error::Disconnected;
-use lore_base::error::NotAuthorized;
-use lore_base::error::NotFound;
-use lore_base::error::Oversized;
-use lore_base::error::SlowDown;
 use lore_base::lore_debug;
 use lore_base::lore_trace;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
-use lore_base::types::HealResult;
 use lore_base::types::KeyType;
 use lore_base::types::Partition;
 use lore_base::types::VerifyResult;
@@ -30,11 +26,12 @@ use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 use zerocopy::IntoBytes;
 
-use super::super::QuicClientError;
 use super::super::QuicOpCode;
 use super::super::client::AuthAdapter;
+use super::super::client::BoundSession;
 use super::super::client::DEFAULT_EXPECTED_RTT_MS;
 use super::super::client::EndpointConfig;
+use super::super::client::NO_GENERATION;
 use super::super::client::QuicConnection;
 use super::super::client::SendWithReconnectError;
 use super::super::client::ServiceClient;
@@ -47,6 +44,20 @@ use super::super::storage_service;
 use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
+use super::check_query_batch;
+use super::check_query_statuses;
+use super::read_fragment;
+use super::read_hash;
+use super::read_metadata;
+use super::read_resolved;
+use super::read_verify;
+use super::sessions;
+use super::sessions::Authorizer;
+use super::sessions::IssueSession;
+use super::sessions::Session;
+use super::sessions::Sessions;
+use super::sessions::session_start_payload;
+use super::sessions::started_session_id;
 use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
@@ -64,16 +75,16 @@ pub struct StorageClient {
     remote_url: String,
     transport_config: TransportConfig,
     auth_adapter: Arc<dyn AuthAdapter<ErrorType = ProtocolError>>,
-    auth_endpoint: AuthEndpoint,
-    recipient_domain: String,
-    identity: String,
-    credentials: Arc<SuppliedCredentials>,
+    authorizer: Authorizer,
     partition: Partition,
     counter: AtomicUsize,
     quic: Arc<QuicConnection>,
     connection_establish: Semaphore,
     command_limit: Semaphore,
     sent: AtomicUsize,
+    sessions: Sessions,
+    /// This client, for the task that issues a session again ([`sessions::rebind`]).
+    this: Weak<StorageClient>,
 }
 
 impl Drop for StorageClient {
@@ -101,24 +112,23 @@ impl StorageClient {
         partition: Partition,
         quinn: quinn::Connection,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Self {
+    ) -> Arc<Self> {
         let quic = QuicConnection::with_v4(quinn, MAX_CHUNK_SIZE, true);
-        StorageClient {
+        Arc::new_cyclic(|this| StorageClient {
             connection,
             remote_url: remote_url.to_string(),
             transport_config,
             auth_adapter,
-            auth_endpoint: auth_endpoint.clone(),
-            recipient_domain: recipient_domain.to_string(),
-            identity: identity.to_string(),
-            credentials: credentials.clone(),
+            authorizer: Authorizer::new(auth_endpoint, recipient_domain, identity, credentials),
             partition,
             quic: Arc::new(quic),
             connection_establish: Semaphore::new(1),
             counter: AtomicUsize::new(0),
             sent: AtomicUsize::new(0),
             command_limit: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
-        }
+            sessions: Sessions::default(),
+            this: this.clone(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -131,7 +141,8 @@ impl StorageClient {
         partition: Partition,
         credentials: &Arc<SuppliedCredentials>,
         user_agent: Option<String>,
-    ) -> Result<Self, ProtocolError> {
+        congestion_algorithm: CongestionAlgorithm,
+    ) -> Result<Arc<Self>, ProtocolError> {
         let user_agent = user_agent.unwrap_or_else(|| crate::user_agent().to_string());
         let auth_adapter = Arc::new(StorageClientAuth {
             recipient_domain: remote_domain.clone(),
@@ -143,7 +154,7 @@ impl StorageClient {
         let transport_config = TransportConfig {
             max_bytes_bandwidth_per_second: MAX_BYTES_BANDWIDTH_PER_SEC,
             expected_rtt_ms: DEFAULT_EXPECTED_RTT_MS,
-            congestion_algorithm: CongestionAlgorithm::Bbr,
+            congestion_algorithm,
             initial_cwnd: None,
         };
 
@@ -201,6 +212,55 @@ impl StorageClient {
 
         Ok(storage)
     }
+
+    /// The commands holding the last issue of the session `session_id` names: the handles to it
+    /// beside the session's own.
+    #[cfg(feature = "test-util")]
+    pub fn awaiting_issue(&self, session_id: u32) -> usize {
+        self.sessions.awaiting_issue(session_id)
+    }
+}
+
+impl IssueSession for StorageClient {
+    fn authorizer(&self) -> &Authorizer {
+        &self.authorizer
+    }
+
+    fn sessions(&self) -> &Sessions {
+        &self.sessions
+    }
+
+    fn upgrade(&self) -> Option<Arc<Self>> {
+        self.this.upgrade()
+    }
+
+    fn is_live(&self, bound: BoundSession) -> bool {
+        bound.generation == self.quic.generation()
+    }
+
+    async fn stop(&self, bound: BoundSession) {
+        if !self.quic.has_streams().await {
+            return;
+        }
+        let _ = send_normal(
+            self.quic.clone(),
+            Command::Authorize as QuicOpCode,
+            bound,
+            true,
+            &mut [Bytes::default(), Bytes::from_static(&[1u8])],
+        )
+        .await;
+    }
+
+    async fn send_issue(&self, session: &Session, token: &str) -> Result<(), ProtocolError> {
+        let payload = session_start_payload(session.partition, &session.correlation_id, token);
+        let response = send_normal_with_reconnect(self, Command::Authorize, session.id, || {
+            [Bytes::default(), payload.clone()]
+        })
+        .await?;
+        session.bind(started_session_id(&response)?);
+        Ok(())
+    }
 }
 
 impl ServiceClient for StorageClient {
@@ -244,23 +304,9 @@ impl ServiceClient for StorageClient {
                 }
                 ProtocolError::from(Disconnected)
             }
-            SendWithReconnectError::ClientError(client_error) => match client_error {
-                QuicClientError::SlowDown => ProtocolError::from(SlowDown),
-                QuicClientError::NotAuthorized => ProtocolError::from(NotAuthorized),
-                QuicClientError::NotFound => ProtocolError::from(NotFound),
-                QuicClientError::Oversized => ProtocolError::from(Oversized {
-                    context: format!(
-                        "{}: server rejected oversized fragment",
-                        storage_service::command_name(&failed_request)
-                    ),
-                }),
-                _ => {
-                    let name = storage_service::command_name(&failed_request);
-                    ProtocolError::internal(format!(
-                        "{name}: Failed sending command: {client_error}"
-                    ))
-                }
-            },
+            SendWithReconnectError::ClientError(client_error) => {
+                storage_service::command_error(&failed_request, client_error)
+            }
         }
     }
 
@@ -275,6 +321,40 @@ impl ServiceClient for StorageClient {
     fn v4_protocol(&self) -> bool {
         true
     }
+
+    /// An `Authorize` request issues the session it names on the current connection, and records
+    /// that connection as the one the server's answer belongs to. Any other request carries the
+    /// session as the server last issued it, or binds to no connection once it is stopped.
+    fn bind_session(&self, request_type: Command, session_id: u32) -> BoundSession {
+        let guard = epoch::pin();
+        let session = self.sessions.find(session_id, &guard);
+        if request_type == Command::Authorize {
+            let generation = self.quic.generation();
+            if let Some(session) = session {
+                session.issue_on(generation);
+            }
+            return BoundSession { id: 0, generation };
+        }
+        session.map_or(
+            BoundSession {
+                id: 0,
+                generation: NO_GENERATION,
+            },
+            |session| session.bound(),
+        )
+    }
+
+    /// An `Authorize` request is bound afresh on its next attempt, as it issues the session.
+    async fn rebind_session(
+        &self,
+        request_type: Command,
+        session_id: u32,
+    ) -> Result<(), ProtocolError> {
+        if request_type == Command::Authorize {
+            return Ok(());
+        }
+        sessions::rebind(self, session_id, self.quic.generation()).await
+    }
 }
 
 #[async_trait]
@@ -284,69 +364,16 @@ impl Storage for StorageClient {
         partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
-        // Fetch auth token via token exchange (cached if already exchanged).
-        // The credentials are read here, not at construction: the server checks
-        // storage authorization at each session start, so a session opened later
-        // must present whatever the newest call supplied.
-        let token = if !self.auth_endpoint.is_none() {
-            let (identity_token, access_token) = self.credentials.tokens();
-            let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
-                &self.auth_endpoint,
-                &self.recipient_domain,
-                &self.identity,
-                partition,
-                &identity_token,
-                &access_token,
-            )
-            .await;
-            authorization_token
-        } else {
-            String::new()
-        };
-        let token_bytes = token.as_bytes();
-
-        // Build Authorize start payload:
-        // action(1=0) + partition_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
-        let corr_bytes = correlation_id.as_bytes();
-        let mut payload =
-            BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
-        payload.put_u8(0); // action = start
-        payload.extend_from_slice(partition.as_bytes());
-        payload.put_u8(corr_bytes.len() as u8);
-        payload.extend_from_slice(corr_bytes);
-        payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
-        payload.extend_from_slice(token_bytes);
-        let payload = payload.freeze();
-
-        let response = send_normal_with_reconnect(self, Command::Authorize, 0, || {
-            [Bytes::default(), payload.clone()]
-        })
-        .await?;
-
-        if response.len() != 4 {
-            return Err(ProtocolError::internal(format!(
-                "session_start: expected 4-byte response, got {} bytes",
-                response.len()
-            )));
-        }
-
-        let session_id = u32::from_le_bytes(response[..4].try_into().unwrap());
-        Ok(session_id)
+        sessions::start(self, partition, correlation_id).await
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {
-        if !self.quic.has_streams().await {
-            return Ok(());
-        }
-        let _ = send_normal(
-            self.quic.clone(),
-            Command::Authorize as QuicOpCode,
-            session_id,
-            true,
-            &mut [Bytes::default(), Bytes::from_static(&[1u8])],
-        )
-        .await;
-        Ok(())
+        sessions::stop(self, session_id).await
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn running_congestion_algorithm(&self) -> Option<CongestionAlgorithm> {
+        self.quic.running_congestion_algorithm().await
     }
 
     async fn get(
@@ -359,25 +386,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() < size_of::<Fragment>() {
-            return Err(ProtocolError::internal("get: Invalid server response"));
-        }
-
-        let fragment_bytes = payload.split_to(size_of::<Fragment>());
-        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
-
-        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
-            return Err(ProtocolError::internal(format!(
-                "get: invalid fragment {fragment:?}: {reason}"
-            )));
-        }
-        if payload.len() != fragment.size_payload as usize {
-            return Err(ProtocolError::internal(format!(
-                "get: Invalid server payload for fragment {fragment:?}, got {} bytes",
-                payload.len()
-            )));
-        }
-
+        let fragment = read_fragment(&mut payload, "get")?;
         Ok((fragment, payload))
     }
 
@@ -402,32 +411,7 @@ impl Storage for StorageClient {
             })
             .await?;
 
-        let prefix = size_of::<Hash>() + size_of::<Fragment>();
-        if payload.len() < prefix {
-            return Err(ProtocolError::internal(format!(
-                "get_resolved: Invalid server response, expected at least {prefix} bytes got {}",
-                payload.len()
-            )));
-        }
-
-        let resolved_bytes = payload.split_to(size_of::<Hash>());
-        let resolved = Hash::from(&resolved_bytes[..]);
-
-        let fragment_bytes = payload.split_to(size_of::<Fragment>());
-        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
-
-        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
-            return Err(ProtocolError::internal(format!(
-                "get_resolved: invalid fragment {fragment:?}: {reason}"
-            )));
-        }
-        if payload.len() != fragment.size_payload as usize {
-            return Err(ProtocolError::internal(format!(
-                "get_resolved: Invalid server payload for fragment {fragment:?}, got {} bytes",
-                payload.len()
-            )));
-        }
-
+        let (resolved, fragment) = read_resolved(&mut payload)?;
         Ok((resolved, fragment, payload))
     }
 
@@ -441,16 +425,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != size_of::<Fragment>() {
-            return Err(ProtocolError::internal(format!(
-                "get_metadata: expected {} bytes for Fragment, got {}",
-                size_of::<Fragment>(),
-                payload.len()
-            )));
-        }
-
-        let fragment = unsafe { payload.as_ptr().cast::<Fragment>().read_unaligned() };
-        Ok(fragment)
+        read_metadata(&payload)
     }
 
     async fn get_priority(
@@ -463,25 +438,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() < size_of::<Fragment>() {
-            return Err(ProtocolError::internal("get: Invalid server response"));
-        }
-
-        let fragment_bytes = payload.split_to(size_of::<Fragment>());
-        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
-
-        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
-            return Err(ProtocolError::internal(format!(
-                "get: invalid fragment {fragment:?}: {reason}"
-            )));
-        }
-        if payload.len() != fragment.size_payload as usize {
-            return Err(ProtocolError::internal(format!(
-                "get: Invalid server payload for fragment {fragment:?}, got {} bytes",
-                payload.len()
-            )));
-        }
-
+        let fragment = read_fragment(&mut payload, "get")?;
         Ok((fragment, payload))
     }
 
@@ -528,13 +485,8 @@ impl Storage for StorageClient {
     }
 
     async fn query(&self, session_id: u32, address: &[Address]) -> Result<Bytes, ProtocolError> {
-        const MAX_BATCH: usize = lore_base::types::FRAGMENT_SIZE_EXPECTED / size_of::<Address>();
         let address_count = address.len();
-        if address_count > MAX_BATCH {
-            return Err(ProtocolError::internal(format!(
-                "query: Invalid address batch count: {address_count}"
-            )));
-        }
+        check_query_batch(address_count)?;
 
         // Allocate a copy on the heap to avoid lifetime issues
         let address = Bytes::copy_from_slice(address.as_bytes());
@@ -543,14 +495,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != address_count {
-            return Err(ProtocolError::internal(format!(
-                "query: Server returned query payload of wrong size, expected {} got {}",
-                address_count,
-                payload.len()
-            )));
-        }
-
+        check_query_statuses(&payload, address_count)?;
         Ok(payload)
     }
 
@@ -571,18 +516,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        // Response should be 2 bytes: corrupted + healed
-        if payload.len() != 2 {
-            return Err(ProtocolError::internal(format!(
-                "verify: Invalid server payload for address {address}, got {} bytes",
-                payload.len()
-            )));
-        }
-
-        Ok(VerifyResult {
-            corrupted: payload[0] != 0,
-            healed: HealResult::from(payload[1]),
-        })
+        read_verify(&payload, address)
     }
 
     async fn copy(
@@ -622,15 +556,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != size_of::<Hash>() {
-            return Err(ProtocolError::internal(format!(
-                "mutable_load: Invalid server response, expected {} bytes got {}",
-                size_of::<Hash>(),
-                payload.len()
-            )));
-        }
-
-        Ok(Hash::from(&payload[..]))
+        read_hash(&payload, "mutable_load")
     }
 
     async fn mutable_store(
@@ -671,15 +597,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != size_of::<Hash>() {
-            return Err(ProtocolError::internal(format!(
-                "mutable_cas: Invalid server response, expected {} bytes got {}",
-                size_of::<Hash>(),
-                payload.len()
-            )));
-        }
-
-        Ok(Hash::from(&payload[..]))
+        read_hash(&payload, "mutable_cas")
     }
 
     async fn close(&self) {

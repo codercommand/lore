@@ -24,7 +24,7 @@ use crate::util::path::RelativePath;
 
 /// Details of a single file that differs between two revisions.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionDiffFileEventData {
     /// Path of the file, relative to the root of the working tree.
@@ -64,6 +64,8 @@ impl LoreRevisionDiffFileEventData {
 
 #[error_set]
 pub enum DiffError {
+    Cancelled,
+    LinkPinsDiverge,
     AddressNotFound,
     InvalidNodeHierarchy,
     InvalidPath,
@@ -201,12 +203,7 @@ async fn send_file_changes(diff: Vec<NodeChange>) -> Result<(), DiffError> {
         if change.from.mapping.node != INVALID_NODE {
             old_is_file = change
                 .from
-                .mapping
-                .state
-                .node(
-                    change.from.mapping.repository.clone(),
-                    change.from.mapping.node,
-                )
+                .get_node()
                 .await
                 .forward::<DiffError>("deserializing source state")?
                 .is_file();
@@ -216,9 +213,7 @@ async fn send_file_changes(diff: Vec<NodeChange>) -> Result<(), DiffError> {
         if change.to.mapping.node != INVALID_NODE {
             new_is_file = change
                 .to
-                .mapping
-                .state
-                .node(change.to.mapping.repository.clone(), change.to.mapping.node)
+                .get_node()
                 .await
                 .forward::<DiffError>("deserializing target state")?
                 .is_file();

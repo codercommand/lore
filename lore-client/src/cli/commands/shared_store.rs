@@ -36,7 +36,7 @@ pub enum SharedStoreCommands {
     /// Show information about the registry of shared stores
     List(SharedStoreListArgs),
 
-    /// Set whether new clones use a shared store without being asked to
+    /// Set whether new instances use a shared store without being asked to
     SetUseAutomatically(SharedStoreSetUseAutomaticallyArgs),
 }
 
@@ -53,6 +53,17 @@ pub struct SharedStoreCreateArgs {
     /// Set this as the default shared store in the global config file, defaults to true
     #[clap(long, default_missing_value = "true")]
     make_default: Option<bool>,
+
+    /// Bytes the store holds before compaction reclaims space, defaults to 10 GiB. Change it later
+    /// as `max_size` in the store's `shared_store.toml`
+    #[clap(long, value_name = "bytes", value_parser = clap::value_parser!(u64).range(1..))]
+    max_size: Option<u64>,
+
+    /// Fragments the store holds before eviction removes some, defaults to 2000000. The periodic
+    /// eviction pass treats a value below 1048576 as 1048576. Change it later as `max_capacity` in
+    /// the store's `shared_store.toml`
+    #[clap(long, value_name = "fragments", value_parser = clap::value_parser!(u64).range(1..))]
+    max_capacity: Option<u64>,
 }
 
 #[derive(Args)]
@@ -60,7 +71,8 @@ pub struct SharedStoreInfoArgs {}
 
 #[derive(Args)]
 pub struct SharedStoreListArgs {
-    /// Look up all instances each shared store is used by.
+    /// Look up the instances using each shared store. A store another process still holds after a
+    /// 3-second wait is listed without them, with a warning.
     #[clap(long, default_missing_value = "true")]
     include_instances: Option<bool>,
 }
@@ -91,12 +103,20 @@ pub fn handle_create(globals: LoreGlobalArgs, args: &SharedStoreCreateArgs) -> u
         remote_url: LoreString::from(&args.remote_url),
         path: args.path.as_ref().map_or("", |s| s as &str).into(),
         make_default: args.make_default.unwrap_or(true) as u8,
+        max_size: args.max_size.unwrap_or_default(),
+        max_capacity: args.max_capacity.unwrap_or_default(),
     };
 
+    let dry_run = globals.dry_run();
+
     let callback = output_formatter().unwrap_or(Some(
-        (Box::new(|event: &LoreEvent| {
+        (Box::new(move |event: &LoreEvent| {
             if let LoreEvent::SharedStoreCreate(data) = event {
-                println!("Created shared store in {}", data.path.as_str(),);
+                println!(
+                    "{} shared store in {}",
+                    if dry_run { "Would create" } else { "Created" },
+                    data.path.as_str(),
+                );
             }
         }) as EventCallbackFn)
             .with_defaults(),

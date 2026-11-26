@@ -19,7 +19,8 @@ fn the_provider_is_advertised_only_when_resolved() {
     environment.oidc = Some(lore_transport::Oidc {
         issuer: "https://auth.example.com".to_string(),
         client_id: "lore-cli".to_string(),
-        identity_claim: Some("sub".to_string()),
+        scopes: vec!["openid".to_string()],
+        client_credentials_scopes: vec!["lore".to_string()],
         ..Default::default()
     });
     assert_eq!(
@@ -27,8 +28,34 @@ fn the_provider_is_advertised_only_when_resolved() {
         Some(Oidc {
             issuer: "https://auth.example.com".to_string(),
             client_id: "lore-cli".to_string(),
-            identity_claim: "sub".to_string(),
+            scopes: vec!["openid".to_string()],
+            client_credentials_scopes: vec!["lore".to_string()],
             ..Default::default()
         })
+    );
+}
+
+#[test]
+fn the_lock_batch_limit_is_advertised_and_zero_when_unset() {
+    let mut environment = lore_revision::environment::EnvironmentConfig {
+        config: Some(lore_revision::environment::Config {
+            max_lock_batch: Some(42),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        environment_to_proto(&environment)
+            .config
+            .map(|config| config.max_lock_batch),
+        Some(42)
+    );
+
+    environment.config = Some(lore_revision::environment::Config::default());
+    assert_eq!(
+        environment_to_proto(&environment)
+            .config
+            .map(|config| config.max_lock_batch),
+        Some(0)
     );
 }

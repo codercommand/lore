@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -13,6 +14,7 @@ use lore_proto::ReplicationPutRequest;
 use lore_proto::rpc::replication_service_server::ReplicationService;
 use lore_revision::runtime::execution_context;
 use lore_storage::ImmutableStore;
+use lore_storage::StoreError;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::create_operation_context_attribute;
 use opentelemetry::KeyValue;
@@ -35,6 +37,7 @@ use tracing::warn;
 
 use crate::grpc::extract_correlation_id;
 use crate::grpc::send_err;
+use crate::grpc::until_request_cancelled;
 use crate::util::REPLICATION_USER_ID;
 use crate::util::setup_execution;
 
@@ -73,7 +76,7 @@ impl ReplicationService for LoreReplicationService {
         request: Request<Streaming<ReplicationPutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-        let mut stream = request.into_inner();
+        let stream = request.into_inner();
 
         // TODO(jcohen): make this capacity configurable or unbounded
         let message_limit = 8192;
@@ -95,6 +98,9 @@ impl ReplicationService for LoreReplicationService {
                 execution,
                 async move {
                     let task_limiter = Arc::new(Semaphore::new(message_limit));
+                    // Ends once nobody reads the answers. An item already started finishes, so no
+                    // store operation is cut off part way.
+                    let mut stream = pin!(until_request_cancelled(stream));
                     while let Some(req) = stream.next().await {
                         if let Err(e) = req {
                             debug!(error = ?e, "Error reading message from stream");
@@ -157,15 +163,26 @@ impl ReplicationService for LoreReplicationService {
                             // normally do when storing new fragments like hash validation. We're relying on
                             // the fact that these requests are coming from trusted callers who have already
                             // performed this validation.
-                            let put_result = immutable_store
-                                .put(
-                                    repository_id.into(),
-                                    address,
-                                    fragment,
-                                    payload,
-                                    false, /* force */
-                                )
-                                .await;
+                            let sizes = payload.as_ref().map_or(Ok(()), |payload| {
+                                lore_storage::check_payload_sizes(&fragment, payload.len())
+                            });
+                            let put_result = match sizes {
+                                Ok(()) => {
+                                    immutable_store
+                                        .put(
+                                            repository_id.into(),
+                                            address,
+                                            fragment,
+                                            payload,
+                                            false, /* force */
+                                        )
+                                        .await
+                                }
+                                Err(error) => Err(StoreError::internal_with_context(
+                                    error,
+                                    "replicated payload sizes disagree with its fragment",
+                                )),
+                            };
 
                             let metrics_code = match &put_result {
                                 Ok(_) => Code::Ok,

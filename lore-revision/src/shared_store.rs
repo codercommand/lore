@@ -71,6 +71,20 @@ pub struct SharedStoreConfig {
     pub store_config: Option<StoreConfig>,
 }
 
+impl SharedStoreConfig {
+    /// The GC options an open of this store runs with: the store's own limits for an open that
+    /// collects, so every instance over it collects to the same limits, and `open` otherwise. A
+    /// limit or delay the store's config leaves out is the default.
+    pub fn gc_options(&self, open: ImmutableStoreCreateOptions) -> ImmutableStoreCreateOptions {
+        match &self.store_config {
+            Some(store_config) if open.collects() => {
+                store_config.with_default_limits().to_options()
+            }
+            _ => open,
+        }
+    }
+}
+
 // Name of the shared store directory created inside the user provided directory
 pub const SHARED_STORE_DIR: &str = "shared_store";
 // Inside SHARED_STORE_DIR
@@ -145,7 +159,7 @@ pub fn find_existing_shared_store_in_dir(
 
 /// Data for an event reporting that a shared store was created.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreSharedStoreCreateEventData {
     /// Filesystem path of the created shared store.
@@ -156,6 +170,7 @@ pub async fn create_shared_store(
     path: Option<PathBuf>,
     remote_url: String,
     make_default: bool,
+    store_config: StoreConfig,
 ) -> Result<(), SharedStoreError> {
     let execution = execution_context();
     let global_cli_args = execution.globals();
@@ -177,26 +192,35 @@ pub async fn create_shared_store(
     };
     let shared_store_path = directory_containing_shared_store.join(SHARED_STORE_DIR);
 
+    if shared_store_path.exists() && !global_cli_args.force() {
+        return Err(SharedStoreError::internal(format!(
+            "Found existing shared store at {}",
+            shared_store_path.display()
+        )));
+    }
+
+    if global_cli_args.dry_run() {
+        LoreEvent::SharedStoreCreate(LoreSharedStoreCreateEventData {
+            path: LoreString::from_str(&shared_store_path.display().to_string()),
+        })
+        .send();
+        return Ok(());
+    }
+
     if shared_store_path.exists() {
-        if global_cli_args.force() {
-            lore_io::IoDriver::global()
-                .remove_dir_all(&shared_store_path)
-                .await
-                .internal_with(|| {
-                    format!("removing shared store at {}", shared_store_path.display())
-                })?;
-        } else {
-            return Err(SharedStoreError::internal(format!(
-                "Found existing shared store at {}",
-                shared_store_path.display()
-            )));
-        }
+        lore_io::IoDriver::global()
+            .remove_dir_all(&shared_store_path)
+            .await
+            .internal_with(|| {
+                format!("removing shared store at {}", shared_store_path.display())
+            })?;
     }
 
     create_shared_store_at(
         &directory_containing_shared_store,
         &shared_store_path,
         Some(remote_url.clone()),
+        store_config,
     )
     .await?;
 
@@ -229,22 +253,16 @@ async fn create_shared_store_at(
     directory_containing_shared_store: &Path,
     shared_store_path: &Path,
     remote_url: Option<String>,
+    store_config: StoreConfig,
 ) -> Result<(), SharedStoreError> {
     let shared_store_config = SharedStoreConfig {
         remote_url,
-        store_config: Some(StoreConfig::global_default()),
+        store_config: Some(store_config),
     };
-
-    let options = shared_store_config
-        .store_config
-        .as_ref()
-        .map_or(ImmutableStoreCreateOptions::none(), |config| {
-            config.to_options()
-        });
 
     let immutable_store = immutable::create(
         Some(shared_store_path),
-        options,
+        ImmutableStoreCreateOptions::none(),
         false,
         immutable::client_settings(
             shared_store_config
@@ -256,8 +274,6 @@ async fn create_shared_store_at(
     )
     .await
     .forward::<SharedStoreError>("creating immutable store")?;
-
-    lore_storage::maintenance::spawn_gc(&immutable_store, &options);
 
     mutable::create(
         Some(shared_store_path),
@@ -404,6 +420,15 @@ pub async fn ensure_shared_store_for_repo(
     }
 
     let shared_store_path = directory_with_shared_store.join(SHARED_STORE_DIR);
+    // A store created here outlives the dry run, which removes only what it made in the
+    // repository's own directory.
+    if execution_context().globals().dry_run() {
+        return Err(SharedStoreError::internal(format!(
+            "--dry-run would create a shared store at {}, create it with `lore shared-store \
+             create` first",
+            shared_store_path.display()
+        )));
+    }
     let migrated = match directory_with_shared_store.parent() {
         Some(base) => {
             migrate_legacy_store_in_base(base, &shared_store_path, &config.remote_url).await?
@@ -420,6 +445,7 @@ pub async fn ensure_shared_store_for_repo(
             &directory_with_shared_store,
             &shared_store_path,
             config.remote_url.clone(),
+            StoreConfig::client_default(),
         )
         .await?;
     }
@@ -452,13 +478,35 @@ pub async fn ensure_shared_store_for_repo(
 pub async fn get_shared_store_path_for_repo(
     config: &RepositoryConfig,
 ) -> Result<Option<PathBuf>, SharedStoreError> {
+    Ok(get_shared_store_for_repo(config)
+        .await?
+        .map(|(shared_store_path, _)| shared_store_path))
+}
+
+/// The directory of the shared store `config` names, found as [`get_shared_store_for_repo`] finds
+/// it, without reading the store's config. `None` where `config` names no shared store.
+pub async fn locate_shared_store_for_repo(
+    config: &RepositoryConfig,
+) -> Result<Option<PathBuf>, SharedStoreError> {
+    let Some(shared_store_to_use_config) = config
+        .shared_store_to_use
+        .as_ref()
+        .filter(|to_use| to_use.use_shared_store.unwrap_or(false))
+    else {
+        return Ok(None);
+    };
+    let directory_with_shared_store =
+        resolve_shared_store_dir(shared_store_to_use_config, &config.remote_url).await?;
+    find_existing_shared_store_in_dir(directory_with_shared_store).map(Some)
+}
+
+/// The path and config of the shared store a repository uses, as
+/// [`get_shared_store_path_for_repo`] finds it.
+pub async fn get_shared_store_for_repo(
+    config: &RepositoryConfig,
+) -> Result<Option<(PathBuf, SharedStoreConfig)>, SharedStoreError> {
     Ok(
-        if let Some(shared_store_to_use_config) = config.shared_store_to_use.as_ref()
-            && shared_store_to_use_config.use_shared_store.unwrap_or(false)
-        {
-            let directory_with_shared_store =
-                resolve_shared_store_dir(shared_store_to_use_config, &config.remote_url).await?;
-            let shared_store_path = find_existing_shared_store_in_dir(directory_with_shared_store)?;
+        if let Some(shared_store_path) = locate_shared_store_for_repo(config).await? {
             let shared_store_config =
                 load_shared_store_config(&shared_store_path)
                     .await
@@ -472,7 +520,7 @@ pub async fn get_shared_store_path_for_repo(
                     shared_store_config.remote_url.unwrap_or_default(),
                 )));
             }
-            Some(shared_store_path)
+            Some((shared_store_path, shared_store_config))
         } else {
             None
         },
@@ -495,7 +543,9 @@ async fn load_shared_store_config(
         let legacy_config = config::load::<SharedStoreConfig>(&legacy_config_path)
             .await
             .forward::<SharedStoreError>("Loading legacy shared store config");
-        if let Ok(legacy_config) = legacy_config.as_ref() {
+        if let Ok(legacy_config) = legacy_config.as_ref()
+            && !execution_context().globals().dry_run()
+        {
             config::save(legacy_config, config_path)
                 .await
                 .forward::<SharedStoreError>("migrating global config")?;
@@ -514,7 +564,9 @@ async fn load_shared_store_config(
 
 /// Data for an event describing the configured shared stores.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreSharedStoreInfoEventData {
     /// Nonzero when a shared store is used automatically for the repository.
@@ -529,7 +581,9 @@ pub struct LoreSharedStoreInfoEventData {
 
 /// Data for an event describing all shared stores.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreSharedStoreListEventData {
     /// All stores from the registry.
@@ -538,15 +592,17 @@ pub struct LoreSharedStoreListEventData {
 
 /// Shared store array list item.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreSharedStoreListItem {
     /// Remote URL the shared store is for.
     pub remote_url: LoreString,
     /// Path to the shared store on disk.
     pub store_path: LoreString,
-    /// Paths to instances using the shared store
+    /// Paths to instances using the shared store, empty for a store listed without its instances.
     pub instance_paths: LoreArray<LoreString>,
-    /// Ids of instances using the shared store
+    /// Ids of instances using the shared store, empty for a store listed without its instances.
     pub instance_ids: LoreArray<InstanceId>,
 }

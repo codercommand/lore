@@ -10,6 +10,8 @@ use std::any::Any;
 use std::sync::OnceLock;
 
 use crate::runtime::LORE_CONTEXT;
+use crate::wire_schema::WireSchema;
+use crate::wire_schema::schema_text;
 
 /// Directory holding the global configuration and data, in place of the per-user default.
 pub const GLOBAL_PATH_VAR: &str = "LORE_GLOBAL_PATH";
@@ -17,8 +19,40 @@ pub const GLOBAL_PATH_VAR: &str = "LORE_GLOBAL_PATH";
 /// Directory holding the token store, in place of the per-user default.
 pub const AUTH_PATH_VAR: &str = "LORE_AUTH_PATH";
 
+/// Where the token store keeps its encryption key, as an [`AuthStore`] value.
+pub const AUTH_STORE_VAR: &str = "LORE_AUTH_STORE";
+
+/// Where the token store keeps its encryption key, as `LORE_AUTH_STORE` and the global
+/// configuration's `[auth] store` name it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthStore {
+    /// The operating system's secure store.
+    Secure,
+    /// A file beside the token store, readable by its owner alone.
+    Fallback,
+}
+
+impl AuthStore {
+    /// The value of `LORE_AUTH_STORE` that selects this store.
+    pub const fn as_var(self) -> &'static str {
+        match self {
+            Self::Secure => "secure",
+            Self::Fallback => "fallback",
+        }
+    }
+
+    /// The store a value of `LORE_AUTH_STORE` names, or `None` for a value that names neither.
+    pub fn from_var(value: &str) -> Option<Self> {
+        [Self::Secure, Self::Fallback]
+            .into_iter()
+            .find(|store| store.as_var() == value)
+    }
+}
+
 /// The variables a call carries.
-const CALL_VARIABLES: [&str; 2] = [GLOBAL_PATH_VAR, AUTH_PATH_VAR];
+#[lore_macro::test_pub]
+const CALL_VARIABLES: [&str; 3] = [GLOBAL_PATH_VAR, AUTH_PATH_VAR, AUTH_STORE_VAR];
 
 /// A process's values of the variables a call carries, unset ones included, so that a variable
 /// its caller left unset is not read from the service's environment either.
@@ -26,6 +60,24 @@ const CALL_VARIABLES: [&str; 2] = [GLOBAL_PATH_VAR, AUTH_PATH_VAR];
 #[derive(Clone, Debug, Default, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub struct CallEnvironment {
     values: [Option<String>; CALL_VARIABLES.len()],
+}
+
+/// The schema of the values with the names of the variables they hold, in order: which value is
+/// which is decided by [`CALL_VARIABLES`], which the values' type doesn't carry.
+impl WireSchema for CallEnvironment {
+    const SCHEMA: u64 = call_environment_schema(&CALL_VARIABLES);
+}
+
+/// The schema of a [`CallEnvironment`] that carries the variables `names` names, in order.
+#[lore_macro::test_pub]
+const fn call_environment_schema(names: &[&str]) -> u64 {
+    let mut hash = <[Option<String>; CALL_VARIABLES.len()] as WireSchema>::SCHEMA;
+    let mut index = 0;
+    while index < names.len() {
+        hash = schema_text(hash, names[index]);
+        index += 1;
+    }
+    hash
 }
 
 impl CallEnvironment {

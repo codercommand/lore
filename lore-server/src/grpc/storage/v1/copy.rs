@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
+use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -32,6 +33,7 @@ use tracing::info_span;
 
 use super::log_and_code;
 use super::record_latency;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 use crate::grpc::extract_correlation_id;
@@ -40,6 +42,8 @@ use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
 use crate::grpc::interpret_streaming_error;
 use crate::grpc::map_message_handle_error_to_status;
+use crate::grpc::require_action;
+use crate::grpc::until_request_cancelled;
 use crate::protocol::storage::copy::handle_copy;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -89,7 +93,7 @@ async fn copy_item(
     } else {
         let token = auth_token.as_deref().map(VerifiedTokenOwned::as_token);
         repository_authorizer
-            .check_repository_access(token.as_ref(), source_repository, None)
+            .check_repository_access(token.as_ref(), source_repository, Action::Read)
             .await
     };
     let outcome = if let Err(status) = source_check {
@@ -144,6 +148,7 @@ pub async fn handler(
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<CopyResponseStream>, Status> {
+    require_action(&repository_authorizer, &request, Action::Write).await?;
     let destination_repository = get_repository(request.metadata())?;
     // Owned halves of the verified token: the per-item tasks outlive the
     // request extensions the borrowed form points into.
@@ -151,7 +156,7 @@ pub async fn handler(
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
-    let mut stream = request.into_inner();
+    let stream = request.into_inner();
 
     let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
@@ -163,6 +168,9 @@ pub async fn handler(
         .scope(execution, async move {
             lore_spawn!(async move {
                 let task_limiter = Arc::new(Semaphore::new(super::STREAM_PROCESS_LIMIT));
+                // Ends once nobody reads the answers. An item already started finishes, so no
+                // store operation is cut off part way.
+                let mut stream = pin!(until_request_cancelled(stream));
                 while let Some(req) = stream.next().await {
                     let permit = match Arc::clone(&task_limiter).acquire_owned().await {
                         Ok(p) => p,

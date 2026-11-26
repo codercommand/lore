@@ -1,14 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use lore_base::error::InvalidArguments;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::BranchId;
+use lore_base::types::Hash;
 use lore_base::types::LockResource;
 use lore_proto::LockService;
 use lore_proto::lock::AdminLockRequest;
 use lore_proto::lock::AdminLockResponse;
+use lore_proto::lock::ForwardedUnlockRequest;
 use lore_proto::lock::LockRequest;
 use lore_proto::lock::LockResponse;
 use lore_proto::lock::QueryRequest;
@@ -20,6 +24,7 @@ use lore_proto::lock::UnlockResponse;
 use lore_revision::lock::LockError;
 use lore_revision::lock::LockQuery;
 use lore_revision::lock::LockStore;
+use lore_revision::lock::util::store_lock_batch_size;
 use lore_revision::lore::RepositoryId;
 use lore_revision::notification::NotificationSender;
 use lore_telemetry::InstrumentProvider;
@@ -30,14 +35,19 @@ use tonic::Status;
 use tracing::info;
 use tracing::warn;
 
+use super::ServerResultExt;
 use super::extract_correlation_id;
 use super::get_repository;
 use super::get_user_id;
 use super::timeout_grpc;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::check_request_cancelled;
+use crate::grpc::forwarded_requests::CallerContext;
+use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::no_repository_access_status;
+use crate::grpc::require_action;
 use crate::util::setup_execution;
-
-const STATUS_MAX_RESOURCE_LEN: usize = 100;
 
 #[derive(Clone)]
 struct LoreLockServiceInstrumentProvider {}
@@ -72,6 +82,311 @@ fn lock_query_from_request(
     }
 }
 
+/// Answers a lock query from this server's own lock store.
+pub async fn query_implementation(
+    request: QueryRequest,
+    caller_context: CallerContext,
+    lock_store: &dyn LockStore,
+) -> Result<Response<QueryResponse>, Status> {
+    let query = lock_query_from_request(caller_context.repository_id, &request)
+        .map_err(handle_lock_error)?;
+
+    let execution = setup_execution(
+        module_path!(),
+        caller_context.correlation_id,
+        caller_context.user_id,
+    );
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            lock_store
+                .query_locks(query)
+                .await
+                .map(|result| {
+                    Response::new(QueryResponse {
+                        result: result.into_iter().map(Into::into).collect(),
+                    })
+                })
+                .map_err(handle_lock_error)
+        })
+        .await
+}
+
+/// Has the peer named by `forwarded_requests` answer the query, and relays its
+/// answer to the client.
+async fn forward_query(
+    request: QueryRequest,
+    caller_context: CallerContext,
+    forwarded_requests: &Arc<dyn ForwardedRequests>,
+) -> Result<Response<QueryResponse>, Status> {
+    let mut client = forwarded_requests.forwarded_lock_service();
+    let request = caller_context.to_forwarded_request(request)?;
+
+    let query_result = client
+        .query(request)
+        .await
+        .warn_map_err(|_err| Status::internal("Error making forwarded request"))?;
+
+    // the Error arm of this result is for the client
+    let response = query_result?;
+    Ok(response)
+}
+
+/// Refuse a request `lock_store` cannot apply as one operation.
+///
+/// **Too many resources.** A request naming more resources than [`store_lock_batch_size`] gives
+/// for the store is refused with `OUT_OF_RANGE`.
+///
+/// **The same resource twice.** A resource is keyed by its branch and hash as the store reads
+/// them; the description is not part of that key, so two resources differing only there name
+/// one lock. A request naming one key more than once is refused with `INVALID_ARGUMENT`.
+///
+/// The count is checked before the keys. A server forwarding a request checks it first, against
+/// the store whose limit it advertises, and the peer checks it again against its own store, whose
+/// limit may be lower.
+fn check_resources(
+    lock_store: &dyn LockStore,
+    resources: &[lore_proto::lock::Resource],
+) -> Result<(), Status> {
+    let limit = store_lock_batch_size(lock_store);
+
+    if resources.len() > limit {
+        return Err(Status::out_of_range(format!(
+            "Resource count {} exceeds limit {limit}",
+            resources.len()
+        )));
+    }
+
+    let mut seen = HashSet::with_capacity(resources.len());
+    if let Some(duplicate) = resources.iter().find(|resource| {
+        !seen.insert((
+            BranchId::from(resource.branch.as_ref()),
+            Hash::from(resource.hash.as_ref()),
+        ))
+    }) {
+        return Err(Status::invalid_argument(format!(
+            "Resource {} is named more than once",
+            duplicate.description
+        )));
+    }
+
+    Ok(())
+}
+
+/// Locks resources for the caller in this server's own lock store, and
+/// announces the new locks.
+pub async fn lock_implementation(
+    request: LockRequest,
+    caller_context: CallerContext,
+    lock_store: &dyn LockStore,
+    notification: &dyn NotificationSender,
+) -> Result<Response<LockResponse>, Status> {
+    if request.resources.is_empty() {
+        return Ok(Response::new(LockResponse { locks: vec![] }));
+    }
+
+    check_resources(lock_store, &request.resources)?;
+
+    let execution = setup_execution(
+        module_path!(),
+        caller_context.correlation_id,
+        caller_context.user_id.clone(),
+    );
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            lock_as_user(
+                lock_store,
+                notification,
+                caller_context.repository_id,
+                request.resources,
+                &caller_context.user_id,
+            )
+            .await
+            .map(|locks| Response::new(LockResponse { locks }))
+        })
+        .await
+}
+
+/// Has the peer named by `forwarded_requests` take the locks, and relays its
+/// answer to the client.
+async fn forward_lock(
+    request: LockRequest,
+    caller_context: CallerContext,
+    forwarded_requests: &Arc<dyn ForwardedRequests>,
+) -> Result<Response<LockResponse>, Status> {
+    let mut client = forwarded_requests.forwarded_lock_service();
+    let request = caller_context.to_forwarded_request(request)?;
+
+    let lock_result = client
+        .lock(request)
+        .await
+        .warn_map_err(|_err| Status::internal("Error making forwarded request"))?;
+
+    // the Error arm of this result is for the client
+    let response = lock_result?;
+    Ok(response)
+}
+
+/// Answers a lock status request from this server's own lock store.
+pub async fn status_implementation(
+    request: StatusRequest,
+    caller_context: CallerContext,
+    lock_store: &dyn LockStore,
+) -> Result<Response<StatusResponse>, Status> {
+    if request.resources.is_empty() {
+        return Ok(Response::new(StatusResponse { locks: vec![] }));
+    }
+
+    check_resources(lock_store, &request.resources)?;
+
+    info!(
+        num_items = request.resources.len(),
+        "Handling LockService::Status request"
+    );
+
+    let resources: Vec<LockResource> = request.resources.into_iter().map(Into::into).collect();
+
+    let execution = setup_execution(
+        module_path!(),
+        caller_context.correlation_id,
+        caller_context.user_id,
+    );
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let locks = lock_store
+                .check_locks_status(caller_context.repository_id, &resources)
+                .await
+                .map_err(handle_lock_error)?;
+
+            Ok(Response::new(StatusResponse {
+                locks: locks.into_iter().map(Into::into).collect(),
+            }))
+        })
+        .await
+}
+
+/// Has the peer named by `forwarded_requests` answer the status request, and
+/// relays its answer to the client.
+async fn forward_status(
+    request: StatusRequest,
+    caller_context: CallerContext,
+    forwarded_requests: &Arc<dyn ForwardedRequests>,
+) -> Result<Response<StatusResponse>, Status> {
+    let mut client = forwarded_requests.forwarded_lock_service();
+    let request = caller_context.to_forwarded_request(request)?;
+
+    let status_result = client
+        .status(request)
+        .await
+        .warn_map_err(|_err| Status::internal("Error making forwarded request"))?;
+
+    // the Error arm of this result is for the client
+    let response = status_result?;
+    Ok(response)
+}
+
+/// Releases locks in this server's own lock store, and announces the released
+/// resources. Unless `elevated_caller` is set, each lock must be held by the caller.
+pub async fn unlock_implementation(
+    resources: Vec<lore_proto::lock::Resource>,
+    elevated_caller: bool,
+    caller_context: CallerContext,
+    lock_store: &dyn LockStore,
+    notification: &dyn NotificationSender,
+) -> Result<Response<UnlockResponse>, Status> {
+    if resources.is_empty() {
+        return Ok(Response::new(UnlockResponse { resources: vec![] }));
+    }
+
+    check_resources(lock_store, &resources)?;
+
+    let resources: Vec<LockResource> = resources.iter().map(Into::into).collect();
+    let repository = caller_context.repository_id;
+    let user_id = caller_context.user_id;
+
+    let execution = setup_execution(
+        module_path!(),
+        caller_context.correlation_id,
+        user_id.clone(),
+    );
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            check_request_cancelled()?;
+            let resources = lock_store
+                .unlock_resources(user_id.as_str(), !elevated_caller, repository, &resources)
+                .await
+                .map_err(handle_lock_error)?;
+
+            // TODO: UCS-13626 move branch out of individual resources into the main message
+            // All resources are on the same branch and the lock call has to be made with at least 1 resource
+            if !resources.is_empty() {
+                notification
+                    .resource_unlocked(repository, resources[0].branch, &user_id, &resources)
+                    .await;
+            }
+
+            Ok(Response::new(UnlockResponse {
+                resources: resources.into_iter().map(Into::into).collect(),
+            }))
+        })
+        .await
+}
+
+/// Has the peer named by `forwarded_requests` release the locks, and relays
+/// its answer to the client.
+async fn forward_unlock(
+    request: ForwardedUnlockRequest,
+    caller_context: CallerContext,
+    forwarded_requests: &Arc<dyn ForwardedRequests>,
+) -> Result<Response<UnlockResponse>, Status> {
+    let mut client = forwarded_requests.forwarded_lock_service();
+    let request = caller_context.to_forwarded_request(request)?;
+
+    let unlock_result = client
+        .unlock(request)
+        .await
+        .warn_map_err(|_err| Status::internal("Error making forwarded request"))?;
+
+    // the Error arm of this result is for the client
+    let response = unlock_result?;
+    Ok(response)
+}
+
+async fn lock_as_user(
+    lock_store: &dyn LockStore,
+    notification: &dyn NotificationSender,
+    repository: RepositoryId,
+    resources: Vec<lore_proto::lock::Resource>,
+    owner_id: &str,
+) -> Result<Vec<lore_proto::lock::Lock>, Status> {
+    if resources.is_empty() {
+        return Err(Status::invalid_argument("At least one resource needed"));
+    }
+
+    let lock_resources: Vec<LockResource> = resources.into_iter().map(Into::into).collect();
+
+    check_request_cancelled()?;
+    let locks = lock_store
+        .lock_resources(owner_id, repository, &lock_resources)
+        .await
+        .map_err(handle_lock_error)?;
+
+    // TODO: UCS-13626 move branch out of individual resources into the main message
+    // All resources are on the same branch and the lock call has to be made with at least 1 resource
+    let branch = lock_resources[0].branch;
+    let locked_resources: Vec<LockResource> =
+        locks.iter().map(|lock| lock.resource.clone()).collect();
+
+    notification
+        .resource_locked(repository, branch, owner_id, &locked_resources)
+        .await;
+
+    Ok(locks.into_iter().map(Into::into).collect())
+}
+
 fn handle_lock_error(error: LockError) -> Status {
     match error {
         LockError::LockNotFound(_) => Status::not_found(error.to_string()),
@@ -90,6 +405,7 @@ pub struct LoreLockService {
     lock_store: Arc<dyn LockStore>,
     notification: Arc<dyn NotificationSender>,
     authorizer: Arc<dyn RepositoryAuthorizer>,
+    forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
 
     instrument_provider: LoreLockServiceInstrumentProvider,
@@ -102,6 +418,7 @@ impl LoreLockService {
         lock_store: Arc<dyn LockStore>,
         notification: Arc<dyn NotificationSender>,
         authorizer: Arc<dyn RepositoryAuthorizer>,
+        forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
     ) -> Self {
         let instrument_provider = LoreLockServiceInstrumentProvider {};
@@ -110,6 +427,7 @@ impl LoreLockService {
             lock_store,
             notification,
             authorizer,
+            forwarded_requests,
             rpc_timeout,
             locking_histogram: instrument_provider.length_histogram(
                 "locking.request.resources.length",
@@ -134,48 +452,20 @@ impl InstrumentProvider for LoreLockServiceInstrumentProvider {
 }
 
 impl LoreLockService {
-    async fn lock_as_user(
-        &self,
-        repository: RepositoryId,
-        resources: Vec<lore_proto::lock::Resource>,
-        owner_id: &str,
-    ) -> Result<Vec<lore_proto::lock::Lock>, Status> {
-        if resources.is_empty() {
-            return Err(Status::invalid_argument("At least one resource needed"));
-        }
-
-        let lock_resources: Vec<LockResource> = resources.into_iter().map(Into::into).collect();
-
-        let locks = self
-            .lock_store
-            .lock_resources(owner_id, repository, &lock_resources)
-            .await
-            .map_err(handle_lock_error)?;
-
-        // TODO: UCS-13626 move branch out of individual resources into the main message
-        // All resources are on the same branch and the lock call has to be made with at least 1 resource
-        let branch = lock_resources[0].branch;
-        let locked_resources: Vec<LockResource> =
-            locks.iter().map(|lock| lock.resource.clone()).collect();
-
-        self.notification
-            .resource_locked(repository, branch, owner_id, &locked_resources)
-            .await;
-
-        let locks = locks.into_iter().map(Into::into).collect();
-
-        Ok(locks)
-    }
-
     /// `owner` or `admin` on `repository` waives the lock-ownership check.
-    async fn is_elevated(&self, extensions: &tonic::Extensions, repository: RepositoryId) -> bool {
-        self.authorizer
-            .permits(extensions, repository, "owner")
-            .await
+    async fn is_elevated(
+        &self,
+        extensions: &tonic::Extensions,
+        repository: RepositoryId,
+    ) -> Result<bool, Status> {
+        Ok(self
+            .authorizer
+            .permits(extensions, repository, Action::Owner)
+            .await?
             || self
                 .authorizer
-                .permits(extensions, repository, "admin")
-                .await
+                .permits(extensions, repository, Action::Admin)
+                .await?)
     }
 }
 
@@ -184,9 +474,8 @@ impl LoreLockService {
         &self,
         request: Request<LockRequest>,
     ) -> Result<Response<LockResponse>, Status> {
-        let repository = get_repository(request.metadata())?;
-        let user_id = get_user_id(request.extensions());
-        let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+        require_action(&self.authorizer, &request, Action::Write).await?;
+        let caller_context = CallerContext::from_original_request(&request)?;
         let lock_request = request.into_inner();
 
         self.locking_histogram.record(
@@ -196,64 +485,49 @@ impl LoreLockService {
                 .get_labels_for_operation_context("lock"),
         );
 
+        // Answered here so an empty request never waits on, or fails with, the peer.
         if lock_request.resources.is_empty() {
             return Ok(Response::new(LockResponse { locks: vec![] }));
         }
 
-        let resources = lock_request.resources;
-
-        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                self.lock_as_user(repository, resources, &user_id)
-                    .await
-                    .map(|locks| Response::new(LockResponse { locks }))
-            })
+        if let Some(forwarded_requests) = &self.forwarded_requests
+            && forwarded_requests.rpc_flags().lock_lock
+        {
+            check_resources(self.lock_store.as_ref(), &lock_request.resources)?;
+            forward_lock(lock_request, caller_context, forwarded_requests).await
+        } else {
+            lock_implementation(
+                lock_request,
+                caller_context,
+                self.lock_store.as_ref(),
+                self.notification.as_ref(),
+            )
             .await
+        }
     }
 
     async fn handle_query(
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let user_id = get_user_id(request.extensions());
-        let repository = get_repository(request.metadata())?;
-        let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-        let query_request = request.get_ref();
+        let caller_context = CallerContext::from_original_request(&request)?;
+        let query_request = request.into_inner();
 
-        let query =
-            lock_query_from_request(repository, query_request).map_err(handle_lock_error)?;
-
-        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                self.lock_store
-                    .query_locks(query)
-                    .await
-                    .map(|result| {
-                        Response::new(QueryResponse {
-                            result: result.into_iter().map(Into::into).collect(),
-                        })
-                    })
-                    .map_err(handle_lock_error)
-            })
-            .await
+        if let Some(forwarded_requests) = &self.forwarded_requests
+            && forwarded_requests.rpc_flags().lock_query
+        {
+            forward_query(query_request, caller_context, forwarded_requests).await
+        } else {
+            query_implementation(query_request, caller_context, self.lock_store.as_ref()).await
+        }
     }
 
     async fn handle_status(
         &self,
         request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        let user_id = get_user_id(request.extensions());
-        let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-        let repository = get_repository(request.metadata())?;
+        let caller_context = CallerContext::from_original_request(&request)?;
         let status_request = request.into_inner();
-
-        if status_request.resources.len() > STATUS_MAX_RESOURCE_LEN {
-            return Err(Status::invalid_argument("Resource count exceeds limit"));
-        }
 
         self.status_histogram.record(
             status_request.resources.len() as u64,
@@ -262,46 +536,36 @@ impl LoreLockService {
                 .get_labels_for_operation_context("status"),
         );
 
+        // Answered here so an empty request never waits on, or fails with, the peer.
         if status_request.resources.is_empty() {
             return Ok(Response::new(StatusResponse { locks: vec![] }));
         }
 
-        info!(
-            num_items = status_request.resources.len(),
-            "Handling LockService::Status request"
-        );
-
-        let resources: Vec<LockResource> = status_request
-            .resources
-            .into_iter()
-            .map(Into::into)
-            .collect();
-
-        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let locks = self
-                    .lock_store
-                    .check_locks_status(repository, &resources)
-                    .await
-                    .map_err(handle_lock_error)?;
-
-                Ok(Response::new(StatusResponse {
-                    locks: locks.into_iter().map(Into::into).collect(),
-                }))
-            })
-            .await
+        if let Some(forwarded_requests) = &self.forwarded_requests
+            && forwarded_requests.rpc_flags().lock_status
+        {
+            check_resources(self.lock_store.as_ref(), &status_request.resources)?;
+            forward_status(status_request, caller_context, forwarded_requests).await
+        } else {
+            status_implementation(status_request, caller_context, self.lock_store.as_ref()).await
+        }
     }
 
     async fn handle_unlock(
         &self,
         request: Request<UnlockRequest>,
     ) -> Result<Response<UnlockResponse>, Status> {
-        let user_id = get_user_id(request.extensions());
-        let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let validate_user = !self.is_elevated(request.extensions(), repository).await;
+        let elevated_caller = self.is_elevated(request.extensions(), repository).await?;
+        if !elevated_caller
+            && !self
+                .authorizer
+                .permits(request.extensions(), repository, Action::Write)
+                .await?
+        {
+            return Err(no_repository_access_status());
+        }
+        let caller_context = CallerContext::from_original_request(&request)?;
         let unlock_request = request.into_inner();
 
         self.locking_histogram.record(
@@ -311,36 +575,30 @@ impl LoreLockService {
                 .get_labels_for_operation_context("unlock"),
         );
 
+        // Answered here so an empty request never waits on, or fails with, the peer.
         if unlock_request.resources.is_empty() {
             return Ok(Response::new(UnlockResponse { resources: vec![] }));
         }
 
-        let resources: Vec<LockResource> =
-            unlock_request.resources.iter().map(Into::into).collect();
-
-        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let resources = self
-                    .lock_store
-                    .unlock_resources(user_id.as_str(), validate_user, repository, &resources)
-                    .await
-                    .map_err(handle_lock_error)?;
-
-                // TODO: UCS-13626 move branch out of individual resources into the main message
-                // All resources are on the same branch and the lock call has to be made with at least 1 resource
-                if !resources.is_empty() {
-                    self.notification
-                        .resource_unlocked(repository, resources[0].branch, &user_id, &resources)
-                        .await;
-                }
-
-                Ok(Response::new(UnlockResponse {
-                    resources: resources.into_iter().map(Into::into).collect(),
-                }))
-            })
+        if let Some(forwarded_requests) = &self.forwarded_requests
+            && forwarded_requests.rpc_flags().lock_unlock
+        {
+            check_resources(self.lock_store.as_ref(), &unlock_request.resources)?;
+            let request = ForwardedUnlockRequest {
+                resources: unlock_request.resources,
+                elevated_caller,
+            };
+            forward_unlock(request, caller_context, forwarded_requests).await
+        } else {
+            unlock_implementation(
+                unlock_request.resources,
+                elevated_caller,
+                caller_context,
+                self.lock_store.as_ref(),
+                self.notification.as_ref(),
+            )
             .await
+        }
     }
 
     async fn handle_admin_lock(
@@ -349,7 +607,14 @@ impl LoreLockService {
     ) -> Result<Response<AdminLockResponse>, Status> {
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let extensions = request.extensions().clone();
+        if !self
+            .authorizer
+            .permits(request.extensions(), repository, Action::Migrate)
+            .await?
+        {
+            warn!("Attempt to apply admin locks, but user does not have the correct permissions");
+            return Err(Status::permission_denied("Permission denied"));
+        }
 
         let user_id = get_user_id(request.extensions());
         let lock_request = request.into_inner();
@@ -360,6 +625,8 @@ impl LoreLockService {
                 .instrument_provider
                 .get_labels_for_operation_context("admin_lock"),
         );
+
+        check_resources(self.lock_store.as_ref(), &lock_request.resources)?;
 
         if lock_request.resources.is_empty() {
             return Ok(Response::new(AdminLockResponse { locks: vec![] }));
@@ -372,14 +639,15 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                if !self.authorizer.permits(&extensions, repository, "migrate").await {
-                    warn!("Attempt to apply admin locks, but user does not have the correct permissions");
-                    return Err(Status::permission_denied("Permission denied"));
-                }
-
-                self.lock_as_user(repository, resources, &owner)
-                    .await
-                    .map(|locks| Response::new(AdminLockResponse { locks }))
+                lock_as_user(
+                    self.lock_store.as_ref(),
+                    self.notification.as_ref(),
+                    repository,
+                    resources,
+                    &owner,
+                )
+                .await
+                .map(|locks| Response::new(AdminLockResponse { locks }))
             })
             .await
     }

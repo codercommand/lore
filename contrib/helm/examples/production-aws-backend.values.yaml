@@ -9,9 +9,9 @@
 #   - the S3 bucket and DynamoDB tables provisioned out of band, with the key
 #     schemas and indexes in contrib/aws/storage.tf
 #
-# NOTE: the chart runs ONE server pod (topology: single). Redundancy here is in the
-# storage layer, not the pod count — horizontal/multi-writer server scaling is a
-# lore feature not yet exposed by this chart.
+# NOTE: this runs ONE server pod (topology: single). Redundancy here is in the
+# storage layer, not the pod count. For several servers with a local NVMe cache each,
+# see examples/multi-server-aws.values.yaml.
 
 image:
   repository: ghcr.io/epicgames/lore/loreserver
@@ -58,6 +58,11 @@ auth:
   jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
   issuer: "https://auth.example.com/"
   audience: ["lore"]
+  resourceClaim: "resources"   # Tier 2: the token's resource grants authorize each repository
+  oidc:
+    clientId: "lore-cli"
+    scopes: ["openid", "offline_access"]
+    resourceTemplate: "https://lore.example.com/partitions/{id}"
 
 # Point every store at the AWS plugin. Adjust bucket/table names and region to your
 # resources. Each store has its own [plugins.aws.<store>] section.

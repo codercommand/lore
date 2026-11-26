@@ -12,6 +12,8 @@ from dataclasses import field as dc_field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from lore import GlobalOptions
 
 logger = logging.getLogger(__name__)
@@ -29,10 +31,6 @@ class BranchList:
 
     def has_remote_branch(self, name: str) -> bool:
         return name in self.remote_branches
-
-    def has_branch(self, name: str) -> bool:
-        """Check if a branch exists locally or remotely."""
-        return self.has_local_branch(name) or self.has_remote_branch(name)
 
     def has_archived_branch(self, name: str) -> bool:
         return name in self.archived_branches
@@ -197,9 +195,28 @@ def parse_jsonl(output: str, tag_name: str) -> list[dict]:
     return entries
 
 
+def to_posix(path: str | Path) -> str:
+    """Normalize a path to forward slashes for comparison against Lore output.
+
+    Lore JSON output always uses forward slashes regardless of platform.
+    Use this to normalize os.path.join results before comparing against
+    paths extracted from Lore status, unstage events, etc.
+    """
+    return str(path).replace("\\", "/")
+
+
 def parse_status_json(status_output: str) -> list[dict]:
     """Parse JSON status output into a list of status entry dictionaries."""
     return parse_jsonl(status_output, "repositoryStatusFile")
+
+
+def find_status_entry(entries: list[dict], path: str | Path) -> dict | None:
+    """Find a status entry by path (posix-normalized)."""
+    target = to_posix(path)
+    for entry in entries:
+        if to_posix(entry.get("path", "")) == target:
+            return entry
+    return None
 
 
 def parse_status_count_json(status_output: str) -> dict | None:
@@ -247,6 +264,15 @@ def parse_layer_remove_json(output: str) -> dict | None:
     event data, or None if no event was emitted."""
     entries = parse_jsonl(output, "layerRemove")
     return entries[0] if entries else None
+
+
+def parse_file_audit_json(output: str) -> list[dict]:
+    """Parse `lore file audit --json` output into a list of range dicts, sorted
+    by first line. The command emits ranges as it resolves them, not in line
+    order; read them with `parse_jsonl` to check the emitted order."""
+    return sorted(
+        parse_jsonl(output, "fileAudit"), key=lambda entry: entry["lineFirst"]
+    )
 
 
 def parse_complete_json(output: str) -> dict | None:
@@ -329,16 +355,7 @@ def parse_branch_list(output: str):
     # Split off archived section first
     archived_split = output.strip().split("Archived local branches:")
     main_output = archived_split[0]
-    archived_string = archived_split[1] if len(archived_split) > 1 else ""
-
-    # If there's a remote section after archived, split it out
-    if "Remote branches:" in archived_string:
-        archived_part, remote_after_archived = archived_string.split(
-            "Remote branches:", 1
-        )
-    else:
-        archived_part = archived_string
-        remote_after_archived = ""
+    archived_part = archived_split[1] if len(archived_split) > 1 else ""
 
     output_split = main_output.split("Remote branches:")
     local_branches = []
@@ -353,13 +370,7 @@ def parse_branch_list(output: str):
         else:
             local_branches.append(line)
 
-    remote_string = ""
-    if len(output_split) > 1:
-        remote_string = output_split[1].strip()
-    if remote_after_archived:
-        if remote_string:
-            remote_string += "\n"
-        remote_string += remote_after_archived.strip()
+    remote_string = output_split[1].strip() if len(output_split) > 1 else ""
 
     remote_branches = [
         branch.lstrip("*").strip()

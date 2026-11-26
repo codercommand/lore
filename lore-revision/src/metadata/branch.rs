@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
+use lore_transport::StorageSession;
 
 use crate::branch;
 use crate::errors::AddressNotFound;
@@ -43,9 +44,22 @@ pub const READ_ONLY_KEYS: &[&str] = &[
     branch::CATEGORY,
     branch::CREATOR,
     branch::CREATED,
+    branch::RESTORED,
+    branch::ARCHIVED,
+    branch::RESTORING,
+    branch::RELEASED,
     branch::STACK,
     branch::PARENT_DEPRECATED,
     branch::BRANCH_POINT_DEPRECATED,
+];
+
+/// The read-only keys archives and restores write, which no metadata write may add either: they
+/// decide what a later archive or restore of the branch does.
+pub const ARCHIVE_KEYS: &[&str] = &[
+    branch::RESTORED,
+    branch::ARCHIVED,
+    branch::RESTORING,
+    branch::RELEASED,
 ];
 
 /// All built-in keys. These cannot be removed via clear, but `protect` can be overwritten
@@ -56,6 +70,10 @@ pub const BUILT_IN_KEYS: &[&str] = &[
     branch::CATEGORY,
     branch::CREATOR,
     branch::CREATED,
+    branch::RESTORED,
+    branch::ARCHIVED,
+    branch::RESTORING,
+    branch::RELEASED,
     branch::PROTECT,
     branch::STACK,
     branch::PARENT_DEPRECATED,
@@ -118,8 +136,9 @@ fn validate_key(key: &str) -> Result<(), BranchMetadataError> {
 /// Fetch the current branch metadata hash pointer.
 ///
 /// When `local` is false, queries the remote for the authoritative hash via the
-/// `BranchMetadataGet` RPC and caches it locally. Falls back to the local cache if the
-/// remote is unavailable. When `local` is true, reads directly from the local mutable store.
+/// `BranchMetadataGet` RPC and caches it locally (`branch::cache_remote_metadata`). Falls back to
+/// the local cache if the remote is unavailable. When `local` is true, reads directly from the
+/// local mutable store.
 async fn fetch_metadata_hash(
     repo: Arc<RepositoryContext>,
     branch: BranchId,
@@ -130,7 +149,7 @@ async fn fetch_metadata_hash(
         && let Ok(revision_service) = remote.revision(repo.id).await
         && let Ok(hash) = revision_service.branch_metadata_get(branch).await
     {
-        let _ = branch::mutable_store_metadata(repo.clone(), branch, hash).await;
+        let _ = branch::cache_remote_metadata(repo.clone(), branch, hash).await;
         return Ok(hash);
     }
 
@@ -139,20 +158,41 @@ async fn fetch_metadata_hash(
         .forward_any::<BranchMetadataError>("loading branch metadata hash")
 }
 
-/// Collect all addresses referenced by a metadata blob: the blob itself plus any binary
-/// (Address-typed) values it contains.
+/// The first of `addresses` the remote lacks, from one existence query on the storage session of
+/// `repository`, and `None` where the remote holds them all. No addresses answer `None` before any
+/// remote check, so a context without a remote fails with [`NoRemote`] only given addresses.
+///
+/// The session is the one `immutable::resolve_session` gives, over
+/// `RepositoryContext::session_pool`.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn first_missing_remote<'a>(
+    repository: &'a Arc<RepositoryContext>,
+    addresses: &'a [Address],
+) -> impl Future<Output = Result<Option<Address>, BranchMetadataError>> + 'a {
+    async move {
+        if addresses.is_empty() {
+            return Ok(None);
+        }
+        let storage = immutable::resolve_session(repository)
+            .ok_or_else(|| BranchMetadataError::from(NoRemote))?;
+        let missing = immutable::missing_remote(&storage, addresses)
+            .await
+            .forward::<BranchMetadataError>("querying the remote for the addresses it lacks")?;
+        Ok(missing.first().copied())
+    }
+}
+
+/// Collect all addresses referenced by a metadata blob: any binary (Address-typed) values it
+/// contains, then the blob itself, so [`ensure_remote_blobs`] uploads each payload before the
+/// blob that names it.
 fn collect_metadata_addresses(metadata: &Metadata, metadata_hash: Hash) -> Vec<Address> {
-    let mut addresses = vec![Address {
+    let mut addresses = metadata.address_values();
+    addresses.push(Address {
         hash: metadata_hash,
         context: Context::default(),
-    }];
-
-    metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
-        if value_type == MetadataType::Address && value.len() == std::mem::size_of::<Address>() {
-            addresses.push(value.into());
-        }
     });
-
     addresses
 }
 
@@ -160,25 +200,16 @@ fn collect_metadata_addresses(metadata: &Metadata, metadata_hash: Hash) -> Vec<A
 /// the local immutable store.
 async fn ensure_remote_blobs(
     repo: Arc<RepositoryContext>,
-    storage: Arc<lore_transport::StorageSession>,
+    storage: Arc<StorageSession>,
     addresses: &[Address],
 ) -> Result<(), BranchMetadataError> {
     if addresses.is_empty() {
         return Ok(());
     }
 
-    let status = storage
-        .query(addresses)
+    let missing = immutable::missing_remote(&storage, addresses)
         .await
-        .forward::<BranchMetadataError>("querying server for metadata blob existence")?;
-
-    let mut missing = vec![];
-    for (index, value) in status.iter().enumerate() {
-        if *value != 0 && index < addresses.len() {
-            missing.push(addresses[index]);
-        }
-    }
-
+        .forward::<BranchMetadataError>("querying the remote for metadata blob existence")?;
     for address in missing {
         let (fragment, payload) =
             immutable::load_raw_store_retry(repo.immutable_store(), repo.id, address)
@@ -201,7 +232,7 @@ async fn ensure_remote_blobs(
 /// metadata blob itself plus any binary Address values) exist on the server, uploading
 /// any that are missing from the local store. Then calls `BranchMetadataSet` which
 /// validates read-only field protection and binary blob existence before performing the CAS.
-/// On success, updates the local cache.
+/// On success, updates the local cache (`branch::cache_remote_metadata`).
 async fn commit_metadata_hash(
     repo: Arc<RepositoryContext>,
     branch: BranchId,
@@ -213,6 +244,11 @@ async fn commit_metadata_hash(
         .remote()
         .await
         .forward::<BranchMetadataError>("remote connection required")?;
+
+    // The upload and the swap below change the remote, which no dry run may.
+    if crate::lore::execution_context().globals().dry_run() {
+        return Ok(());
+    }
 
     let correlation_id = crate::lore::execution_context()
         .globals()
@@ -241,7 +277,7 @@ async fn commit_metadata_hash(
         ));
     }
 
-    let _ = branch::mutable_store_metadata(repo, branch, new).await;
+    let _ = branch::cache_remote_metadata(repo, branch, new).await;
     Ok(())
 }
 

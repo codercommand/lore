@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
 use clap::ValueEnum;
@@ -21,6 +21,8 @@ use lore::interface::LoreRepositoryCreateArgs;
 use lore::interface::LoreRepositoryDumpArgs;
 use lore::interface::LoreRepositoryGcArgs;
 use lore::interface::LoreRepositoryInfoArgs;
+use lore::interface::LoreRepositoryInstanceCloneMethod;
+use lore::interface::LoreRepositoryInstanceClonePhase;
 use lore::interface::LoreRepositoryListArgs;
 use lore::interface::LoreRepositoryMetadataClearArgs;
 use lore::interface::LoreRepositoryMetadataGetArgs;
@@ -117,8 +119,12 @@ pub enum VfsType {
     None,
     /// Use whichever VFS system is preferred based on the user's system.
     Default,
-    /// Use Epic's Split Write File System as the Virtual File System.
+    /// Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its
+    /// content in the shared store made for its remote, so it needs a reachable remote: it cannot
+    /// be created offline, or for a repository with no remote.
     Swfs,
+    /// A writable virtual instance: a Linux FUSE mount served by the Lore service.
+    Fuse,
 }
 
 impl VfsType {
@@ -127,6 +133,7 @@ impl VfsType {
             VfsType::None => LoreVfsType::None,
             VfsType::Default => LoreVfsType::Default,
             VfsType::Swfs => LoreVfsType::Swfs,
+            VfsType::Fuse => LoreVfsType::Fuse,
         }
     }
 }
@@ -146,19 +153,21 @@ pub struct RepositoryCreateArgs {
     #[clap(long, value_name = "id")]
     id: Option<String>,
 
-    /// Virtual File System type. When not 'none', creates a VFS as the repository directory.
+    /// Virtual File System type. When not 'none', creates a VFS as the repository directory,
+    /// over a shared store as if --use-shared-store were given.
     #[clap(long, value_enum, default_value = "none")]
     vfs: VfsType,
 
-    /// Use the shared store rather than create a local immutable store
+    /// Use the shared store rather than create a local immutable store. A VFS always does
     #[clap(long)]
     use_shared_store: bool,
 
     /// Use this path rather than the system default as the shared store location
-    #[clap(long, requires = "use_shared_store")]
+    #[clap(long)]
     shared_store_path: Option<String>,
 }
 
+#[lore_macro::test_pub]
 #[derive(Args)]
 pub struct RepositoryCloneArgs {
     /// URL of repository
@@ -181,15 +190,19 @@ pub struct RepositoryCloneArgs {
     #[clap(long, value_name = "branch", conflicts_with = "revision")]
     branch: Option<String>,
 
-    /// Clone without files, only fetch latest revision tree
+    /// Clone without files, only fetch latest revision tree. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long, action)]
     bare: bool,
 
-    /// Write directly to the destination file instead of write to a temporary file and move into place
+    /// Write directly to the destination file instead of write to a temporary file and move into
+    /// place, and on Windows write files of one fragment past the file cache. Applies to this clone
+    /// only: the new instance's `[file] direct_write` setting is left as it is, and later commands
+    /// follow that setting
     #[clap(long, action)]
     direct_file_write: bool,
 
-    /// Virtual File System type. When not 'none', creates a VFS as the repository directory.
+    /// Virtual File System type. When not 'none', creates a VFS as the repository directory,
+    /// over a shared store as if --use-shared-store were given.
     #[clap(long, value_enum, default_value = "none")]
     vfs: VfsType,
 
@@ -201,37 +214,45 @@ pub struct RepositoryCloneArgs {
     #[clap(long, value_name = "key")]
     layer_metadata: Option<String>,
 
-    /// File containing list of files to prefetch
+    /// Access recording whose paths a FUSE instance warms in the background (one path per line, directories ending with `/`)
     #[clap(long, value_name = "file")]
     prefetch: Option<String>,
 
-    /// Use the shared store rather than create a local immutable store
+    /// Use the shared store rather than create a local immutable store. A VFS always does
     #[clap(long)]
     use_shared_store: bool,
 
     /// Use this path rather than the system default as the shared store location
-    #[clap(long, requires = "use_shared_store")]
+    #[clap(long)]
     shared_store_path: Option<String>,
 
     /// Clone without local repository tracking (memory-only stores)
     #[clap(long, action)]
     no_tracking: bool,
 
-    /// Root files for dependency-based selective clone (only clone these files and their dependencies)
+    /// Root files for dependency-based selective cloning (only clone these files and their dependencies). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long = "root-file", value_name = "path")]
     root_files: Vec<String>,
 
-    /// Tags to filter dependencies by during dependency-based clone
+    /// Tags to filter dependencies by during dependency-based cloning
     #[clap(long = "dependency-tag", value_name = "tag")]
     dependency_tags: Vec<String>,
 
-    /// Follow transitive dependencies recursively during dependency-based clone
+    /// Follow transitive dependencies recursively during dependency-based cloning
     #[clap(long, action)]
     dependency_recursive: bool,
 
     /// Maximum dependency traversal depth (0 means unlimited)
     #[clap(long, value_name = "depth", default_value = "0")]
     dependency_depth_limit: u32,
+
+    /// Fragments the new instance's store holds before eviction removes some, defaults to 2000000. The periodic eviction pass treats a value below 1048576 as 1048576. Ignored over a shared store and with --no-tracking
+    #[clap(long, value_name = "fragments")]
+    max_capacity: Option<NonZeroU64>,
+
+    /// Bytes the new instance's store holds before compaction reclaims space, defaults to 10 GiB. Ignored over a shared store and with --no-tracking
+    #[clap(long, value_name = "bytes")]
+    max_size: Option<NonZeroU64>,
 }
 
 #[derive(Args)]
@@ -363,12 +384,13 @@ pub enum RepositoryCommands {
 
     /// Clone a remote repository into the given path
     ///
-    /// A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the
-    /// clone for working offline instead. With it, as with `--cache`, a clone that writes its files
-    /// caches every file metadata block of the cloned revision, which staging and committing write
-    /// to, so both work without the remote, and fails if it cannot. A bare clone writes no files
-    /// and reads them from the remote when a command needs them.
-    Clone(RepositoryCloneArgs),
+    /// Cloning needs the remote, so `--offline` does not keep it from connecting: it prepares the
+    /// new instance for working offline instead. With it, as with `--cache`, cloning into an
+    /// instance that writes its files caches every file metadata block of the cloned revision, which
+    /// staging and committing write to, so both work without the remote, and fails if it cannot. A
+    /// bare or virtual instance writes no files and reads them from the remote when a command needs
+    /// them.
+    Clone(Box<RepositoryCloneArgs>),
 
     /// Delete a repository
     Delete(RepositoryDeleteArgs),
@@ -408,12 +430,51 @@ pub struct RepositoryInstanceArgs {
 
 #[derive(Subcommand)]
 pub enum RepositoryInstanceCommands {
-    /// List all registered instances for this repository
+    /// List the registered instances of this repository that the local store can read
     List,
-    /// Remove stale instance entries: paths that no longer exist, paths that hold no revision, and
-    /// paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains
-    /// in the global data directory, even when it is not mounted.
+    /// Remove stale instance registrations: paths that no longer exist, paths that hold no
+    /// revision, paths that now hold a different instance, and registrations whose data is missing
+    /// from the local store or malformed. An SWFS instance is kept while its `.lore` remains in the
+    /// external root, even when it's not mounted, and so is an instance whose external directory
+    /// can't be checked, as while the external root is unavailable.
     Prune,
+    /// Delete the current instance: unmount (if a virtual instance), deregister from mutable store, and delete associated directories
+    Delete,
+    /// Move the current instance to a new path
+    Move(RepositoryInstanceMoveArgs),
+    /// Clone the current instance to a new path as an instance of its own, on the same revision,
+    /// branch and staged state. The new instance shares the instance's data blocks, and cloning is
+    /// refused where the destination's filesystem or volume cannot share them unless --allow-copy
+    /// is given. A FUSE instance on Linux is cloned into a FUSE instance the service mounts at the
+    /// path, copying only its Lore directory and local changes, which the volume of the external
+    /// root holds. The instance must use a shared store, and the path must not be inside
+    /// another instance. While cloning runs, commands on the instance, and commands from other
+    /// processes on every instance over the store, wait for it where they open the store. An
+    /// instance delete waits too, since it opens the store to deregister the instance before it
+    /// removes any file. An instance move renames an on-disk instance before it opens the store, so
+    /// a move makes cloning fail, or on Windows is refused while cloning lists one of its
+    /// directories.
+    Clone(RepositoryInstanceCloneArgs),
+}
+
+#[derive(Args)]
+pub struct RepositoryInstanceMoveArgs {
+    /// Target path to move the instance to
+    #[arg(value_name = "target-path")]
+    pub target_path: String,
+}
+
+#[derive(Args)]
+pub struct RepositoryInstanceCloneArgs {
+    /// Path to create the new instance at; it must not exist, and must be on the instance's volume
+    /// for the new instance to share its data blocks
+    #[arg(value_name = "target-path")]
+    pub target_path: String,
+    /// Copy the instance's files where the new instance cannot share their data blocks, rather
+    /// than refusing. A copy takes as long as writing every file, and commands wait for it as they
+    /// wait while any instance is cloned
+    #[arg(long)]
+    pub allow_copy: bool,
 }
 
 #[derive(Args)]
@@ -574,19 +635,17 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
                     data.revision_number,
                     data.revision
                 );
-                if data.remote_available != 0 {
-                    if data.remote_authorized == 0 {
-                        println!(
-                            "Remote reachable but could not read remote revision (not authorized or unavailable)"
-                        );
-                    } else if data.remote_branch_exist != 0 {
-                        println!(
-                            "Remote revision {} -> {}",
-                            data.revision_remote_number, data.revision_remote
-                        );
-                    } else {
-                        println!("Remote branch does not exist");
-                    }
+                if data.remote_unauthenticated != 0
+                    || (data.remote_available != 0 && data.remote_authorized == 0)
+                {
+                    util::print_remote_unread(data.remote_unauthenticated != 0, "");
+                } else if data.remote_branch_exist != 0 {
+                    println!(
+                        "Remote revision {} -> {}",
+                        data.revision_remote_number, data.revision_remote
+                    );
+                } else if data.remote_available != 0 {
+                    println!("Remote branch does not exist");
                 }
                 if data.is_local_ahead > 0 {
                     if data.is_remote_ahead > 0 {
@@ -614,8 +673,12 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
             }
             LoreEvent::RepositoryStatusSummary(data) => {
                 summary_holder.adds.store(data.adds, Ordering::Relaxed);
-                summary_holder.deletes.store(data.deletes, Ordering::Relaxed);
-                summary_holder.modifies.store(data.modifies, Ordering::Relaxed);
+                summary_holder
+                    .deletes
+                    .store(data.deletes, Ordering::Relaxed);
+                summary_holder
+                    .modifies
+                    .store(data.modifies, Ordering::Relaxed);
                 summary_holder.moves.store(data.moves, Ordering::Relaxed);
                 summary_holder.copies.store(data.copies, Ordering::Relaxed);
                 summary_holder.seen.store(true, Ordering::Relaxed);
@@ -858,9 +921,7 @@ pub fn handle_repository_info(globals: LoreGlobalArgs, args: &RepositoryInfoArgs
                     anstyle::Reset,
                     data.creator
                 );
-                if let Some(created) = DateTime::from_timestamp_millis(data.created as i64)
-                    .map(|time| time.to_rfc2822())
-                {
+                if let Some(created) = util::rfc2822_display(data.created) {
                     println!(
                         "{}Created:{} {created}",
                         CommonStyles::HEADERS,
@@ -909,30 +970,65 @@ pub fn handle_repository_list(globals: LoreGlobalArgs, args: &RepositoryListArgs
     return run_command(globals, list_args.into(), callback) as u8;
 }
 
+/// The shared store mode a clone or create passes on for `--use-shared-store`, with `vfs` and
+/// whether `--shared-store-path` is given, or the usage error where the path would be ignored. A
+/// path places a shared store, so it needs one: `--use-shared-store`, or a `vfs` that makes a
+/// virtual file system on this platform, which always uses one.
+pub fn shared_store_mode(
+    use_shared_store: bool,
+    vfs: VfsType,
+    shared_store_path: bool,
+) -> Result<LoreSharedStoreMode, clap::Error> {
+    if use_shared_store {
+        return Ok(LoreSharedStoreMode::Enabled);
+    }
+    if shared_store_path && !vfs.to_lore().to_config().vfs_type.is_virtual() {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "'--shared-store-path' needs a shared store: pass '--use-shared-store', or a '--vfs' \
+             that makes a virtual file system, which always uses one\n",
+        ));
+    }
+    Ok(LoreSharedStoreMode::Inherit)
+}
+
+/// Print `error` as clap prints a usage error, and return its exit code.
+fn refused_arguments(error: &clap::Error) -> u8 {
+    let _ = error.print();
+    error.exit_code() as u8
+}
+
 pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreateArgs) -> u8 {
     // Passed through as given. Whether an argument without a host is a repository name or
     // a malformed URL depends on `--offline`, which the core resolves along with the rest
     // of the globals, so there is nothing to decide here.
     let url = args.url.clone().unwrap_or_default();
+    let use_shared_store = match shared_store_mode(
+        args.use_shared_store,
+        args.vfs,
+        args.shared_store_path.is_some(),
+    ) {
+        Ok(mode) => mode,
+        Err(error) => return refused_arguments(&error),
+    };
 
     let args = LoreRepositoryCreateArgs {
         repository_url: url.into(),
         id: LoreString::from(&args.id),
         description: LoreString::from(&args.description),
-        use_shared_store: if args.use_shared_store {
-            LoreSharedStoreMode::Enabled
-        } else {
-            LoreSharedStoreMode::Inherit
-        },
+        use_shared_store,
         shared_store_path: args.shared_store_path.as_ref().into(),
         vfs: args.vfs.to_lore(),
     };
+
+    let dry_run = globals.dry_run();
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::RepositoryCreate(data) => {
                 println!(
-                    "Created repository {} in {} with ID {}",
+                    "{} repository {} in {} with ID {}",
+                    if dry_run { "Would create" } else { "Created" },
                     data.name,
                     data.path.as_str(),
                     data.id,
@@ -1019,6 +1115,14 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
     } else {
         revision = args.revision.as_ref().into();
     }
+    let use_shared_store = match shared_store_mode(
+        args.use_shared_store,
+        args.vfs,
+        args.shared_store_path.is_some(),
+    ) {
+        Ok(mode) => mode,
+        Err(error) => return refused_arguments(&error),
+    };
 
     let clone_args = LoreRepositoryCloneArgs {
         repository_url,
@@ -1030,11 +1134,7 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
         layer: args.layer.as_ref().into(),
         layer_metadata: args.layer_metadata.as_ref().into(),
         prefetch: args.prefetch.as_ref().into(),
-        use_shared_store: if args.use_shared_store {
-            LoreSharedStoreMode::Enabled
-        } else {
-            LoreSharedStoreMode::Inherit
-        },
+        use_shared_store,
         shared_store_path: args.shared_store_path.as_ref().into(),
         no_tracking: args.no_tracking.into(),
         root_files: LoreArray::from_vec(
@@ -1051,6 +1151,8 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
         ),
         dependency_recursive: args.dependency_recursive.into(),
         dependency_depth_limit: args.dependency_depth_limit,
+        max_capacity: args.max_capacity.map_or(0, NonZeroU64::get),
+        max_size: args.max_size.map_or(0, NonZeroU64::get),
     };
 
     let start = std::time::Instant::now();
@@ -1091,7 +1193,7 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
                     anstyle::Reset,
                     data.revision
                 );
-                println!("Clone complete in {:.2}s", start.elapsed().as_secs_f32());
+                println!("Cloned in {:.2}s", start.elapsed().as_secs_f32());
             }
             LoreEvent::RevisionResolve(data) => util::handle_revision_resolve_event(data),
             LoreEvent::Complete(_) => {}
@@ -1406,6 +1508,7 @@ pub fn handle_repository_dump(
 
 pub fn handle_repository_gc(globals: LoreGlobalArgs) -> u8 {
     let args = LoreRepositoryGcArgs {};
+    let dry_run = globals.dry_run();
 
     // Progress events arrive one per evicted bucket / compacted group. Show a single
     // in-place bar with the running total instead of a line per event, then print the
@@ -1416,7 +1519,10 @@ pub fn handle_repository_gc(globals: LoreGlobalArgs) -> u8 {
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Complete(_) => {
+            LoreEvent::Complete(data) if data.status == 0 && dry_run => {
+                println!("Garbage collection skipped in a dry run");
+            }
+            LoreEvent::Complete(data) if data.status == 0 => {
                 println!(
                     "Garbage collection complete: compaction reclaimed {}, eviction removed {} fragments",
                     format_bytes_to_string(reclaimed.load(Ordering::Relaxed)),
@@ -1649,8 +1755,7 @@ pub fn handle_repository_metadata_clear(
     let keys: Vec<LoreString> = args
         .keys
         .as_ref()
-        .map(|k| k.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|k| k.iter().map(|s| LoreString::from(s.as_str())).collect());
 
     let clear_args = LoreRepositoryMetadataClearArgs {
         keys: LoreArray::from_vec(keys),
@@ -1704,6 +1809,15 @@ pub fn handle_repository_commands(cmd: &RepositoryCommands, globals: LoreGlobalA
         RepositoryCommands::Instance(args) => match &args.command {
             RepositoryInstanceCommands::List => handle_repository_instance_list(globals),
             RepositoryInstanceCommands::Prune => handle_repository_instance_prune(globals),
+            RepositoryInstanceCommands::Delete => handle_repository_instance_delete(globals),
+            RepositoryInstanceCommands::Move(move_args) => {
+                handle_repository_instance_move(globals, &move_args.target_path)
+            }
+            RepositoryInstanceCommands::Clone(clone_args) => handle_repository_instance_clone(
+                globals,
+                &clone_args.target_path,
+                clone_args.allow_copy,
+            ),
         },
         RepositoryCommands::Config(args) => match &args.command {
             RepositoryConfigCommands::Get(get_args) => {
@@ -1770,12 +1884,19 @@ fn handle_repository_instance_prune(globals: LoreGlobalArgs) -> u8 {
             }
             LoreEvent::RepositoryInstance(data) => {
                 pruned_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                println!(
-                    "  Pruned {} {}{}",
-                    data.instance_id,
-                    data.path,
-                    instance_stale_suffix(data.stale)
-                );
+                if data.stale == 4 {
+                    println!(
+                        "  Pruned a registration whose data is missing from the local store or \
+                         malformed"
+                    );
+                } else {
+                    println!(
+                        "  Pruned {} {}{}",
+                        data.instance_id,
+                        data.path,
+                        instance_stale_suffix(data.stale)
+                    );
+                }
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -1816,6 +1937,187 @@ fn handle_repository_update_path(globals: LoreGlobalArgs) -> u8 {
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(|event: &LoreEvent| match event {
             LoreEvent::Complete(_) => {}
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    ));
+
+    return run_command(globals, args.into(), callback) as u8;
+}
+
+fn handle_repository_instance_delete(globals: LoreGlobalArgs) -> u8 {
+    let args = lore::repository::LoreRepositoryInstanceDeleteArgs {};
+    let dry_run = globals.dry_run();
+
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::Complete(_) => {}
+            LoreEvent::RepositoryInstanceDeleteBegin(data) => {
+                let mode = if dry_run { " (dry run)" } else { "" };
+                println!(
+                    "Deleting instance {} at {}{}",
+                    data.instance_id, data.path, mode
+                );
+            }
+            LoreEvent::RepositoryInstanceDeleteProgress(data) => {
+                println!("  {:?}", data.phase);
+            }
+            LoreEvent::RepositoryInstanceDeleteComplete(data) => {
+                let outcome = if dry_run { "can be deleted" } else { "deleted" };
+                println!("Instance {} {}", data.instance_id, outcome);
+            }
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    ));
+
+    return run_command(globals, args.into(), callback) as u8;
+}
+
+fn handle_repository_instance_move(globals: LoreGlobalArgs, target_path: &str) -> u8 {
+    let args = lore::repository::LoreRepositoryInstanceMoveArgs {
+        target_path: LoreString::from(target_path),
+    };
+    let dry_run = globals.dry_run();
+
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::Complete(_) => {}
+            LoreEvent::RepositoryInstanceMoveBegin(data) => {
+                let mode = if dry_run { " (dry run)" } else { "" };
+                println!(
+                    "Moving instance {} from {} to {}{}",
+                    data.instance_id, data.source_path, data.target_path, mode
+                );
+            }
+            LoreEvent::RepositoryInstanceMoveComplete(data) => {
+                let outcome = if dry_run { "can be moved" } else { "moved" };
+                println!(
+                    "Instance {} {} to {}",
+                    data.instance_id, outcome, data.target_path
+                );
+            }
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    ));
+
+    return run_command(globals, args.into(), callback) as u8;
+}
+
+/// How often at most the clone prints the counts of its copy, however often its events come.
+const COUNT_LINE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn handle_repository_instance_clone(
+    globals: LoreGlobalArgs,
+    target_path: &str,
+    allow_copy: bool,
+) -> u8 {
+    let args = lore::repository::LoreRepositoryInstanceCloneArgs {
+        target_path: LoreString::from(target_path),
+        allow_copy: u8::from(allow_copy),
+    };
+    let last_count_line = std::sync::Mutex::new(None::<std::time::Instant>);
+    let copy_started = std::sync::atomic::AtomicBool::new(false);
+    let dry_run = globals.dry_run();
+
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::Complete(_) => {}
+            LoreEvent::RepositoryInstanceCloneBegin(data) => {
+                let mode = if dry_run { " (dry run)" } else { "" };
+                println!(
+                    "Cloning instance {} at {} to {}{}",
+                    data.instance_id, data.source_path, data.target_path, mode
+                );
+                match data.method {
+                    LoreRepositoryInstanceCloneMethod::SharesBlocks => {
+                        println!(
+                            "  Shares data blocks on the {} volume at {}",
+                            data.filesystem, data.mount_point
+                        );
+                    }
+                    LoreRepositoryInstanceCloneMethod::CopiesBytes => {
+                        println!(
+                            "  A copy takes {} for {} files on the {} volume at {}, which has {} free: \
+                             {}",
+                            format_bytes_to_string(data.size),
+                            data.file_count,
+                            data.filesystem,
+                            data.mount_point,
+                            format_bytes_to_string(data.available_size),
+                            data.reason
+                        );
+                        if allow_copy {
+                            println!(
+                                "  Holds the store's locks throughout the copy, so commands that \
+                                 open the store, on the instance and from other processes on \
+                                 every instance over the store, wait for it"
+                            );
+                        }
+                    }
+                    LoreRepositoryInstanceCloneMethod::Unsupported => {
+                        println!("  Cannot be cloned: {}", data.reason);
+                    }
+                }
+            }
+            LoreEvent::RepositoryInstanceCloneProgress(data) => match data.phase {
+                LoreRepositoryInstanceClonePhase::WritingRecords => {
+                    println!("  Writing the modified-time records back to disk");
+                }
+                LoreRepositoryInstanceClonePhase::Copying
+                    if data.cloned_directory_count
+                        + data.cloned_entry_count
+                        + data.copied_file_count
+                        == 0 =>
+                {
+                    if !copy_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        println!("  Copying the instance's directory");
+                    }
+                }
+                LoreRepositoryInstanceClonePhase::Copying => {
+                    let mut printed = last_count_line.lock().unwrap_or_else(|err| err.into_inner());
+                    if printed.is_none_or(|at| at.elapsed() >= COUNT_LINE_INTERVAL) {
+                        *printed = Some(std::time::Instant::now());
+                        println!(
+                            "  {} directories cloned whole, {} entries cloned, {} files copied",
+                            data.cloned_directory_count,
+                            data.cloned_entry_count,
+                            data.copied_file_count
+                        );
+                    }
+                }
+                LoreRepositoryInstanceClonePhase::Registering => {
+                    println!("  Registering the new instance");
+                }
+                LoreRepositoryInstanceClonePhase::RemovingLeftover => {
+                    println!("  Removing {}, left by interrupted cloning", data.path);
+                }
+            },
+            LoreEvent::RepositoryInstanceCloneComplete(data) => {
+                if dry_run {
+                    println!("Instance can be cloned to {}", data.target_path);
+                } else {
+                    println!(
+                        "Instance {} cloned to {} ({} directories cloned whole, {} entries \
+                         cloned, {} files copied)",
+                        data.instance_id,
+                        data.target_path,
+                        data.cloned_directory_count,
+                        data.cloned_entry_count,
+                        data.copied_file_count
+                    );
+                }
+            }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
             }

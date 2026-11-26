@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::borrow::Cow;
 use std::sync::Arc;
 
+use anyhow::Context as _;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::DecodingKey;
 use jsonwebtoken::Validation;
 use jsonwebtoken::decode;
@@ -17,6 +21,10 @@ use tracing::warn;
 
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
+use crate::auth::jwk::JWKServiceSettings;
+use crate::auth::jwk::JwkServiceImpl;
+use crate::authnz::repository_authorizer::Action;
+use crate::settings::AuthSettings;
 
 /// From Lore protos, but cannot derive deserialize on external type
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
@@ -41,8 +49,11 @@ impl ResourcePermission {
 pub const DEFAULT_RESOURCE_ID_TEMPLATE: &str = "urc-{id}";
 /// The legacy wildcard, the `resource_wildcard` setting's default.
 pub const DEFAULT_RESOURCE_WILDCARD: &str = "urc-*";
-/// The `identity_claim` setting's default: the token's subject.
-pub const DEFAULT_IDENTITY_CLAIM: &str = "sub";
+/// The claim an issuer puts the user identity in when `sub` is not it.
+pub const IDENTITY_CLAIM: &str = "identity";
+/// The namespaced alias of [`IDENTITY_CLAIM`], for providers that require
+/// namespaced custom claims.
+pub const IDENTITY_CLAIM_NAMESPACED: &str = "https://lore.org/claims/identity";
 
 /// Renders repository ids into resource names and matches grant entries
 /// against them. The defaults reproduce the legacy `UrcAuthApi` shape for
@@ -88,20 +99,27 @@ impl ResourceMatcher {
             .any(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
     }
 
-    /// Whether some entry matching `repository` grants `action`. The
-    /// per-question form of [`merged_permissions`](Self::merged_permissions):
-    /// it visits the entries in place rather than building the merged set.
+    /// Whether some entry matching `repository` grants `action`. Any matching
+    /// entry grants `read`. The per-question form of
+    /// [`merged_permissions`](Self::merged_permissions): it visits the entries
+    /// in place rather than building the merged set.
     pub fn permits(
         &self,
         resources: &[ResourcePermission],
         repository: lore_base::types::RepositoryId,
-        action: &str,
+        action: Action,
     ) -> bool {
         let resource_id = self.resource_for(repository);
         resources
             .iter()
             .filter(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
-            .any(|entry| entry.permission.iter().any(|granted| granted == action))
+            .any(|entry| {
+                action == crate::authnz::repository_authorizer::Action::Read
+                    || entry
+                        .permission
+                        .iter()
+                        .any(|granted| granted == action.as_str())
+            })
     }
 
     /// The actions granted on `repository`, merged across every matching
@@ -148,16 +166,16 @@ pub struct AuthorizationToken {
     /// claims this struct does not name.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
-    /// The caller's identity, resolved from the claim that is configured
-    /// in `[server.auth].identity_claim`. Uses `sub` by default.
+    /// The caller's identity when the token carries it in the `identity`
+    /// claim or its namespaced alias; `None` when `sub` is the identity.
+    /// Resolved by the verifier, never decoded.
     #[serde(skip)]
     pub identity: Option<String>,
 }
 
 impl AuthorizationToken {
-    /// Token's unique identity: either the claim configured in
-    /// `[server.auth].identity_claim`, or the value of `sub`, if a custom
-    /// claim is not configured.
+    /// The identity the caller is recorded and compared as: the `identity`
+    /// claim where the token carries one, `sub` otherwise.
     pub fn identity(&self) -> &str {
         self.identity.as_deref().unwrap_or(&self.user_id)
     }
@@ -205,7 +223,7 @@ pub enum JwtVerifierError {
     KeyNotFound(#[from] JWKServiceError),
     #[error("JWT validation failed")]
     ValidationFailed(#[from] jsonwebtoken::errors::Error),
-    #[error("JWT carries no non-empty string at the identity claim `{claim}`")]
+    #[error("JWT carries an empty or non-string value at the identity claim `{claim}`")]
     IdentityClaimMissing { claim: String },
     #[error("JWT header `typ` is absent or not an accepted type")]
     TypNotAccepted,
@@ -213,17 +231,53 @@ pub enum JwtVerifierError {
 
 #[derive(Clone)]
 pub struct JwtVerifier {
+    /// The login issuer's keys, which verify every token that doesn't name the exchange
+    /// issuer as `iss`.
     pub jwk_service: Arc<dyn JWKService>,
-    /// Every `iss` value verification accepts. Two entries during an issuer's
+    /// The `iss` values the `jwk_service` keys may sign for. Two entries during an issuer's
     /// cutover, one otherwise (see [`AuthSettings::jwt_issuer`](crate::settings::AuthSettings)).
     pub jwt_issuer: Option<Vec<String>>,
     pub jwt_audience: Option<Vec<String>>,
     /// Accepted `typ` header values.
     /// `None` skips the check (see [`AuthSettings::jwt_typ`](crate::settings::AuthSettings)).
     pub jwt_typ: Option<Vec<String>>,
-    /// Dotted path of the claim recorded and compared as the caller's
-    /// identity (see [`AuthSettings::identity_claim`](crate::settings::AuthSettings)).
-    pub identity_claim: String,
+    /// A separate token exchange issuer, whose tokens only its own keys verify.
+    pub exchange_issuer: Option<ExchangeIssuer>,
+}
+
+/// A token exchange issuer apart from the login issuer, which signs the partition-scoped
+/// tokens with keys of its own. A token naming `issuer` as `iss` is verified against
+/// `jwk_service` alone, and every other token against the login issuer's keys alone, so
+/// neither signer can issue tokens in the other's name.
+#[derive(Clone)]
+pub struct ExchangeIssuer {
+    pub issuer: String,
+    pub jwk_service: Arc<dyn JWKService>,
+}
+
+impl ExchangeIssuer {
+    /// The keys `issuer`'s discovery document names, fetched. `[server.auth.jwk].endpoint`
+    /// names the login issuer's keys and never these: serving the login issuer's keys here
+    /// would let it sign tokens in the exchange issuer's name.
+    pub async fn discover(issuer: &str) -> Result<Self, JWKServiceError> {
+        let issuer = issuer.to_string();
+        let jwk_service = JwkServiceImpl::with_issuers(
+            JWKServiceSettings::default(),
+            Some(std::slice::from_ref(&issuer)),
+        )?;
+        jwk_service.fetch_new_keys(None).await?;
+        Ok(ExchangeIssuer {
+            issuer,
+            jwk_service: Arc::new(jwk_service),
+        })
+    }
+}
+
+/// The keys a token is verified against and the `iss` values they may sign for.
+#[derive(Clone, Copy)]
+struct Signer<'a> {
+    jwk_service: &'a dyn JWKService,
+    issuers: Option<&'a [String]>,
 }
 
 /// The comparison form of a `typ` header value. RFC 7515 §4.1.9 makes the
@@ -251,6 +305,32 @@ fn key_may_be_stale(error: &JwtVerifierError) -> bool {
 }
 
 impl JwtVerifier {
+    /// The verifier `auth` describes, with the login issuer's keys and those of a separate
+    /// token exchange issuer fetched. Fails when either key set can't be resolved or fetched.
+    pub async fn from_settings(auth: &AuthSettings) -> anyhow::Result<Self> {
+        let jwk_service = JwkServiceImpl::with_issuers(
+            auth.jwk.clone().unwrap_or_default(),
+            Some(&auth.jwt_issuer),
+        )?;
+        jwk_service
+            .fetch_new_keys(None)
+            .await
+            .context("fetching the keys of [server.auth] jwt_issuer")?;
+        let exchange_issuer = match auth.separate_exchange_issuer() {
+            Some(issuer) => Some(ExchangeIssuer::discover(issuer).await.with_context(|| {
+                format!("fetching the keys of [server.auth.oidc] token_exchange_issuer {issuer}")
+            })?),
+            None => None,
+        };
+        Ok(JwtVerifier {
+            jwk_service: Arc::new(jwk_service),
+            jwt_issuer: Some(auth.jwt_issuer.clone()),
+            jwt_audience: Some(auth.jwt_audience.clone()),
+            jwt_typ: auth.jwt_typ.clone(),
+            exchange_issuer,
+        })
+    }
+
     /// Verify a token, re-fetching the signing key once if the cached one looks stale.
     ///
     /// The retry is what makes a key rotated under an unchanged key id recoverable. Without
@@ -260,21 +340,22 @@ impl JwtVerifier {
         let header = decode_header(token).map_err(JwtVerifierError::ValidationFailed)?;
         self.check_typ(&header)?;
         let kid = header.kid.ok_or(JwtVerifierError::HeaderKIDMissing)?;
+        let signer = self.signer_for(token);
 
-        let (key, alg) = self
+        let (key, alg) = signer
             .jwk_service
             .get_key(&kid)
             .await
             .map_err(JwtVerifierError::KeyNotFound)?;
 
-        let stale_failure = match self.verify_token_internal(token, &key, &alg) {
+        let stale_failure = match self.verify_token_internal(signer, token, &key, &alg) {
             Err(failure) if key_may_be_stale(&failure) => failure,
             result => return result,
         };
 
         // `None` covers both unchanged material and a declined fetch, so the original failure
         // stands rather than being re-derived from the same key.
-        let Some((key, alg)) = self
+        let Some((key, alg)) = signer
             .jwk_service
             .refresh_key(&kid)
             .await
@@ -283,7 +364,23 @@ impl JwtVerifier {
             return Err(stale_failure);
         };
 
-        self.verify_token_internal(token, &key, &alg)
+        self.verify_token_internal(signer, token, &key, &alg)
+    }
+
+    /// The signer whose keys verify `token`: the exchange issuer's when the token names it as
+    /// `iss`, the login issuer's otherwise. The unverified `iss` chooses the only keys that may
+    /// verify the token, so a token signed by the other party fails its signature check.
+    fn signer_for(&self, token: &str) -> Signer<'_> {
+        match self.exchange_issuer.as_ref() {
+            Some(exchange) if names_issuer(token, &exchange.issuer) => Signer {
+                jwk_service: exchange.jwk_service.as_ref(),
+                issuers: Some(std::slice::from_ref(&exchange.issuer)),
+            },
+            _ => Signer {
+                jwk_service: self.jwk_service.as_ref(),
+                issuers: self.jwt_issuer.as_deref(),
+            },
+        }
     }
 
     /// Verify a token using only the JWK cache, without any `.await`. `Ok(Some(_))` on
@@ -301,12 +398,13 @@ impl JwtVerifier {
         let header = decode_header(token).map_err(JwtVerifierError::ValidationFailed)?;
         self.check_typ(&header)?;
         let kid = header.kid.ok_or(JwtVerifierError::HeaderKIDMissing)?;
+        let signer = self.signer_for(token);
 
-        let Some((key, alg)) = self.jwk_service.get_cached_key(&kid) else {
+        let Some((key, alg)) = signer.jwk_service.get_cached_key(&kid) else {
             return Ok(None);
         };
 
-        match self.verify_token_internal(token, &key, &alg) {
+        match self.verify_token_internal(signer, token, &key, &alg) {
             Err(failure) if key_may_be_stale(&failure) => Ok(None),
             result => result.map(Some),
         }
@@ -314,12 +412,13 @@ impl JwtVerifier {
 
     fn verify_token_internal(
         &self,
+        signer: Signer<'_>,
         token: &str,
         key: &DecodingKey,
         alg: &jsonwebtoken::Algorithm,
     ) -> Result<AuthorizationToken, JwtVerifierError> {
         let mut validation = Validation::new(*alg);
-        if let Some(iss) = self.jwt_issuer.as_ref() {
+        if let Some(iss) = signer.issuers {
             validation.set_issuer(iss);
         }
         if let Some(aud) = self.jwt_audience.as_ref() {
@@ -345,7 +444,7 @@ impl JwtVerifier {
 
         debug!("Decoded user info: {:?}", token_data.claims);
         let mut claims = token_data.claims;
-        claims.identity = self.resolve_identity(&claims)?;
+        claims.identity = resolve_identity(&claims)?;
         Ok(claims)
     }
 
@@ -365,26 +464,121 @@ impl JwtVerifier {
         warn!("Rejecting token: the `typ` header is absent or not an accepted type");
         Err(JwtVerifierError::TypNotAccepted)
     }
+}
 
-    /// `None` when the configured claim is `sub`, which `user_id` holds.
-    fn resolve_identity(
-        &self,
-        claims: &AuthorizationToken,
-    ) -> Result<Option<String>, JwtVerifierError> {
-        if self.identity_claim == DEFAULT_IDENTITY_CLAIM {
-            return Ok(None);
+/// How every transport treats a bearer token, chosen once from `[server.auth]` and
+/// `server.trust_unsigned_identity`.
+#[derive(Clone, Default)]
+pub enum TokenVerification {
+    /// No `[server.auth]`: a bearer token is not required, and one that is present is not
+    /// read.
+    #[default]
+    Ignore,
+    /// `server.trust_unsigned_identity`: a bearer token is not required. One that is present
+    /// is decoded by [`decode_unsigned_identity`], and only its claims are kept, so the
+    /// caller is named but holds no verified token.
+    TrustUnsigned,
+    Verify(JwtVerifier),
+}
+
+impl TokenVerification {
+    pub fn new(
+        verifier: Option<JwtVerifier>,
+        trust_unsigned_identity: bool,
+    ) -> anyhow::Result<Self> {
+        match (verifier, trust_unsigned_identity) {
+            (Some(_), true) => anyhow::bail!(
+                "trust_unsigned_identity applies only to a server without [server.auth]"
+            ),
+            (Some(verifier), false) => Ok(Self::Verify(verifier)),
+            (None, true) => Ok(Self::TrustUnsigned),
+            (None, false) => Ok(Self::Ignore),
         }
-        match claims.claim_at(&self.identity_claim) {
-            Some(serde_json::Value::String(identity)) if !identity.is_empty() => Ok(Some(identity)),
-            _ => {
-                warn!(
-                    claim = self.identity_claim,
-                    "Rejecting token: the identity claim is absent or not a string"
-                );
-                Err(JwtVerifierError::IdentityClaimMissing {
-                    claim: self.identity_claim.clone(),
-                })
-            }
+    }
+
+    pub fn verifier(&self) -> Option<&JwtVerifier> {
+        match self {
+            Self::Verify(verifier) => Some(verifier),
+            Self::Ignore | Self::TrustUnsigned => None,
         }
+    }
+
+    /// The startup log's description of the mode.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Ignore => "disabled",
+            Self::TrustUnsigned => "disabled, trusting unsigned identity",
+            Self::Verify(_) => "enabled",
+        }
+    }
+}
+
+/// Decode `token` without checking its signature, issuer, audience or expiry,
+/// for `server.trust_unsigned_identity`. The claims still have to parse as an
+/// [`AuthorizationToken`] and name an identity.
+pub fn decode_unsigned_identity(token: &str) -> Result<AuthorizationToken, JwtVerifierError> {
+    let header = decode_header(token)?;
+    let mut validation = Validation::new(header.alg);
+    validation.insecure_disable_signature_validation();
+    validation.validate_aud = false;
+    validation.validate_exp = false;
+    validation.required_spec_claims.clear();
+    let mut claims =
+        decode::<AuthorizationToken>(token, &DecodingKey::from_secret(&[]), &validation)?.claims;
+    claims.identity = resolve_identity(&claims)?;
+    Ok(claims)
+}
+
+/// Whether the `iss` claim of `token` is `issuer`, read without checking anything about the
+/// token. A token whose claims don't decode names no issuer.
+///
+/// Decodes the claims once and reads `iss`, borrowing where it can, rather than going through
+/// `jsonwebtoken::decode`, which parses the header and the claims again: this runs on every
+/// request of a deployment with a separate token exchange issuer.
+fn names_issuer(token: &str, issuer: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Claims<'a> {
+        #[serde(borrow)]
+        iss: Option<Cow<'a, str>>,
+    }
+    let Some(encoded) = token.split('.').nth(1) else {
+        return false;
+    };
+    let Ok(claims) = URL_SAFE_NO_PAD.decode(encoded) else {
+        return false;
+    };
+    serde_json::from_slice::<Claims<'_>>(&claims)
+        .ok()
+        .and_then(|claims| claims.iss)
+        .is_some_and(|iss| iss == issuer)
+}
+
+/// The identity `claims` name: the first of `identity`, its namespaced alias
+/// and `sub` the token carries, and only that one. `None` stands for `sub`,
+/// which `user_id` holds. An empty or non-string value at the claim that
+/// decides is an error; the rule does not fall through to the next claim.
+fn resolve_identity(claims: &AuthorizationToken) -> Result<Option<String>, JwtVerifierError> {
+    let refused = |claim: &str| {
+        warn!(
+            claim,
+            "Rejecting token: the identity claim is empty or not a string"
+        );
+        Err(JwtVerifierError::IdentityClaimMissing {
+            claim: claim.to_string(),
+        })
+    };
+    let Some((claim, value)) = [IDENTITY_CLAIM, IDENTITY_CLAIM_NAMESPACED]
+        .into_iter()
+        .find_map(|claim| claims.extra.get(claim).map(|value| (claim, value)))
+    else {
+        return if claims.user_id.is_empty() {
+            refused("sub")
+        } else {
+            Ok(None)
+        };
+    };
+    match value {
+        serde_json::Value::String(identity) if !identity.is_empty() => Ok(Some(identity.clone())),
+        _ => refused(claim),
     }
 }

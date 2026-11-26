@@ -26,13 +26,8 @@ use std::sync::atomic::Ordering;
 use dashmap::DashMap;
 use lore_base::error::NoRemote;
 use lore_base::types::Partition;
-use lore_revision::filter::Filter;
-use lore_revision::instance::InstanceId;
 use lore_revision::metadata::Metadata;
-use lore_revision::repository::InMemoryContext;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::repository::RepositoryContextCreationArgs;
-use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 use lore_transport::ProtocolError;
 use tokio::sync::Notify;
@@ -44,7 +39,17 @@ use crate::storage::store::StoreInternal;
 /// Treat this as an opaque value; never cast it directly to or from raw
 /// pointers.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 pub struct LoreRevisionTree {
     /// Registry key; `0` is the reserved invalid/unregistered sentinel (zero-init = null handle)
     pub handle_id: u64,
@@ -60,19 +65,13 @@ lore_base::carries_no_text!(LoreRevisionTree);
 ///
 /// Holds an `Arc<StoreInternal>` clone of the parent storage handle so
 /// `lore_storage_close` on the parent does not tear down the underlying
-/// store while a revision tree handle still references it. The
-/// `parent_storage_handle_id` is the registry key of the parent storage
-/// handle at load time and is the matching key used by the IPC dispatcher
-/// to cascade closes on connection teardown.
+/// store while a revision tree handle still references it.
 #[lore_macro::test_pub]
 pub(crate) struct RevisionTreeInternal {
-    /// Shared store reference cloned from the parent storage handle.
+    /// Shared store reference cloned from the parent storage handle: the handle's own state,
+    /// not only its backend, so the connection-teardown cascade matches the tree on the
+    /// connection that opened that handle, whether the handle is still open or not.
     pub(crate) store_internal: Arc<StoreInternal>,
-    /// Registry key of the parent storage handle this revision tree was loaded
-    /// against, and what the connection-teardown cascade matches on. The id
-    /// rather than the store, so two handles sharing one cached backend stay
-    /// distinct.
-    pub(crate) parent_storage_handle_id: u64,
     /// Repository identity (a `Partition`) the loaded revision targets.
     pub(crate) repository: Partition,
     /// Synthesized repository context covering the underlying immutable,
@@ -81,17 +80,18 @@ pub(crate) struct RevisionTreeInternal {
     pub(crate) repository_context: Arc<RepositoryContext>,
     /// Loaded revision's in-memory `State`.
     ///
-    /// Private, and reachable only through [`Self::access_shared`] or
-    /// [`Self::access_exclusive`], so a call cannot touch the tree without saying
-    /// whether it can share the handle. `State` is internally
+    /// Private, and reachable only through [`Self::access_shared`],
+    /// [`Self::claim_shared`] or [`Self::access_exclusive`], so a call cannot touch the
+    /// tree without saying whether it can share the handle. `State` is internally
     /// mutable, so an editing verb mutates it while holding a *shared* guard; `commit`
     /// takes the exclusive one. That is what makes a commit atomic against the handle —
     /// no edit lands inside the freeze, and nothing is reading the old state when a
     /// failed commit puts the restored one back through the same guard.
     ///
     /// Async-aware because commit holds it across the freeze's awaits, where a
-    /// `parking_lot` guard is neither `Send` nor safe to hold.
-    state: tokio::sync::RwLock<Arc<State>>,
+    /// `parking_lot` guard is neither `Send` nor safe to hold. Behind an `Arc` for the
+    /// owned guards of [`SharedClaim`].
+    state: Arc<tokio::sync::RwLock<Arc<State>>>,
     /// Accumulator for `metadata_set` edits. Commit clones the buffer,
     /// serializes the clone, and on success replaces this with a fresh
     /// default.
@@ -108,9 +108,10 @@ pub(crate) struct RevisionTreeInternal {
 
 /// A held claim on the handle's tree, shared with other calls.
 ///
-/// Every verb but `commit` works under one of these. `State` is internally mutable, so
-/// an editing verb mutates the tree through a shared claim; what the claim excludes is
-/// a commit, not another edit.
+/// The verbs that work on the tree work under one of these, but for `commit`, which takes an
+/// [`ExclusiveAccess`], and `add` and `modify`, which hand their tasks shares of a
+/// [`SharedClaim`]. `State` is internally mutable, so an editing verb mutates the tree through a
+/// shared claim; what the claim excludes is a commit, not another edit.
 ///
 /// Keep it alive for as long as the state is in use: dropping it and holding on to the
 /// `Arc<State>` leaves a verb mutating a tree a commit believes it has to itself.
@@ -121,6 +122,24 @@ impl SharedAccess<'_> {
     /// The tree this call may work on.
     pub(crate) fn state(&self) -> Arc<State> {
         (*self.0).clone()
+    }
+}
+
+/// A held claim on the handle's tree, shared with other calls as [`SharedAccess`] is, whose
+/// shares a call hands to the tasks it spawns: the claim lasts until the last share drops.
+///
+/// A dropped call's spawned tasks are aborted, and tokio drops an aborted task only when it next
+/// polls it, so a task holding the `Arc<State>` alone would go on changing the tree, and drop
+/// what it holds, after the call released its claim, inside a commit. Each such task binds its
+/// share before anything else, so it drops the share last.
+#[lore_macro::test_pub]
+#[derive(Clone)]
+pub(crate) struct SharedClaim(Arc<tokio::sync::OwnedRwLockReadGuard<Arc<State>>>);
+
+impl SharedClaim {
+    /// The tree this call and its tasks may work on.
+    pub(crate) fn state(&self) -> &Arc<State> {
+        &self.0
     }
 }
 
@@ -154,21 +173,19 @@ impl ExclusiveAccess<'_> {
 impl RevisionTreeInternal {
     /// Build a handle's internals around a freshly loaded tree. A constructor rather
     /// than a struct literal because [`Self::state`] is private, which is what keeps
-    /// every reader on the two access methods.
+    /// every reader on the access methods.
     #[lore_macro::test_pub]
     pub(crate) fn new(
         store_internal: Arc<StoreInternal>,
-        parent_storage_handle_id: u64,
         repository: Partition,
         repository_context: Arc<RepositoryContext>,
         state: Arc<State>,
     ) -> Self {
         Self {
             store_internal,
-            parent_storage_handle_id,
             repository,
             repository_context,
-            state: tokio::sync::RwLock::new(state),
+            state: Arc::new(tokio::sync::RwLock::new(state)),
             pending_metadata: parking_lot::RwLock::new(Metadata::default()),
             in_flight: AtomicU64::new(0),
             invalid: AtomicBool::new(false),
@@ -180,6 +197,13 @@ impl RevisionTreeInternal {
     #[lore_macro::test_pub]
     pub(crate) async fn access_shared(&self) -> SharedAccess<'_> {
         SharedAccess(self.state.read().await)
+    }
+
+    /// Claim the handle's tree for a call that can share it and spawns tasks that work on
+    /// it — see [`SharedClaim`].
+    #[lore_macro::test_pub]
+    pub(crate) async fn claim_shared(&self) -> SharedClaim {
+        SharedClaim(Arc::new(self.state.clone().read_owned().await))
     }
 
     /// Claim the handle's tree for a call that cannot — see [`ExclusiveAccess`].
@@ -206,13 +230,19 @@ impl RevisionTreeInternal {
     /// race in between increment-and-check self-abort because they see
     /// `invalid=true` before proceeding.
     ///
+    /// Each side stores and then reads what the other stores, so the store of `invalid` and the
+    /// first read of `in_flight` are `SeqCst`, as are an op's increment and its read of `invalid`
+    /// ([`RevisionTreeGuard::join`]): with any weaker order both can read the value from before
+    /// the other's store, and the close returns while the op runs.
+    ///
     /// The waiter is registered before the re-check, because `notified()` alone
     /// stays unregistered until first poll and would miss a decrement firing
     /// between the check and the await.
+    #[lore_macro::test_pub]
     pub(crate) async fn mark_invalid_and_await(&self) {
-        self.invalid.store(true, Ordering::Release);
+        self.invalid.store(true, Ordering::SeqCst);
         loop {
-            if self.in_flight.load(Ordering::Acquire) == 0 {
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
                 return;
             }
             let mut notified = std::pin::pin!(self.drained.notified());
@@ -280,16 +310,15 @@ pub(crate) fn drain_all() -> Vec<(u64, Arc<RevisionTreeInternal>)> {
     drained
 }
 
-/// Drain every registry entry loaded against the storage handle `storage_handle_id`, for
-/// the connection-teardown cascade: a tree outlives its parent by design, so a connection
-/// that drops without closing it would hold the store for the life of the process.
+/// Drain every registry entry loaded against a storage handle the IPC connection
+/// `connection_id` opened, whether that storage handle is still open or not, for the
+/// connection-teardown cascade: a tree outlives its parent by design, so a connection that
+/// drops without closing it would hold the store for the life of the process.
 #[lore_macro::test_pub]
-pub(crate) fn drain_for_storage_handle(
-    storage_handle_id: u64,
-) -> Vec<(u64, Arc<RevisionTreeInternal>)> {
+pub(crate) fn drain_for_connection(connection_id: u64) -> Vec<(u64, Arc<RevisionTreeInternal>)> {
     let mut drained = Vec::new();
     REGISTRY.retain(|&id, internal| {
-        if internal.parent_storage_handle_id == storage_handle_id {
+        if internal.store_internal.connection_id == Some(connection_id) {
             drained.push((id, internal.clone()));
             false
         } else {
@@ -316,7 +345,8 @@ pub(crate) fn unregister(handle: LoreRevisionTree) -> Option<Arc<RevisionTreeInt
 ///
 /// The synthesized context has no working-tree path — every op against the
 /// memory-based revision tree API operates only on the underlying stores.
-/// When `store` has a remote endpoint, the helper resolves the
+/// It carries the in-memory write token, since the handle exists to build
+/// revisions. When `store` has a remote endpoint, the helper resolves the
 /// per-partition `Arc<Connection>` so the context lands in the `Connected`
 /// remote state on success; a connection failure propagates as `Failed`.
 /// Absent a remote endpoint the context resolves directly to the `Offline`
@@ -327,32 +357,15 @@ pub(crate) async fn synth_repository_context(
     repository: Partition,
 ) -> Arc<RepositoryContext> {
     let remote_result = match store.remote.as_ref() {
-        Some(endpoint) => endpoint.session_connection(repository).await,
+        Some(endpoint) => endpoint.connection(repository).await,
         None => Err(ProtocolError::from(NoRemote)),
     };
     Arc::new(
-        RepositoryContext::new(RepositoryContextCreationArgs {
-            paths: None,
-            immutable_store: store.immutable.clone(),
-            mutable_store: store.mutable.clone(),
-            id: repository,
-            instance_id: InstanceId::default(),
-            remote: remote_result,
-            filter: Arc::new(Filter::default()),
-            filesystem_provider: None,
-        })
-        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
+        store
+            .repository_context(repository, remote_result)
+            .with_write_token(StoreInternal::in_memory_write_token()),
     )
 }
-
-/// Gates [`RepositoryWriteToken::in_memory`] for this crate.
-///
-/// The handle exists to build revisions, so its context is write-capable from
-/// load. Being path-less it has no per-path write mutex to take; what serializes
-/// publication is the branch tip compare-and-swap in the commit.
-pub(crate) struct InMemoryMarker;
-impl InMemoryContext for InMemoryMarker {}
-pub(crate) const IN_MEMORY_MARKER: InMemoryMarker = InMemoryMarker;
 
 /// RAII guard protecting an in-flight op. Obtained via
 /// [`RevisionTreeGuard::enter`]; dropping it pairs the in-flight
@@ -369,9 +382,15 @@ impl RevisionTreeGuard {
     /// when the handle is unknown or the tree has been marked invalid.
     #[lore_macro::test_pub]
     pub(crate) fn enter(handle: LoreRevisionTree) -> Option<Self> {
-        let internal = lookup(handle)?;
-        internal.in_flight.fetch_add(1, Ordering::AcqRel);
-        if internal.invalid.load(Ordering::Acquire) {
+        Self::join(lookup(handle)?)
+    }
+
+    /// Enter an op on `internal`, a tree an op already entered holds, as a task that op spawns
+    /// does to outlive it: no second registry lookup. Returns `None` when the tree has been
+    /// marked invalid since.
+    pub(crate) fn join(internal: Arc<RevisionTreeInternal>) -> Option<Self> {
+        internal.in_flight.fetch_add(1, Ordering::SeqCst);
+        if internal.invalid.load(Ordering::SeqCst) {
             Self::release(&internal);
             return None;
         }

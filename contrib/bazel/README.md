@@ -6,8 +6,8 @@ the actions against their own tier of that store, and everything cacheable is st
 resolved from a loreserver that any number of machines can share.
 
 A standalone workspace, outside the Lore workspace and built from within `contrib/bazel`: it
-reaches the Lore crates by path, restates the workspace's `quinn-proto` patch, and pins its
-dependencies in a committed `Cargo.lock`.
+reaches the Lore crates by path, restates the workspace's `quinn-proto` and `glob-match` patches,
+and pins its dependencies in a committed `Cargo.lock`.
 
 [reapi]: https://github.com/bazelbuild/remote-apis
 
@@ -213,8 +213,8 @@ lore-rbe              lifecycle: build, seed, up, workers, down, wipe-*, status,
 ## Prerequisites
 
 * Linux. The worker and `lore-rbe-index` use Unix file APIs and Linux extended attributes.
-* Rust with edition 2024, and nightly rustfmt for formatting.
-* This repository: the workspace depends on the Lore crates and `vendor/quinn-proto` by path.
+* The current stable Rust, as for Lore itself, and nightly rustfmt for formatting.
+* This repository: the workspace depends on the Lore crates, `vendor/quinn-proto` and `vendor/glob-match` by path.
 * For `seed`, `source-repo` and `deps-repos`: bazel, and the `lore` CLI.
 
 ## Build
@@ -229,8 +229,9 @@ here, and `loreserver` in the Lore root. Both run from within their workspace, b
 reads `.cargo/config.toml` from the working directory upwards, not from `--manifest-path`, and
 the root one sets the rustflags `loreserver` needs (`--cfg tokio_unstable`, `--cfg uuid_unstable`).
 
-`[patch.crates-io] quinn-proto` is restated in this workspace's manifest: `lore-transport` does
-not compile against the published quinn-proto, and a patch applies only from the workspace root.
+`[patch.crates-io]` is restated in this workspace's manifest, because a patch applies only from the
+workspace root: `lore-transport` does not compile against the published quinn-proto, and
+`lore-revision`'s view and ignore filters need the vendored glob-match's `**` matching.
 
 Tests, formatting and lints run from here too:
 
@@ -390,9 +391,9 @@ absence: a non-zero value means warm builds are running cold.
 * **`local_cache = 1` on writes keeps the payload local**, not only fragment metadata: the write
   path retains it only when `!stored_durable || cache_local`, and a successful upstream write
   makes it durable.
-* **The server flushes Lore on shutdown.** Lore's close-time flush is otherwise fire-and-forget,
-  and a restart cannot reuse the on-disk repository, so a warm cache comes back cold. The server
-  handles SIGTERM as well as SIGINT, and `lore-rbe down` waits for each process to exit.
+* **The server flushes Lore on shutdown.** Without it a restart cannot reuse the on-disk
+  repository, so a warm cache comes back cold. The server handles SIGTERM as well as SIGINT, and
+  `lore-rbe down` waits for each process to exit.
 * **`lore-rbe` writes its own loreserver configuration**, overriding only ports and store paths.
   `lore-server/config/local.toml` references test certificates relative to the repository root.
   With no `[server.quic.certificate]` the QUIC endpoint generates an ephemeral self-signed

@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: MIT
 """Declarative stub of the UCS auth service, for authenticated-path smoke tests.
 
-Serves the `epic_urc.UrcAuthApi` and `ucs.auth.RebacApi` gRPC services
-(lore-proto/proto/auth_api.proto, rebac_api.proto) plus an HTTP endpoint with
+Serves the `epic_urc.UrcAuthApi`, `ucs.auth.RebacApi`,
+`lore.user.v1.UserService` and `lore.user.v1.RepositoryRegistryService` gRPC
+services (lore-proto/proto/auth_api.proto, rebac_api.proto,
+lore/user/v1/user.proto) plus an HTTP endpoint with
 the JWKS document the lore server validates tokens against. The stub holds
 **no behavior of its own**: each test registers the request/response pairs its
 scenario needs with `on(...)`, and anything unregistered is denied. A test
@@ -63,6 +65,8 @@ logger = logging.getLogger(__name__)
 
 _AUTH_SERVICE = "epic_urc.UrcAuthApi"
 _REBAC_SERVICE = "ucs.auth.RebacApi"
+_USER_SERVICE = "lore.user.v1.UserService"
+_REGISTRY_SERVICE = "lore.user.v1.RepositoryRegistryService"
 
 
 def _identity_bytes(raw: bytes) -> bytes:
@@ -180,8 +184,33 @@ def user_info_response(*users: MockUser) -> bytes:
     return response
 
 
+def user_list_response(*users: MockUser) -> bytes:
+    """A `lore.user.v1` `UserGet` or `UserFind` answer: `repeated User`. No
+    users is an empty list, which `UserFind` answers for an unknown name."""
+    return b"".join(
+        encode_bytes_field(
+            1,
+            encode_string_field(1, user.user_id)
+            + encode_string_field(2, user.display_name)
+            + encode_string_field(3, user.preferred_username),
+        )
+        for user in users
+    )
+
+
+def repository_list_response(*repository_ids: str) -> list[bytes]:
+    """A `lore.user.v1` `RepositoryList` answer: one message per repository id
+    (hex), each granting `read`."""
+    return [
+        encode_bytes_field(1, bytes.fromhex(repository_id))
+        + encode_string_field(2, "read")
+        for repository_id in repository_ids
+    ]
+
+
 def empty_response() -> bytes:
-    """An empty message: `CreateResource`/`DeleteResource` responses, or a
+    """An empty message: `CreateResource`/`DeleteResource` and
+    `RepositoryRegister`/`RepositoryUnregister` responses, or a
     `GetAuthSession`/`RefreshAuthSession` answer carrying no token yet."""
     return b""
 
@@ -193,6 +222,7 @@ def empty_response() -> bytes:
 _STRING = "string"
 _STRINGS = "repeated string"
 _TARGET_USER = "target_user"
+_BYTES = "bytes"
 
 # method -> {field name: (field number, kind)}
 _REQUEST_FIELDS: dict[str, dict[str, tuple[int, str]]] = {
@@ -220,9 +250,28 @@ _REQUEST_FIELDS: dict[str, dict[str, tuple[int, str]]] = {
     "GetProviderUserId": {"user_id": (1, _STRING)},
     "CreateResource": {"resource_id": (1, _STRING), "resource_name": (2, _STRING)},
     "DeleteResource": {"resource_id": (1, _STRING)},
+    "UserGet": {"partition": (1, _BYTES), "id": (2, _STRINGS)},
+    # The `query` oneof, the arm not named decoding to the empty string.
+    "UserFind": {
+        "partition": (1, _BYTES),
+        "username": (2, _STRING),
+        "display_name": (3, _STRING),
+    },
+    "RepositoryList": {},
+    "RepositoryRegister": {"id": (1, _BYTES), "name": (2, _STRING)},
+    "RepositoryUnregister": {"id": (1, _BYTES)},
 }
 
 _REBAC_METHODS = ("CreateResource", "DeleteResource")
+
+# The deprecated `UserService` partition RPCs are not served, so a call to one
+# answers UNIMPLEMENTED.
+_USER_METHODS = ("UserGet", "UserFind")
+
+_REGISTRY_METHODS = ("RepositoryList", "RepositoryRegister", "RepositoryUnregister")
+
+# Server-streaming RPCs: a rule's response is the list of messages to stream.
+_STREAM_METHODS = ("RepositoryList",)
 
 # The status an unmatched request is refused with. Chosen to mirror how the
 # real service refuses the corresponding case: a token endpoint answers "who
@@ -247,6 +296,8 @@ def _decode_request(method: str, request: bytes) -> dict:
             decoded[name] = field_string(fields, number)
         elif kind == _STRINGS:
             decoded[name] = tuple(field_strings(fields, number))
+        elif kind == _BYTES:
+            decoded[name] = field_bytes(fields, number)
         elif kind == _TARGET_USER:
             target_user = field_bytes(fields, number)
             decoded[name] = (
@@ -261,10 +312,10 @@ class _Rule:
     def __init__(self, method: str, matchers: dict):
         self.method = method
         self.matchers = matchers
-        self.response: bytes | None = None
+        self.response: bytes | list[bytes] | None = None
         self.denial: tuple[grpc.StatusCode, str] | None = None
 
-    def respond(self, payload: bytes) -> "_Rule":
+    def respond(self, payload: bytes | list[bytes]) -> "_Rule":
         self.response = payload
         return self
 
@@ -404,6 +455,12 @@ class MockAuthServer:
             self._rules.insert(0, rule)
         return rule
 
+    def remove(self, rule: _Rule) -> None:
+        """Drop `rule`, which `on` returned, so the rules registered before it
+        answer its requests again."""
+        with self._lock:
+            self._rules.remove(rule)
+
     def reset(self) -> None:
         """Drop every rule and record. Health checks answer unconditionally,
         registered here so even they are visible as a rule."""
@@ -435,13 +492,22 @@ class MockAuthServer:
         auth_methods = {
             name: self._unary(name)
             for name in _REQUEST_FIELDS
-            if name not in _REBAC_METHODS
+            if name not in _REBAC_METHODS + _USER_METHODS + _REGISTRY_METHODS
+        }
+        user_methods = {name: self._unary(name) for name in _USER_METHODS}
+        registry_methods = {
+            name: self._stream(name) if name in _STREAM_METHODS else self._unary(name)
+            for name in _REGISTRY_METHODS
         }
         rebac_methods = {name: self._unary(name) for name in _REBAC_METHODS}
         self._grpc_server.add_generic_rpc_handlers(
             (
                 grpc.method_handlers_generic_handler(_AUTH_SERVICE, auth_methods),
                 grpc.method_handlers_generic_handler(_REBAC_SERVICE, rebac_methods),
+                grpc.method_handlers_generic_handler(_USER_SERVICE, user_methods),
+                grpc.method_handlers_generic_handler(
+                    _REGISTRY_SERVICE, registry_methods
+                ),
             )
         )
         self.grpc_port = self._grpc_server.add_insecure_port("127.0.0.1:0")
@@ -562,7 +628,7 @@ class MockAuthServer:
     def _unary(self, method: str):
         def handler(request: bytes, context: grpc.ServicerContext) -> bytes:
             try:
-                return self._serve(method, request, context)
+                return cast(bytes, self._serve(method, request, context))
             except _AbortError as refusal:
                 context.abort(refusal.code, refusal.details)
                 raise  # unreachable; context.abort raises
@@ -577,9 +643,28 @@ class MockAuthServer:
             response_serializer=_identity_bytes,
         )
 
+    def _stream(self, method: str):
+        def handler(request: bytes, context: grpc.ServicerContext):
+            try:
+                messages = cast(list[bytes], self._serve(method, request, context))
+            except _AbortError as refusal:
+                context.abort(refusal.code, refusal.details)
+                raise  # unreachable; context.abort raises
+            except Exception:
+                logger.exception("mock auth: %s failed", method)
+                context.abort(grpc.StatusCode.INTERNAL, "mock auth internal error")
+                raise  # unreachable; context.abort raises
+            yield from messages
+
+        return grpc.unary_stream_rpc_method_handler(
+            handler,
+            request_deserializer=_identity_bytes,
+            response_serializer=_identity_bytes,
+        )
+
     def _serve(
         self, method: str, request: bytes, context: grpc.ServicerContext
-    ) -> bytes:
+    ) -> bytes | list[bytes]:
         decoded = _decode_request(method, request)
         decoded["bearer"] = self._credential(decoded, context)
         with self._lock:

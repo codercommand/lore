@@ -5,6 +5,7 @@
 //! revision-level metadata is served separately by `lore_revision_tree_info`.
 
 use lore_base::error::InvalidArguments;
+use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::event::EventError;
@@ -12,6 +13,7 @@ use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
 use lore_revision::interface::LoreError;
+use lore_revision::interface::LoreNodeStagedAction;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
 use lore_revision::node::INVALID_NODE;
@@ -27,7 +29,17 @@ use crate::revision_tree::handle::LoreRevisionTree;
 
 /// Arguments for `lore_revision_tree_node_info`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(node_info_impl)]
 pub struct LoreRevisionTreeNodeInfoArgs {
     /// Per-call correlation id echoed back in events
@@ -94,12 +106,12 @@ fn emit_node_info_error(id: u64, error_code: LoreErrorCode) {
 /// as a zeroed record with an empty name; since every non-root node has a
 /// non-empty name, such an id is rejected with `INVALID_ARGUMENTS` rather than
 /// reported as a bogus record (consistent with `node_path`).
-pub async fn node_info(
+pub fn node_info(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeNodeInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, node_info_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, node_info_impl)
 }
 
 async fn node_info_impl(
@@ -160,12 +172,23 @@ async fn node_info_impl(
                 return Err(invalid("node id does not resolve to a named node"));
             }
 
-            let kind = if node.is_file() {
-                LoreNodeType::File as u32
-            } else if node.is_link() {
-                LoreNodeType::Link as u32
+            // A discarded node reads as a freed slot does, whatever it was: one a delete left
+            // for the commit to free keeps its kind and its staging for that commit alone.
+            let (kind, staged_action, address) = if node.is_discarded() {
+                (
+                    LoreNodeType::Directory as u32,
+                    LoreNodeStagedAction::None as u32,
+                    Address::default(),
+                )
             } else {
-                LoreNodeType::Directory as u32
+                let kind = if node.is_file() {
+                    LoreNodeType::File
+                } else if node.is_link() {
+                    LoreNodeType::Link
+                } else {
+                    LoreNodeType::Directory
+                };
+                (kind as u32, node.staged_action() as u32, node.address)
             };
 
             LoreEvent::RevisionTreeNodeInfo(LoreRevisionTreeNodeInfoEventData {
@@ -176,11 +199,11 @@ async fn node_info_impl(
                 name: LoreString::from(name.as_str()),
                 parent_id: node.parent,
                 kind,
-                staged_action: node.staged_action() as u32,
+                staged_action,
                 mode: node.mode,
                 size: node.size,
-                address: node.address,
-                file_id: node.address.context,
+                address,
+                file_id: address.context,
                 error_code: LoreErrorCode::None,
             })
             .send();

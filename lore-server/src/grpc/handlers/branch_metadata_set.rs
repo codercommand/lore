@@ -11,23 +11,29 @@ use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
 use lore_revision::metadata::MetadataType;
+use lore_revision::metadata::branch::ARCHIVE_KEYS;
 use lore_revision::metadata::branch::READ_ONLY_KEYS;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::require_action;
+use crate::grpc::require_branch_protection_administration;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
 /// Validate that read-only fields have not been changed between the current and proposed
-/// metadata blobs.
+/// metadata blobs, and that none of the keys archives and restores write was added.
 pub(crate) fn validate_read_only_fields(
     current: &Metadata,
     proposed: &Metadata,
@@ -49,10 +55,22 @@ pub(crate) fn validate_read_only_fields(
                     "cannot remove read-only key '{key}'"
                 )));
             }
+            (Err(_), Ok(_)) if ARCHIVE_KEYS.contains(key) => {
+                return Err(Status::invalid_argument(format!(
+                    "cannot add read-only key '{key}'"
+                )));
+            }
             (Err(_), Ok(_) | Err(_)) => {}
         }
     }
     Ok(())
+}
+
+/// Whether `proposed` turns the branch's protection on or off relative to
+/// `current`. Such a change is repository administration rather than an
+/// ordinary write.
+pub(crate) fn changes_protection(current: &Metadata, proposed: &Metadata) -> bool {
+    branch::protected(current) != branch::protected(proposed)
 }
 
 /// Validate that all Address-typed values in the proposed metadata blob reference existing
@@ -91,12 +109,15 @@ pub(crate) async fn validate_binary_blobs(
 #[tracing::instrument(name = "BranchMetadataSet::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchMetadataSetRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<BranchMetadataSetResponse>, Status> {
+    require_action(authorizer, &request, Action::Write).await?;
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let extensions = request.extensions().clone();
     let req = request.into_inner();
 
     let branch_id = BranchId::from(req.branch_id);
@@ -107,11 +128,12 @@ pub async fn handler(
     let expected_hash: Hash = req.expected_hash.into();
     let new_hash: Hash = req.new_hash.into();
 
-    let execution = setup_execution(module_path!(), correlation_id, user_id);
+    let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
@@ -145,6 +167,15 @@ pub async fn handler(
 
             // Validate read-only fields are unchanged
             validate_read_only_fields(&current_metadata, &proposed_metadata)?;
+            if changes_protection(&current_metadata, &proposed_metadata) {
+                require_branch_protection_administration(
+                    authorizer,
+                    &extensions,
+                    repository.clone(),
+                    &user_id,
+                )
+                .await?;
+            }
 
             // Validate binary blob references exist
             validate_binary_blobs(repository.clone(), &proposed_metadata).await?;

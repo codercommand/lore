@@ -10,9 +10,10 @@ use crate::branch;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
-use crate::filter::FilterMode;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
+use crate::lock::util::lock_path_node;
+use crate::lock::util::lock_tree;
 use crate::lore::BranchId;
 use crate::lore::execution_context;
 use crate::lore_debug;
@@ -55,7 +56,9 @@ impl EventError for QueryError {
 
 /// Data for an event that marks the start of a lock query result.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileQueryBeginEventData {
     /// Number of query entries that follow.
@@ -64,7 +67,7 @@ pub struct LoreLockFileQueryBeginEventData {
 
 /// Data for an event reporting a single lock matched by a query.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileQueryEventData {
     /// Identifier of the branch the lock belongs to.
@@ -77,16 +80,26 @@ pub struct LoreLockFileQueryEventData {
     pub locked_at: u64,
 }
 
+/// Reports the locks the remote holds on `options.branch`, filtered by owner or by path. Without a
+/// branch it reports those on every branch, or, where a path is given, on the branch the instance
+/// is on. An owner and a path together are refused as [`InvalidArguments`], before the remote is
+/// asked, since it answers no query naming both.
 pub async fn query(
     repository: Arc<RepositoryContext>,
     options: QueryOptions,
 ) -> Result<(), QueryError> {
+    if !options.owner.is_empty() && !options.path.is_empty() {
+        return Err(InvalidArguments {
+            reason: "--owner can't be combined with --path".to_string(),
+        }
+        .into());
+    }
     let remote = repository
         .remote()
         .await
         .forward::<QueryError>("Unable to check lock status while offline")?;
 
-    let branch = if options.branch.is_empty() {
+    let mut branch = if options.branch.is_empty() {
         None
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
@@ -112,13 +125,25 @@ pub async fn query(
             RelativePath::new_from_user_path(repository.require_path()?, options.path.as_str())
                 .forward_with::<QueryError, _>(|| format!("Invalid path: {}", options.path))?;
 
-        if !execution_context().globals().force()
-            && repository
-                .filter
-                .emit_excludes(&relative_path, true, FilterMode::Full)
-        {
-            lore_trace!("Path excluded by filter: {}", relative_path.as_str());
-            return Ok(());
+        if !execution_context().globals().force() {
+            let (state, current_branch) = lock_tree(&repository)
+                .await
+                .forward_any::<QueryError>("Failed to deserialize state")?;
+            if lock_path_node(&repository, &state, &relative_path, false)
+                .await
+                .forward_any::<QueryError>("checking a lock path against the filter")?
+                .is_none()
+            {
+                lore_trace!("Path excluded by filter: {}", relative_path.as_str());
+                return Ok(());
+            }
+            branch = branch.or(Some(current_branch));
+        } else if branch.is_none() {
+            let (_, current_branch) =
+                crate::instance::load_current_anchor(&repository)
+                    .await
+                    .forward_any::<QueryError>("reading the branch the instance is on")?;
+            branch = Some(current_branch);
         }
         Some(relative_path.to_string())
     };

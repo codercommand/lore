@@ -53,9 +53,13 @@
 //! `PluginNotFound` sits with the other not-found codes, not with the other
 //! plugin codes.
 
+use std::convert::Infallible;
 use std::fmt;
 
+use lore_error_set::ErrorSet;
 use lore_error_set::FfiError;
+use lore_error_set::ForwardAny;
+use lore_error_set::Has;
 use thiserror::Error;
 
 /// Scopes `#[ffi_code(N)]` to this module.
@@ -142,6 +146,33 @@ pub struct NotAuthenticated;
 #[ffi_code(17)]
 pub struct NotAuthorized;
 
+/// Whether `error` is a refusal of the caller: [`NotAuthenticated`] or [`NotAuthorized`].
+pub fn is_refusal<E: FfiError>(error: &E) -> bool {
+    matches!(
+        error.ffi_code(),
+        NotAuthenticated::FFI_CODE | NotAuthorized::FFI_CODE
+    )
+}
+
+/// `error` forwarded into `Target` when it is the remote's refusal of the caller, which keeps its
+/// variant there, and `otherwise(error)` when it is any other failure.
+#[track_caller]
+pub fn forward_refusal_or<Source, Target>(
+    error: Source,
+    context: &str,
+    otherwise: impl FnOnce(Source) -> Target,
+) -> Target
+where
+    Source: ErrorSet + FfiError,
+    Target: ErrorSet + Has<NotAuthenticated> + Has<NotAuthorized>,
+{
+    if !is_refusal(&error) {
+        return otherwise(error);
+    }
+    let Err(target) = Err::<Infallible, Source>(error).forward_any::<Target>(context);
+    target
+}
+
 #[derive(Debug, Clone, Error, FfiError)]
 #[error("No token stored")]
 #[ffi_code(18)]
@@ -184,7 +215,8 @@ pub struct Maintenance;
 #[ffi_code(31)]
 pub struct SlowDown;
 
-/// No Lore service could be reached, and none could be started.
+/// No Lore service could be reached, and none could be started, or the service socket answered
+/// that no service runs while the external directories of its virtual instances move.
 ///
 /// Distinct from [`NotConnected`], which reports a remote: a caller that relays
 /// its calls through the local service handles this differently, because it is
@@ -197,6 +229,16 @@ pub struct SlowDown;
 pub struct ServiceUnavailable {
     pub reason: String,
 }
+
+/// The caller left or timed out, so the operation stopped without leaving partially completed
+/// work.
+///
+/// Unlike [`Disconnected`], which reports a transport failure while the caller is still waiting,
+/// this means nobody is waiting for the result.
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("Operation cancelled")]
+#[ffi_code(33)]
+pub struct Cancelled;
 
 // ---------------------------------------------------------------------------
 // Repository state (40–55)
@@ -212,7 +254,7 @@ pub struct ServiceUnavailable {
 pub struct NothingStaged;
 
 #[derive(Debug, Clone, Error, FfiError)]
-#[error("Branch has been advanced by another instance, sync and re-stage to commit")]
+#[error("The branch's latest revision has moved on; sync to bring in its new revisions")]
 #[ffi_code(41)]
 pub struct BranchAdvanced;
 
@@ -262,6 +304,35 @@ pub struct DeleteCurrent {
 #[ffi_code(49)]
 pub struct DeleteDefault {
     pub branch: String,
+}
+
+// Code 50 stays free so this block does not renumber.
+
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("Mounts are busy: {paths}")]
+#[ffi_code(51)]
+pub struct MountsBusy {
+    pub paths: String,
+}
+
+#[derive(Debug, Clone, Error, FfiError)]
+#[error(
+    "Can't push the link at {path} (branch {branch}): the remote branch has newer revisions than yours"
+)]
+#[ffi_code(52)]
+pub struct LinkDivergent {
+    pub path: String,
+    pub branch: String,
+}
+
+#[derive(Debug, Clone, Error, FfiError)]
+#[error(
+    "The mounts of linked repository {repository} disagree on their revision, branch or flags: {mounts}; pin them at one revision with `lore link update <mount>`, and remove and add again a mount whose flags differ"
+)]
+#[ffi_code(53)]
+pub struct LinkPinsDiverge {
+    pub repository: String,
+    pub mounts: String,
 }
 
 // ---------------------------------------------------------------------------

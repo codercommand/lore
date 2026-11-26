@@ -6,15 +6,17 @@
 //! attaches the outer `Client` write token (held by clone for cross-thread
 //! exclusion on the destination path) must grant write capability via
 //! `try_write_mutable_store`. Without this, `branch::create`'s internal
-//! helpers (`store_name_to_id`, `metadata_store`, `store_latest`) fail
-//! with `WriteRequired`.
+//! writes (`create_record`'s metadata swap, `claim_name`, `store_latest`)
+//! fail with `WriteRequired`.
 use std::sync::Arc;
 
+use lore_revision::repository::LockSharing;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::get_or_create_repository_lock;
+use lore_storage::local::store_lock::StoreHold;
 
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::default_repository_creation_args;
 
 async fn in_memory_context() -> Arc<RepositoryContext> {
     let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
@@ -90,13 +92,18 @@ async fn a_context_without_command_locks_holds_no_write_token() {
 async fn a_context_without_command_locks_holds_no_repository_lock() {
     let temp_dir = lore_base::test_util::TempDir::new("lore-repository-lock-test-");
     let dot_path = temp_dir.path().to_path_buf();
-    let lock = get_or_create_repository_lock(dot_path.clone())
-        .await
-        .expect("the repository lock is taken");
+    let (lock, stores) = get_or_create_repository_lock(
+        dot_path.clone(),
+        StoreHold::default(),
+        true,
+        LockSharing::Shared,
+    )
+    .await
+    .expect("the repository lock is taken");
     let held = Arc::downgrade(&lock);
     let ctx = Arc::try_unwrap(in_memory_context().await)
         .expect("sole owner")
-        .with_repository_lock(lock);
+        .with_repository_lock(lock, stores);
 
     let unlocked = ctx.without_command_locks();
     drop(ctx);
@@ -104,7 +111,7 @@ async fn a_context_without_command_locks_holds_no_repository_lock() {
     assert!(held.upgrade().is_none(), "the copy holds the lock");
     let _later = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        get_or_create_repository_lock(dot_path),
+        get_or_create_repository_lock(dot_path, StoreHold::default(), true, LockSharing::Shared),
     )
     .await
     .expect("a later command takes the lock while the copy lives")

@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
+use lore_base::error::SlowDown;
 use lore_base::lore_spawn;
 use lore_base::runtime::processor_count;
 use lore_base::types::Address;
@@ -23,24 +24,35 @@ use lore_revision::event::revision_tree::LoreRevisionTreeModifyCompleteEventData
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreError;
 use lore_revision::node::INVALID_NODE;
-use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::Content;
 use lore_revision::state::State;
+use lore_revision::subtask;
 use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
+use crate::revision_tree::call::EntryFailure;
 use crate::revision_tree::call::revision_tree_call;
 use crate::revision_tree::handle::LoreRevisionTree;
 use crate::revision_tree::handle::RevisionTreeInternal;
+use crate::revision_tree::handle::SharedClaim;
 
 /// One node to rewrite. The node must already exist and be a file.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreRevisionTreeModifyEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `MODIFY_COMPLETE`
@@ -57,7 +69,16 @@ pub struct LoreRevisionTreeModifyEntry {
 
 /// Arguments for `lore_revision_tree_modify`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(modify_impl)]
 pub struct LoreRevisionTreeModifyArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
@@ -72,6 +93,7 @@ pub struct LoreRevisionTreeModifyArgs {
 #[error_set]
 enum ModifyError {
     InvalidArguments,
+    SlowDown,
 }
 
 impl ModifyError {
@@ -88,6 +110,7 @@ impl EventError for ModifyError {
     fn translated(&self) -> LoreError {
         match self {
             ModifyError::InvalidArguments(_) => LoreError::InvalidArguments,
+            ModifyError::SlowDown(_) => LoreError::SlowDown,
             ModifyError::Internal(_) => LoreError::Internal,
         }
     }
@@ -127,6 +150,7 @@ fn batch_error_code(result: &Result<(), ModifyError>) -> LoreErrorCode {
     match result {
         Ok(()) => LoreErrorCode::None,
         Err(ModifyError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
+        Err(ModifyError::SlowDown(_)) => LoreErrorCode::SlowDown,
         Err(ModifyError::Internal(_)) => LoreErrorCode::Internal,
     }
 }
@@ -147,13 +171,7 @@ fn reject(entry_id: u64, entry_index: usize, reason: &str) -> ModifyError {
 struct Planned {
     entry_id: u64,
     node_id: NodeID,
-    mode: u16,
-    size: u64,
-    address: Address,
-    /// The staged and dirty change the rewrite records, decided while the plan
-    /// phase had the node in hand.
-    staged: NodeFlags,
-    dirty: NodeFlags,
+    content: Content,
 }
 
 /// Check every entry against the tree and against the rest of the batch,
@@ -212,15 +230,14 @@ async fn plan_entries(
             ));
         }
 
-        let (staged, dirty) = State::staged_edit_flags(&node);
         planned.push(Planned {
             entry_id,
             node_id: entry.node_id,
-            mode: entry.mode,
-            size: entry.size,
-            address: entry.address,
-            staged,
-            dirty,
+            content: Content {
+                mode: entry.mode,
+                size: entry.size,
+                address: entry.address,
+            },
         });
     }
 
@@ -237,10 +254,13 @@ async fn plan_entries(
 ///
 /// The plan is shared with the tasks rather than handed out piecewise, and a task
 /// takes a contiguous range of it, so dividing the work moves no entry data and
-/// allocates nothing per entry.
+/// allocates nothing per entry. Each task holds a share of the call's claim
+/// ([`SharedClaim`]), so none outlives it. A call with an entry that failed
+/// reports `SLOW_DOWN` where every failure was a `SlowDown` of the State,
+/// `INTERNAL` otherwise, as it does where a task died.
 #[lore_macro::test_pub]
 async fn apply_plan(
-    state: Arc<State>,
+    claim: SharedClaim,
     context: Arc<RepositoryContext>,
     planned: Vec<Planned>,
 ) -> Result<(), ModifyError> {
@@ -249,63 +269,74 @@ async fn apply_plan(
     let chunk = total.div_ceil(task_count);
     let planned = Arc::new(planned);
 
-    let mut tasks: JoinSet<usize> = JoinSet::new();
+    let mut tasks: JoinSet<(usize, EntryFailure)> = JoinSet::new();
     for start in (0..total).step_by(chunk) {
         let end = (start + chunk).min(total);
         let planned = planned.clone();
-        let state = state.clone();
+        let claim = claim.clone();
         let context = context.clone();
-        lore_spawn!(tasks, async move {
-            let mut applied = 0;
-            for item in &planned[start..end] {
-                let rewritten = state
-                    .node_modify(
-                        context.clone(),
-                        item.node_id,
-                        item.mode,
-                        item.size,
-                        item.address,
-                    )
-                    .await;
-                let outcome = match rewritten {
-                    Ok(()) => {
-                        state
-                            .node_mark_staged(
-                                context.clone(),
-                                item.node_id,
-                                item.staged,
-                                item.dirty,
-                            )
-                            .await
+        lore_spawn!(
+            tasks,
+            subtask!(async move {
+                // Bound first, so a task dropped where it parked drops its rewrite, and the
+                // guard noting an unfinished change, before its share of the claim.
+                let claim = claim;
+                // Read from the claim's cell once, not at each entry.
+                let state: &State = claim.state();
+                let mut applied = 0;
+                let mut strongest = EntryFailure::None;
+                for item in &planned[start..end] {
+                    let outcome = state
+                        .node_modify_staged(&context, item.node_id, &item.content)
+                        .await;
+                    match outcome {
+                        Ok(()) => {
+                            emit_modify_complete(item.entry_id, item.node_id, LoreErrorCode::None);
+                            applied += 1;
+                        }
+                        Err(error) => {
+                            let failure = EntryFailure::of(&error);
+                            emit_modify_error(item.entry_id, failure.code());
+                            strongest.merge(failure);
+                        }
                     }
-                    Err(error) => Err(error),
-                };
-                match outcome {
-                    Ok(()) => {
-                        emit_modify_complete(item.entry_id, item.node_id, LoreErrorCode::None);
-                        applied += 1;
-                    }
-                    Err(_) => emit_modify_error(item.entry_id, LoreErrorCode::Internal),
                 }
-            }
-            applied
-        });
+                (applied, strongest)
+            })
+        );
     }
 
     let mut applied = 0usize;
+    let mut strongest = EntryFailure::None;
     while let Some(result) = tasks.join_next().await {
-        if let Ok(count) = result {
-            applied += count;
+        match result {
+            Ok((count, failure)) => {
+                applied += count;
+                strongest.merge(failure);
+            }
+            Err(_) => strongest.merge(EntryFailure::Internal),
         }
     }
-
+    let state: &State = claim.state();
+    let drained = if state.holds_promoted_moves() {
+        Box::pin(lore_revision::file::stage::stage_promoted_moves_of_call(
+            &context, state, None,
+        ))
+        .await
+        .map(drop)
+    } else {
+        Ok(())
+    };
     if applied < total {
         let failed = total - applied;
-        return Err(ModifyError::internal(format!(
-            "{failed}/{total} node modifies failed"
-        )));
+        return Err(strongest.call_error(&format!("{failed}/{total} node modifies failed")));
     }
-    Ok(())
+    drained.map_err(|error| {
+        ModifyError::internal_with_context(
+            error,
+            "stage the moves of directories the modifies were in",
+        )
+    })
 }
 
 /// Rewrite a batch of file nodes' content fields.
@@ -317,8 +348,9 @@ async fn apply_plan(
 /// derived at commit and a link's address is its target, so neither holds
 /// content to rewrite. A zero `address.context` preserves the node's existing
 /// file id — unlike `add`, which generates one — because the node already
-/// carries an identity and replacing it would record the edit as a move. An
-/// empty batch succeeds.
+/// carries an identity and replacing it would record the edit as a move. A file
+/// added or moved through this handle stays an addition or a move, which the
+/// commit records with the new content. An empty batch succeeds.
 ///
 /// The call as a whole reports on `RevisionTreeBatchComplete`, carrying the
 /// call's own `batch_id` and firing exactly once — after any per-entry
@@ -341,8 +373,11 @@ async fn apply_plan(
 /// Atomicity covers the rules checked here, which is every rule a caller can
 /// break through the arguments. A failure after the checks pass — a block that
 /// cannot be read, or a target deleted between its check and its write — reports
-/// `INTERNAL` and may leave part of the batch rewritten: nothing is rolled back,
-/// the handle stays usable, and no revision is published until `commit`.
+/// `INTERNAL`. An entry the tree gave up on under load, a store asking it to slow
+/// down, reports `SLOW_DOWN`, which a caller can retry, and so does the batch
+/// where nothing failed otherwise. Either may leave part of the batch
+/// rewritten: nothing is rolled back, the handle stays usable, and no revision
+/// is published until `commit`.
 ///
 /// Entries are independent, since a rewrite touches no parent or sibling chain,
 /// so the batch is split into contiguous ranges over at most one task per
@@ -356,12 +391,12 @@ async fn apply_plan(
 /// Concurrency covers entries in different node blocks: each rewrite takes its
 /// target's block write lock for the field write, so entries sharing a block —
 /// which sequentially allocated node ids usually do — serialize on it.
-pub async fn modify(
+pub fn modify(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeModifyArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, modify_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, modify_impl)
 }
 
 /// Plan and apply one batch. Split out of the dispatcher closure so the batch
@@ -374,10 +409,9 @@ async fn modify_batch(
         return Ok(());
     }
     let context = internal.repository_context.clone();
-    let access = internal.access_shared().await;
-    let state = access.state();
-    let planned = plan_entries(&state, &context, args.entries.as_slice()).await?;
-    apply_plan(state, context, planned).await
+    let claim = internal.claim_shared().await;
+    let planned = plan_entries(claim.state(), &context, args.entries.as_slice()).await?;
+    apply_plan(claim, context, planned).await
 }
 
 async fn modify_impl(

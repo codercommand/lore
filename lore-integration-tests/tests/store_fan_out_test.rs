@@ -4,6 +4,10 @@
 //! `LocalMutableStore`. Verifies the headline file-count win for client stores: cloning a 100k-file
 //! repository keeps every group at level 1, so the on-disk artifact count is bounded by 256
 //! per-group bucket files + 256 marker files (mutable) or +256 packfiles (immutable).
+//!
+//! A test holds a span over a store it writes through or runs many operations on, as a command
+//! does: `LocalImmutableStore::store` takes no claim of its own, and an operation outside any span
+//! claims the store afresh, reloading it, whenever nothing unflushed kept the flock.
 
 #[cfg(test)]
 mod tests {
@@ -13,6 +17,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use lore_base::test_util::TempDir;
+    use lore_storage::ImmutableStore;
     use lore_storage::ImmutableStoreSettings;
     use lore_storage::MutableStoreSettings;
     use lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT;
@@ -77,6 +82,11 @@ mod tests {
 
         let mutable = Arc::new(mutable);
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let partition = lore_storage::Partition::default();
         let mut rng = StdRng::seed_from_u64(0xDEADBEEFCAFEBABE);
@@ -95,7 +105,7 @@ mod tests {
 
         store
             .clone()
-            .flush(true)
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
             .await
             .expect("Failed to flush mutable store");
 
@@ -142,6 +152,11 @@ mod tests {
         )
         .await
         .expect("Failed to create immutable store");
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let partition = lore_storage::Partition::default();
         let mut rng = StdRng::seed_from_u64(0xDEADBEEFCAFEBABE);
@@ -170,7 +185,7 @@ mod tests {
 
         let store_dyn: Arc<dyn lore_storage::ImmutableStore> = store.clone();
         store_dyn
-            .flush(true)
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
             .await
             .expect("Failed to flush immutable store");
 
@@ -186,7 +201,11 @@ mod tests {
         // All 100k addresses must be findable.
         for address in &addresses {
             let result = store
-                .find(partition, *address)
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             assert_eq!(
@@ -262,7 +281,10 @@ mod tests {
             )
             .await
             .expect("Failed to store");
-        store.flush(true).await.expect("Failed to flush");
+        store
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
 
         let mutable = open_mutable(&store_path, settings).await;
         for (idx, group) in mutable.group.iter().enumerate() {
@@ -280,7 +302,10 @@ mod tests {
             )
             .await
             .expect("Failed to store");
-        store.flush(true).await.expect("Failed to flush");
+        store
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
 
         let mutable = open_mutable(&store_path, settings).await;
         assert_eq!(
@@ -333,13 +358,21 @@ mod tests {
         )
         .await
         .expect("Failed to create immutable store");
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         store
             .clone()
             .store(partition, written, fragment, Some(payload.clone()), false)
             .await
             .expect("Failed to store fragment");
         let store: Arc<dyn lore_storage::ImmutableStore> = store;
-        store.flush(true).await.expect("Failed to flush");
+        store
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
 
         let store = lore_storage::LocalImmutableStore::new(
             Some(store_path.path().to_path_buf()),
@@ -351,13 +384,21 @@ mod tests {
             let count = group.bucket_count.load(Ordering::Relaxed);
             assert_eq!(count, 1, "Group {idx} must reopen at the initial level 1");
         }
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         store
             .clone()
             .store(partition, untouched, fragment, Some(payload.clone()), false)
             .await
             .expect("Failed to store fragment");
         let store: Arc<dyn lore_storage::ImmutableStore> = store;
-        store.flush(true).await.expect("Failed to flush");
+        store
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
 
         let store = lore_storage::LocalImmutableStore::new(
             Some(store_path.path().to_path_buf()),
@@ -372,7 +413,11 @@ mod tests {
         );
         for address in [written, untouched] {
             let result = store
-                .find(partition, address)
+                .find(
+                    partition,
+                    address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             assert_eq!(
@@ -422,7 +467,11 @@ mod tests {
                 .await
                 .expect("Failed to store");
         }
-        store.clone().flush(true).await.expect("Failed to flush");
+        store
+            .clone()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
 
         let mutable_index = store_path.join("mutable").join("index");
         // Find at least one group dir with a marker file.
@@ -484,7 +533,11 @@ mod tests {
                 .await
                 .expect("Failed to store");
         }
-        store.clone().flush(true).await.expect("Failed to flush");
+        store
+            .clone()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
 
         let mutable_index = store_path.join("mutable").join("index");
         let mut found_marker_at_256 = false;
@@ -529,6 +582,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         // Force specific groups to specific levels by setting bucket_count directly.
         store.group[0].bucket_count.store(1, Ordering::Relaxed);
@@ -573,10 +631,14 @@ mod tests {
 
         // Flush — exercises the per-group serialize loop with mixed bucket counts.
         let store_dyn: Arc<dyn lore_storage::ImmutableStore> = store.clone();
-        store_dyn.clone().flush(true).await.unwrap();
+        store_dyn
+            .clone()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .unwrap();
 
         // evict_oldest with generous capacity: no actual eviction, but the bucket-iteration path runs at every level.
-        let _evicted = store.evict_oldest(1_000_000_000, None).await;
+        let (_evicted, _) = store.evict_oldest(1_000_000_000, None).await;
 
         let mut at = None;
         for _ in 0..=lore_storage::local::immutable_store::GROUP_COUNT {
@@ -743,7 +805,11 @@ mod tests {
             .await
             .unwrap();
 
-        store.clone().flush(true).await.unwrap();
+        store
+            .clone()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .unwrap();
 
         // Decision 8 invariant 1: NO marker files appear anywhere in the index tree after flush.
         for entry in std::fs::read_dir(&mutable_index_root).unwrap().flatten() {
@@ -864,7 +930,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        store.clone().flush(true).await.unwrap();
+        store
+            .clone()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .unwrap();
 
         // Find a bucket file and read its first 4 bytes (the version field).
         let mutable_index = store_path.join("mutable").join("index");
@@ -929,6 +999,11 @@ mod tests {
         .unwrap();
         let mutable = Arc::new(mutable);
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         // Pin every write to group 0x10 by fixing the first hash byte.
         let group_index: u8 = 0x10;
@@ -951,7 +1026,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        store.clone().flush(true).await.unwrap();
+        store
+            .clone()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .unwrap();
 
         // Direct-jump fan-out lands at exactly level 32 for these parameters.
         let final_level = mutable.group[group_index as usize]
@@ -1002,6 +1081,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let group_index: u8 = 0x10;
         let n = 5000;
@@ -1029,7 +1113,10 @@ mod tests {
                 .unwrap();
         }
         let store_dyn: Arc<dyn lore_storage::ImmutableStore> = store.clone();
-        store_dyn.flush(true).await.unwrap();
+        store_dyn
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .unwrap();
 
         let final_level = store.group[group_index as usize]
             .bucket_count
@@ -1050,7 +1137,14 @@ mod tests {
         assert_eq!(marker_level, 32, "Marker level mismatches in-memory level");
 
         for address in &addresses {
-            let result = store.find(partition, *address).await.unwrap();
+            let result = store
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
+                .await
+                .unwrap();
             assert_eq!(
                 result.matching,
                 lore_storage::StoreMatch::MatchFull,
@@ -1115,7 +1209,11 @@ mod tests {
                     .await
                     .unwrap();
             }
-            store.clone().flush(true).await.unwrap();
+            store
+                .clone()
+                .flush(lore_storage::FlushOptions::SYNC_DATA)
+                .await
+                .unwrap();
             assert_eq!(
                 mutable.group[group_index as usize]
                     .bucket_count
@@ -1150,6 +1248,11 @@ mod tests {
                 .unwrap(),
             );
             let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+            let _span = store
+                .clone()
+                .hold_for_command()
+                .await
+                .expect("claims the store");
             assert_eq!(
                 mutable.group[group_index as usize]
                     .bucket_count
@@ -1178,7 +1281,11 @@ mod tests {
             }
 
             // Phase 4: flush. Level-32 bucket 0 exceeds threshold → fan-out to level 64. The fan-out path MUST force-deserialize all level-32 buckets before redistribute or phase-1 entries in non-deserialized buckets will be lost.
-            store.clone().flush(true).await.unwrap();
+            store
+                .clone()
+                .flush(lore_storage::FlushOptions::SYNC_DATA)
+                .await
+                .unwrap();
             let new_level = mutable.group[group_index as usize]
                 .bucket_count
                 .load(Ordering::Relaxed);
@@ -1235,6 +1342,11 @@ mod tests {
             .unwrap(),
         );
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         let group_index: u8 = 0x10;
         let partition = lore_storage::Partition::default();
 
@@ -1283,7 +1395,10 @@ mod tests {
         let flush_handle = lore_base::lore_spawn!(async move {
             for _ in 0..10 {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                let _ = flush_store.clone().flush(true).await;
+                let _ = flush_store
+                    .clone()
+                    .flush(lore_storage::FlushOptions::SYNC_DATA)
+                    .await;
             }
         });
 
@@ -1295,7 +1410,11 @@ mod tests {
         flush_handle.await.expect("Flush task panicked");
 
         // Final settle flush after all writers are done.
-        store.clone().flush(true).await.unwrap();
+        store
+            .clone()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .unwrap();
 
         let final_level = mutable.group[group_index as usize]
             .bucket_count
@@ -1435,7 +1554,11 @@ mod tests {
                     .await
                     .unwrap();
             }
-            store.clone().flush(true).await.unwrap();
+            store
+                .clone()
+                .flush(lore_storage::FlushOptions::SYNC_DATA)
+                .await
+                .unwrap();
         }
 
         // Reload phase: reopen the same path, verify groups loaded at bucket_count = 1.
@@ -1534,7 +1657,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        store.clone().flush(true).await.unwrap();
+        store
+            .clone()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .unwrap();
         assert_eq!(
             mutable.group[group_index as usize]
                 .bucket_count
@@ -1630,7 +1757,7 @@ mod tests {
                 std::fs::copy(&path, &new_path).unwrap();
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1680,7 +1807,7 @@ mod tests {
                 }
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1717,7 +1844,7 @@ mod tests {
         let (store_path, group_dir, keys) = setup_post_fan_out_to_level_32(0xAA04, 200).await;
 
         // Construct: write pending=32, leave everything else alone (final files at level-32, marker=32).
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1816,7 +1943,7 @@ mod tests {
                 std::fs::copy(&path, &new_path).unwrap();
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1843,6 +1970,11 @@ mod tests {
         )
         .await;
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         let partition = lore_storage::Partition::default();
         let mut rng = StdRng::seed_from_u64(0xFA0_0002);
         let mut keys = Vec::with_capacity(5000);
@@ -1871,7 +2003,11 @@ mod tests {
             }
         });
 
-        store.clone().flush(true).await.expect("Failed to flush");
+        store
+            .clone()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
         reader.await.expect("Reader task panicked");
 
         assert_eq!(
@@ -1879,7 +2015,11 @@ mod tests {
             32,
             "Group 0x42 must have fanned out to level 32"
         );
-        store.clone().flush(true).await.expect("Failed to flush");
+        store
+            .clone()
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
 
         let mut missing = 0usize;
         for (key, value) in &keys {
@@ -1915,6 +2055,11 @@ mod tests {
         )
         .await
         .expect("Failed to create immutable store");
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let partition = lore_storage::Partition::default();
         let payload = bytes::Bytes::from_static(b"test fragment payload data 30!");
@@ -1946,13 +2091,22 @@ mod tests {
         let reader = lore_base::lore_spawn!(async move {
             for _ in 0..40 {
                 for address in &reader_addresses {
-                    let _ = reader_store.find(partition, *address).await;
+                    let _ = reader_store
+                        .find(
+                            partition,
+                            *address,
+                            lore_storage::local::immutable_store::Lookup::Read,
+                        )
+                        .await;
                 }
             }
         });
 
         let store_dyn: Arc<dyn lore_storage::ImmutableStore> = store.clone();
-        store_dyn.flush(true).await.expect("Failed to flush");
+        store_dyn
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
         reader.await.expect("Reader task panicked");
 
         assert_eq!(
@@ -1962,12 +2116,19 @@ mod tests {
         );
 
         let store_dyn: Arc<dyn lore_storage::ImmutableStore> = store.clone();
-        store_dyn.flush(true).await.expect("Failed to flush");
+        store_dyn
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
 
         let mut missing = 0usize;
         for address in &addresses {
             let result = store
-                .find(partition, *address)
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             if result.matching != lore_storage::StoreMatch::MatchFull {
@@ -2021,13 +2182,21 @@ mod tests {
             lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             "Untouched group of a legacy store must open at the legacy level"
         );
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         store
             .clone()
             .store(partition, address, fragment, Some(payload.clone()), false)
             .await
             .expect("Failed to store fragment");
         let store: Arc<dyn lore_storage::ImmutableStore> = store;
-        store.flush(true).await.expect("Failed to flush");
+        store
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
 
         assert!(
             !store_path
@@ -2046,7 +2215,11 @@ mod tests {
         .await
         .expect("Failed to reopen immutable store");
         let result = store
-            .find(partition, address)
+            .find(
+                partition,
+                address,
+                lore_storage::local::immutable_store::Lookup::Read,
+            )
             .await
             .expect("find returned an error");
         assert_eq!(
@@ -2091,7 +2264,10 @@ mod tests {
             .store(partition, key, value, lore_storage::KeyType::BranchMetadata)
             .await
             .expect("Failed to store");
-        store.flush(true).await.expect("Failed to flush");
+        store
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("Failed to flush");
 
         let mutable = open_mutable(&store_path, MutableStoreSettings::default()).await;
         let store: Arc<dyn lore_storage::MutableStore> = mutable;

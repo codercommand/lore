@@ -13,6 +13,7 @@ use tokio::task::JoinSet;
 
 use super::RepositoryContext;
 use super::RepositoryError;
+use crate::errors::is_refusal;
 use crate::event;
 use crate::hash;
 use crate::interface::LoreArray;
@@ -40,7 +41,9 @@ use crate::util::path::RelativePath;
 
 /// Data for the event emitted when state verification starts.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyStateBeginEventData {
     /// Placeholder field. The event carries no data.
@@ -49,7 +52,7 @@ pub struct LoreRepositoryVerifyStateBeginEventData {
 
 /// Data for the event emitted when state verification finishes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyStateEndEventData {
     /// Identifier of the staged state after healing. Zero when nothing was healed.
@@ -58,7 +61,7 @@ pub struct LoreRepositoryVerifyStateEndEventData {
 
 /// One stored copy of a fragment found during fragment verification.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyFragmentMatchEventData {
     /// Slot the match was found in.
@@ -87,7 +90,7 @@ pub struct LoreRepositoryVerifyFragmentMatchEventData {
 
 /// Result of verifying a single fragment, including every stored copy found.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyFragmentEventData {
     /// Hash of the fragment that was verified.
@@ -112,7 +115,9 @@ pub struct LoreRepositoryVerifyFragmentEventData {
 
 /// Result of verifying a single fragment on the remote.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyFragmentRemoteEventData {
     /// Hash part of the fragment address.
@@ -181,17 +186,12 @@ async fn verify_staged_directory(
     state: Arc<State>,
     node_id: NodeID,
 ) -> Result<(), RepositoryError> {
-    let parent = state
-        .node(repository.clone(), node_id)
+    let mut children = StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id)
         .await
         .forward::<RepositoryError>("Failed to deserialize repository state")?;
 
     let mut names: Vec<ChildName> = Vec::new();
     let mut any_staged = false;
-    let mut children =
-        StateNodeChildrenIterator::from_parent(state.clone(), repository.clone(), node_id, &parent)
-            .await
-            .forward::<RepositoryError>("Invalid node hierarchy in revision state")?;
 
     while let Some((child_node_id, child_node)) = children
         .next()
@@ -328,11 +328,12 @@ pub(crate) async fn verify(
 
     // Check the node hierarchy
     let node_id = if let Some(path) = path {
-        let node_link = state
-            .find_node_link(repository.clone(), path.as_str())
+        state
+            .locate_node(repository.clone(), path.as_str())
             .await
-            .forward::<RepositoryError>("Invalid repository path")?;
-        node_link.node
+            .forward::<RepositoryError>("Invalid repository path")?
+            .identity()
+            .node
     } else {
         ROOT_NODE
     };
@@ -745,6 +746,9 @@ async fn verify_fragment_remote(
                 },
             )
             .send();
+            if is_refusal(&e) {
+                return Err(e.forward("verifying fragment on remote"));
+            }
             Err(RepositoryError::internal(format!(
                 "Repository verification failed: {error_msg}"
             )))

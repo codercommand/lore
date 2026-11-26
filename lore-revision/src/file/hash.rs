@@ -36,7 +36,9 @@ impl EventError for HashError {
 
 /// Data for the event reporting the hash of a single file.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileHashEventData {
     /// Path of the file.
@@ -80,13 +82,13 @@ pub async fn hash(
         })
         .await?
     } else {
-        let metadata = lore_io::IoDriver::global()
-            .metadata(path.as_ref())
+        let stat = lore_io::IoDriver::global()
+            .stat(path.as_ref())
             .await
             .map_err(|err| InvalidArguments {
                 reason: format!("path does not exist or is not accessible: {err}"),
             })?;
-        let size = hashed_file_size(FileInfo::from_metadata(&metadata))?;
+        let size = hashed_file_size(FileInfo::from_stat(&stat))?;
         let hash = immutable::hash_file(
             repository.clone(),
             &lore_storage::ContentSource::file(path.as_ref()),

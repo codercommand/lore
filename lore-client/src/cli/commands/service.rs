@@ -1,36 +1,38 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-pub mod run;
-
-use std::sync::Arc;
 
 use clap::Args;
 use clap::Subcommand;
 use lore::call_delegation::run_command_locally;
+use lore::interface::LoreArray;
 use lore::interface::LoreEvent;
 use lore::interface::LoreEventCallback;
+use lore::interface::LoreExternalRootState;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreLogLevel;
 use lore::interface::LoreServiceMessageEventData;
 use lore::interface::LoreServiceSetExecutableArgs;
+use lore::interface::LoreServiceSetExternalDirectoryArgs;
 use lore::interface::LoreServiceSetUseAutomaticallyArgs;
 use lore::interface::LoreServiceStartArgs;
 use lore::interface::LoreServiceStatusArgs;
 use lore::interface::LoreServiceStatusEventData;
 use lore::interface::LoreServiceStopArgs;
+use lore::interface::LoreString;
 use lore::runtime;
 use lore::service;
-use lore::service::state::ServiceStateImpl;
+use lore::service::LoreServiceQuitArgs;
+use lore::service::LoreServiceRunArgs;
 
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
 use crate::cli::output_formatter;
-use crate::commands::service::run::service_main;
 use crate::eprintln;
 use crate::println;
 use crate::styling::CommonStyles;
 use crate::styling::LogStyles;
 use crate::util;
+use crate::util::TerminationSignals;
 
 #[derive(Args)]
 pub struct ServiceArgs {
@@ -68,6 +70,23 @@ pub struct ServiceSetUseAutomaticallyArgs {
     enabled: bool,
 }
 
+#[derive(Args)]
+pub struct ServiceSetExternalDirectoryArgs {
+    /// The new external root: an absolute path, one relative to the working directory, or empty
+    /// for the default location in the global data directory
+    #[clap(value_name = "path")]
+    path: String,
+
+    /// Point the setting at the path, a root that holds this global data directory's marker, and
+    /// move nothing
+    #[clap(long)]
+    adopt: bool,
+
+    /// Give up the unavailable external root for a new, empty one at the path, and move nothing
+    #[clap(long)]
+    abandon: bool,
+}
+
 #[derive(Subcommand)]
 pub enum ServiceCommands {
     ///Run this process as the service
@@ -79,7 +98,7 @@ pub enum ServiceCommands {
     /// Stop the running service
     Stop(ServiceStopArgs),
 
-    /// Report whether the service is running, and what it is doing
+    /// Report whether the service is running, what it is doing, and where the external directories are
     Status(ServiceStatusArgs),
 
     /// Set which executable is started as the service
@@ -87,21 +106,99 @@ pub enum ServiceCommands {
 
     /// Set whether commands are carried out by the service
     SetUseAutomatically(ServiceSetUseAutomaticallyArgs),
+
+    /// Move every virtual instance's external directory to a new external root
+    ///
+    /// Stops the running service and holds its socket until the move ends, then starts the
+    /// service again. Renames the external root within its volume, and copies it to another
+    /// volume, keeping holes, owners, permissions, attributes, access control lists and times, and
+    /// refusing what a copy can't keep, such as a hard link. Refuses a service that runs inside
+    /// another program, and a stop while a program is inside a virtual instance, unless --force,
+    /// which detaches busy mounts lazily.
+    /// Ctrl-C before the final switch undoes a move; an --adopt or --abandon it interrupts is
+    /// finished later, by recovery. Ctrl-C while the command finishes an earlier interrupted move
+    /// ends it, and leaves that move to recovery. With --dry-run, runs every check that needs
+    /// nothing stopped and reports what the move would do; while a move is interrupted, it reports
+    /// that move, and the target is checked once recovery has finished it.
+    SetExternalDirectory(ServiceSetExternalDirectoryArgs),
+}
+
+/// Where the service process parks its working directory. It inherits one from
+/// whoever started it, which is unrelated to the directories its callers run in,
+/// and holding that directory would also keep the filesystem under it busy.
+/// Callers send the directory their relative paths belong to, so the service
+/// never needs one of its own.
+///
+/// Done here and not in `service::run`, so that a program embedding the service
+/// keeps its own working directory.
+fn detached_working_directory() -> std::path::PathBuf {
+    #[cfg(target_family = "unix")]
+    {
+        std::path::PathBuf::from("/")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("SystemRoot").map_or_else(
+            || std::path::PathBuf::from("C:\\"),
+            std::path::PathBuf::from,
+        )
+    }
 }
 
 fn handle_service_run(globals: LoreGlobalArgs, _args: &ServiceRunArgs) -> u8 {
-    // The service process owns one state, taken from the global here so that
-    // everything below is handed the instance rather than reaching for it.
-    let service_state = Arc::clone(ServiceStateImpl::global());
-    match runtime().block_on(async move { service_main(globals, None, service_state).await }) {
-        Ok(_) => 0,
+    let detached = detached_working_directory();
+    if let Err(error) = std::env::set_current_dir(&detached) {
+        eprintln!(
+            "{}Failed to set working directory to {}:{} {error}",
+            CommonStyles::FAILURE,
+            detached.display(),
+            anstyle::Reset
+        );
+    }
+
+    runtime().block_on(async move {
+        // Registered before the service starts, because a signal ends the process
+        // outright until a handler is in place: registering after the service
+        // binds its socket leaves a window in which a service callers can already
+        // reach dies rather than stopping, leaving the socket behind.
+        // Without signals the service is still stoppable over IPC
+        let signals = register_termination_signals();
+
+        let run = service::run(globals.clone(), LoreServiceRunArgs {}, service_callback());
+        tokio::pin!(run);
+
+        let Some(mut signals) = signals else {
+            return run.await as u8;
+        };
+
+        // The service ends by itself when stopped over IPC or when it fails to start,
+        // and by a quit when a signal arrives first.
+        // Biased towards the service, so that it is polled and has begun to start
+        // by the time a signal that arrived already is acted on: a quit before
+        // that has no service to reach.
+        tokio::select! {
+            biased;
+            status = &mut run => status as u8,
+            () = signals.recv() => {
+                service::quit(globals, LoreServiceQuitArgs {}, service_callback()).await;
+                run.await as u8
+            }
+        }
+    })
+}
+
+/// The termination signals, registered, or `None` where they can't be, which is reported on
+/// stderr.
+fn register_termination_signals() -> Option<TerminationSignals> {
+    match TerminationSignals::register() {
+        Ok(signals) => Some(signals),
         Err(error) => {
             eprintln!(
-                "{}Error running service:{} {error}",
+                "{}Failed to listen for termination signals:{} {error}",
                 CommonStyles::FAILURE,
                 anstyle::Reset
             );
-            1
+            None
         }
     }
 }
@@ -161,41 +258,91 @@ fn format_uptime(uptime_ms: u64) -> String {
     }
 }
 
-/// Reports what the service is, where it is, and how busy it is. Nothing is
-/// printed beyond the first line when none is running: the fields are zeroed in
-/// that case, and printing them would read as a service that is running and
-/// idle.
+/// Reports what the service is, where it is, and how busy it is, then the external root of the
+/// caller's global data directory. Nothing about a service is printed beyond the
+/// first line when none is running: its fields are zeroed in that case, and printing them would
+/// read as a service that is running and idle.
 fn print_service_status(data: &LoreServiceStatusEventData) {
     if data.running == 0 {
         println!("No Lore service is running");
+    } else {
+        println!("Lore service is running");
+        println!(
+            "  {}Executable:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            data.binary_path.as_str()
+        );
+        println!(
+            "  {}Uptime:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            format_uptime(data.uptime_ms)
+        );
+        println!(
+            "  {}Connections:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            data.connection_count
+        );
+        println!(
+            "  {}SWFS mounts:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            data.swfs_mount_count
+        );
+        println!(
+            "  {}Process ID:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            data.process_id
+        );
+        println!(
+            "  {}Runs inside another program:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            if data.embedded == 0 { "no" } else { "yes" }
+        );
+        print_paths("Mounted virtual instances:", &data.mounted_paths);
+        print_paths(
+            "Global data directories of the mounts:",
+            &data.mounted_global_data_directories,
+        );
+    }
+    println!(
+        "{}External directories:{} {}",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        data.external_root.as_str()
+    );
+    println!(
+        "  {}State:{} {}",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        match data.external_root_state {
+            LoreExternalRootState::Available => "can be used",
+            LoreExternalRootState::Unavailable => "can't be used",
+            LoreExternalRootState::Interrupted => "a move hasn't finished",
+        }
+    );
+    println!(
+        "  {}Old directories to remove:{} {}",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        data.external_leftovers
+    );
+}
+
+/// Prints `label` with each of `paths` on a line of its own below it, or `none` beside it.
+fn print_paths(label: &str, paths: &LoreArray<LoreString>) {
+    if paths.is_empty() {
+        println!("  {}{label}{} none", CommonStyles::HEADERS, anstyle::Reset);
         return;
     }
-
-    println!("Lore service is running");
-    println!(
-        "  {}Executable:{} {}",
-        CommonStyles::HEADERS,
-        anstyle::Reset,
-        data.binary_path.as_str()
-    );
-    println!(
-        "  {}Uptime:{} {}",
-        CommonStyles::HEADERS,
-        anstyle::Reset,
-        format_uptime(data.uptime_ms)
-    );
-    println!(
-        "  {}Connections:{} {}",
-        CommonStyles::HEADERS,
-        anstyle::Reset,
-        data.connection_count
-    );
-    println!(
-        "  {}SWFS mounts:{} {}",
-        CommonStyles::HEADERS,
-        anstyle::Reset,
-        data.swfs_mount_count
-    );
+    println!("  {}{label}{}", CommonStyles::HEADERS, anstyle::Reset);
+    for path in paths.as_slice() {
+        println!("    {}", path.as_str());
+    }
 }
 
 /// Reads a buffered service message as a line, naming the level it came in at.
@@ -262,6 +409,28 @@ fn handle_service_set_use_automatically(
     return run_command_locally(globals, set_args.into(), service_callback()) as u8;
 }
 
+fn handle_service_set_external_directory(
+    globals: LoreGlobalArgs,
+    args: &ServiceSetExternalDirectoryArgs,
+) -> u8 {
+    let set_args = LoreServiceSetExternalDirectoryArgs {
+        path: args.path.as_str().into(),
+        adopt: u8::from(args.adopt),
+        abandon: u8::from(args.abandon),
+    };
+    runtime().block_on(async move {
+        let signals = register_termination_signals();
+        let termination = async move {
+            match signals {
+                Some(mut signals) => signals.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        service::set_external_directory_until(globals, set_args, service_callback(), termination)
+            .await as u8
+    })
+}
+
 pub fn handle_service_commands(cmd: &ServiceCommands, globals: LoreGlobalArgs) -> u8 {
     match cmd {
         ServiceCommands::Run(args) => {
@@ -281,6 +450,9 @@ pub fn handle_service_commands(cmd: &ServiceCommands, globals: LoreGlobalArgs) -
         }
         ServiceCommands::SetUseAutomatically(args) => {
             return handle_service_set_use_automatically(globals, args);
+        }
+        ServiceCommands::SetExternalDirectory(args) => {
+            return handle_service_set_external_directory(globals, args);
         }
     }
 }

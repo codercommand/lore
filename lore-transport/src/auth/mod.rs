@@ -5,6 +5,8 @@ pub mod mode;
 pub mod oidc;
 pub mod token_only;
 pub mod ucs_auth;
+pub mod user_directory;
+pub mod user_service_v1;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,7 +20,6 @@ use parking_lot::Mutex;
 
 use crate::error::ProtocolError;
 use crate::traits::Authentication;
-use crate::traits::UserService;
 use crate::types::EnvironmentConfig;
 use crate::types::Oidc;
 
@@ -126,12 +127,31 @@ impl Authentication for NoAuthentication {
         Err(Self::refused())
     }
 
+    async fn authenticate_client(
+        &self,
+        _auth_url: &str,
+        _client_id: &str,
+        _client_secret: &str,
+        _correlation_id: &str,
+    ) -> Result<crate::types::AuthenticationToken, ProtocolError> {
+        Err(Self::refused())
+    }
+
     async fn refresh_authentication(
         &self,
         _auth_url: &str,
         _refresh_token: &str,
         _correlation_id: &str,
     ) -> Result<crate::types::AuthenticationToken, ProtocolError> {
+        Err(Self::refused())
+    }
+
+    async fn revoke_refresh_token(
+        &self,
+        _auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
         Err(Self::refused())
     }
 
@@ -145,11 +165,11 @@ impl Authentication for NoAuthentication {
         Err(Self::refused())
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         _auth_url: &str,
         _authn_token: &str,
-        _resource_id: &str,
+        _resource_ids: &[&str],
         _correlation_id: &str,
     ) -> Result<crate::types::AuthorizationToken, ProtocolError> {
         Err(Self::refused())
@@ -161,9 +181,21 @@ fn register_builtin() {
         let ucs_auth = Arc::new(ucs_auth::UcsAuthentication);
         for scheme in ucs_auth::SCHEMES {
             let _ = authentication::add(scheme, ucs_auth.clone());
-            let _ = user_service::add(scheme, ucs_auth.clone());
         }
     });
+}
+
+/// Refuses a custom resource exchange that names no resource, or names one by an empty ID.
+/// Sent on, it would ask the backend for a token without a target, which an RFC 8693 issuer
+/// may answer with one as broad as the subject token.
+#[lore_macro::test_pub]
+pub(crate) fn require_custom_resources(resource_ids: &[&str]) -> Result<(), ProtocolError> {
+    if resource_ids.is_empty() || resource_ids.iter().any(|id| id.is_empty()) {
+        return Err(ProtocolError::internal(
+            "a custom resource exchange needs at least one non-empty resource ID",
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `url` is a plain-http URL naming a loopback host, where the traffic never leaves
@@ -301,8 +333,7 @@ pub mod authentication {
             let auth = map.as_ref().and_then(|m| m.get(scheme).cloned());
             auth.ok_or_else(|| {
                 map.as_ref()
-                    .map(|m| m.keys().cloned().collect::<Vec<String>>())
-                    .unwrap_or_default()
+                    .map_or_default(|m| m.keys().cloned().collect::<Vec<String>>())
             })
         };
         found.map_err(|available| {
@@ -329,43 +360,5 @@ pub mod authentication {
             Some(m) => m.keys().cloned().collect(),
             None => Vec::new(),
         }
-    }
-}
-
-/// Scheme-based registry for `UserService` implementations, keyed like
-/// [`authentication`] but on the service URL, which a server may advertise
-/// separately from its auth URL.
-///
-/// Unlike authentication, a service is optional: a scheme with none
-/// registered gets [`token_only::TokenOnlyUserService`], which names the
-/// bearer from their own token and echoes every other ID.
-pub mod user_service {
-    use super::*;
-
-    static USER_SERVICE_MAP: Mutex<Option<HashMap<String, Arc<dyn UserService>>>> =
-        Mutex::new(None);
-
-    /// The `UserService` for the given user service URL.
-    /// Registers builtin implementations on first call.
-    pub fn find(user_url: &str) -> Arc<dyn UserService> {
-        register_builtin();
-
-        let registered = parse_scheme(user_url).ok().and_then(|scheme| {
-            USER_SERVICE_MAP
-                .lock()
-                .as_ref()
-                .and_then(|m| m.get(scheme).cloned())
-        });
-        registered.unwrap_or_else(|| Arc::new(token_only::TokenOnlyUserService))
-    }
-
-    /// Registers a `UserService` implementation for the given scheme.
-    pub fn add(scheme: &str, service: Arc<dyn UserService>) -> Result<(), ProtocolError> {
-        let mut map = USER_SERVICE_MAP.lock();
-        if map.is_none() {
-            *map = Some(HashMap::new());
-        }
-        map.as_mut().unwrap().insert(scheme.to_string(), service);
-        Ok(())
     }
 }

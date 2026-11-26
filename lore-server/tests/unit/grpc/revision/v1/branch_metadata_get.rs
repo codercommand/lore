@@ -11,8 +11,11 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::revision::v1::branch_metadata_get::*;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
@@ -42,6 +45,7 @@ async fn returns_metadata_hash_for_existing_branch() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
 
         let write_token = get_write_token();
@@ -88,6 +92,7 @@ async fn returns_metadata_hash_for_deleted_branch() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
         let write_token = get_write_token();
         branch::create(
@@ -118,13 +123,15 @@ async fn returns_metadata_hash_for_deleted_branch() {
             .expect("serialize state");
         let main_latest = branch_push::push(
             repository.clone(),
+            None,
             main_id,
             state_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("seed main latest")

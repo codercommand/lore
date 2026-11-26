@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
 use lore::branch::LoreBranchMetadataClearArgs;
@@ -22,7 +22,10 @@ use lore::interface::LoreBranchLatestListArgs;
 use lore::interface::LoreBranchListArgs;
 use lore::interface::LoreBranchLocation;
 use lore::interface::LoreBranchMergeAbortArgs;
+use lore::interface::LoreBranchMergeConflictsListArgs;
 use lore::interface::LoreBranchMergeIntoArgs;
+use lore::interface::LoreBranchMergeLinkPinConflictEventData;
+use lore::interface::LoreBranchMergeLinkPinResolvedEventData;
 use lore::interface::LoreBranchMergeResolveArgs;
 use lore::interface::LoreBranchMergeResolveMineArgs;
 use lore::interface::LoreBranchMergeResolveTheirsArgs;
@@ -36,6 +39,7 @@ use lore::interface::LoreBranchSwitchArgs;
 use lore::interface::LoreBranchUnprotectArgs;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
+use lore::interface::LoreLinkPinResolution;
 use lore::interface::LoreMetadataType;
 use lore::interface::LoreString;
 use lore::interface::Partition;
@@ -111,7 +115,7 @@ pub struct BranchSwitchArgs {
     #[clap(long, action)]
     reset: bool,
 
-    /// Only update anchor tracking without modifying or verifying files, useful for bare repositories
+    /// Only update anchor tracking without modifying or verifying files, useful for bare repositories. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long, action)]
     bare: bool,
 }
@@ -161,6 +165,10 @@ pub struct BranchMergeArgs {
     /// to the merge itself. Carries nothing when not given.
     #[clap(long = "inherit-metadata", value_name = "KEY")]
     inherit_metadata: Vec<String>,
+
+    /// Per-link auto commit message. Takes two values: <path> <message>. Can be specified multiple times.
+    #[clap(long = "link-message", num_args = 2, value_names = ["PATH", "MESSAGE"])]
+    link_messages: Vec<String>,
 }
 
 #[derive(Args)]
@@ -194,6 +202,15 @@ pub struct BranchMergeStartArgs {
     /// to the merge itself. Carries nothing when not given.
     #[clap(long = "inherit-metadata", value_name = "KEY")]
     inherit_metadata: Vec<String>,
+
+    /// Per-link auto commit message. Takes two values: <path> <message>. Can be specified multiple times.
+    #[clap(
+        long = "link-message",
+        num_args = 2,
+        value_names = ["PATH", "MESSAGE"],
+        conflicts_with = "ignore_links"
+    )]
+    link_messages: Vec<String>,
 }
 
 #[derive(Args)]
@@ -376,6 +393,21 @@ pub enum BranchMergeCommands {
 
     /// Abort a merge process
     Abort(BranchMergeAbortArgs),
+
+    /// Conflicts held by the merge in progress
+    Conflicts(BranchMergeConflictsArgs),
+}
+
+#[derive(Args)]
+pub struct BranchMergeConflictsArgs {
+    #[command(subcommand)]
+    subcommand: BranchMergeConflictsCommands,
+}
+
+#[derive(Subcommand)]
+pub enum BranchMergeConflictsCommands {
+    /// List every conflict the merge still holds
+    List,
 }
 
 #[derive(Args)]
@@ -403,7 +435,7 @@ pub struct BranchResetArgs {
 
 #[derive(Subcommand)]
 pub enum BranchCommands {
-    /// List available branches
+    /// List the local branches, or the remote's branches with `--remote`
     List(BranchListArgs),
 
     /// Get info about the given branch
@@ -569,10 +601,22 @@ fn handle_branch_create(globals: LoreGlobalArgs, args: &BranchCreateArgs) -> u8 
         id,
     };
 
+    let dry_run = globals.dry_run();
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::BranchCreate(data) => {
-                if data.is_commit == 0 {
+                if dry_run {
+                    println!(
+                        "{}Would create branch{} {}{}{} at revision {}",
+                        CommonStyles::SUCCESS,
+                        anstyle::Reset,
+                        BranchStyles::CURRENT_BRANCH,
+                        data.name.as_str(),
+                        anstyle::Reset,
+                        data.latest,
+                    );
+                } else if data.is_commit == 0 {
                     println!(
                         "{}Created branch{} {}{}{} at revision {}",
                         CommonStyles::SUCCESS,
@@ -713,9 +757,7 @@ fn handle_branch_info(globals: LoreGlobalArgs, args: &BranchInfoArgs) -> u8 {
             );
         }
 
-        if let Some(created) =
-            DateTime::from_timestamp_millis(data.created as i64).map(|time| time.to_rfc2822())
-        {
+        if let Some(created) = util::rfc2822_display(data.created) {
             println!(
                 "  {}Created:{} {created}",
                 CommonStyles::HEADERS,
@@ -795,8 +837,47 @@ fn handle_branch_switch(globals: LoreGlobalArgs, args: &BranchSwitchArgs) -> u8 
     return run_command(globals, switch_args.into(), callback) as u8;
 }
 
+/// The fragments one branch of a push has registered, of the revisions it finished and of the
+/// one in flight.
+#[derive(Default)]
+struct FragmentProgress {
+    finished: u64,
+    finished_count: u64,
+    complete: u64,
+    count: u64,
+}
+
+impl FragmentProgress {
+    fn begin(&mut self, count: u64) {
+        self.complete = 0;
+        self.count = count;
+    }
+
+    fn progress(&mut self, complete: u64, count: u64) {
+        self.complete = complete;
+        self.count = count;
+    }
+
+    fn end(&mut self) {
+        self.finished += self.complete;
+        self.finished_count += self.count;
+        self.begin(0);
+    }
+
+    fn complete(&self) -> u64 {
+        self.finished + self.complete
+    }
+
+    fn count(&self) -> u64 {
+        self.finished_count + self.count
+    }
+}
+
 pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 {
     let response_message = Arc::new(Mutex::new(String::new()));
+    // Reported once the push succeeds: a push that finds the remote past its revision can still
+    // fail as diverged.
+    let remote_moved_forward = Arc::new(Mutex::new(false));
 
     // The push events identify a branch by ID, so keep the names reported by the
     // `BranchPush` event of every branch the cascade visits — it precedes that
@@ -821,6 +902,19 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
 
     let debug = progress_debug();
     let progress_bar = ProgressBar::new(0);
+    // Branches push at once, so the bar shows the fragments of every branch together.
+    let fragments = Mutex::new(BTreeMap::<(Partition, Context), FragmentProgress>::new());
+    let show_fragments = move |update: &dyn Fn(&mut FragmentProgress), repository, branch| {
+        let mut fragments = fragments.lock();
+        update(fragments.entry((repository, branch)).or_default());
+        let (complete, count) = fragments
+            .values()
+            .fold((0, 0), |(complete, count), branch| {
+                (complete + branch.complete(), count + branch.count())
+            });
+        progress_bar.set_max_progress(count);
+        progress_bar.set_progress(complete);
+    };
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -837,8 +931,13 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                     if data.flag_link == 0 && data.flag_layer == 0 {
                         println!("Revision is already pushed and at remote latest");
                     }
-                } else if data.local_history == 0 && main_branch_prints {
-                    println!("Revision is already pushed and remote has moved forward");
+                } else if data.local_history == 0
+                    && !data.remote_revision.is_zero()
+                    && globals.force == 0
+                {
+                    if data.flag_link == 0 && data.flag_layer == 0 {
+                        *remote_moved_forward.lock() = true;
+                    }
                 } else if data.remote_history == 0 && main_branch_prints {
                     println!(
                         "Local branch is {} revision(s) ahead of remote, pushing all revisions",
@@ -866,7 +965,11 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                 if data.fragments > 0 {
                     println!("Pushing {} fragment(s)", data.fragments);
                 }
-                progress_bar.set_max_progress(data.fragments);
+                show_fragments(
+                    &|branch| branch.begin(data.fragments),
+                    data.repository,
+                    data.branch,
+                );
             }
             LoreEvent::BranchPushFragmentProgress(data) => {
                 if debug {
@@ -878,11 +981,15 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                         format_bytes_to_string(data.bytes_total)
                     );
                 }
-                progress_bar.set_max_progress(data.count);
-                progress_bar.set_progress(data.complete);
+                show_fragments(
+                    &|branch| branch.progress(data.complete, data.count),
+                    data.repository,
+                    data.branch,
+                );
             }
-            LoreEvent::BranchPushFragmentEnd(data)
-                if data.fragments > 0 => {
+            LoreEvent::BranchPushFragmentEnd(data) => {
+                show_fragments(&FragmentProgress::end, data.repository, data.branch);
+                if data.fragments > 0 {
                     if data.bytes_transferred > 0 {
                         println!(
                             "Pushed {} fragment(s), {}",
@@ -893,6 +1000,7 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                         println!("Pushed {} fragment(s)", data.fragments);
                     }
                 }
+            }
             LoreEvent::BranchPushStats(data) => {
                 stats_display::print_push_totals(data);
             }
@@ -944,6 +1052,9 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
             }
             LoreEvent::Complete(data)
                 if data.status == 0 => {
+                    if *remote_moved_forward.lock() {
+                        println!("Revision is already pushed and remote has moved forward");
+                    }
                     let message = response_message.lock();
                     if !message.is_empty() {
                         println!("{}", *message);
@@ -1079,10 +1190,13 @@ fn handle_branch_merge_into(globals: LoreGlobalArgs, args: &BranchMergeIntoArgs)
 }
 
 fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArgs) -> u8 {
+    let (link_paths, link_messages) = util::split_path_messages(&args.link_messages);
     let merge_start_args = LoreBranchMergeStartArgs {
         branch: LoreString::from(&args.branch),
         message: LoreString::from(&args.message),
         no_commit: args.no_commit as u8,
+        link_paths: LoreArray::from_vec(link_paths),
+        link_messages: LoreArray::from_vec(link_messages),
         link: LoreString::from(&args.link),
         ignore_links: args.ignore_links as u8,
         inherit_metadata: LoreArray::from_vec(util::convert_to_lore_string_vec(
@@ -1094,10 +1208,13 @@ fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArg
     let progress_bar = ProgressBar::new(0);
 
     let display_path = util::cwd_relativizer(&globals);
+    let link_conflicts = LinkPinConflicts::default();
+    let seen_link_conflicts = link_conflicts.clone();
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::BranchMergeStartBegin(_data) => {}
+            LoreEvent::BranchMergeLinkPinConflict(data) => seen_link_conflicts.push(data),
             LoreEvent::RevisionSyncProgress(data) => {
                 apply_sync_progress_to_bar(&progress_bar, data);
                 if debug {
@@ -1138,7 +1255,9 @@ fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArg
             .with_defaults(),
     ));
 
-    return run_command(globals, merge_start_args.into(), callback) as u8;
+    let status = run_command(globals.clone(), merge_start_args.into(), callback) as u8;
+    link_conflicts.print_any(globals);
+    status
 }
 
 fn handle_branch_merge_resolve(globals: LoreGlobalArgs, args: &BranchMergeResolveArgs) -> u8 {
@@ -1170,34 +1289,19 @@ fn handle_branch_merge_resolve_impl(
 
     let merge_resolve_args = LoreBranchMergeResolveArgs { paths };
 
-    let count_atomic = AtomicU64::default();
+    let resolved = ResolvedConflicts::default();
     let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::BranchMergeResolveFile(data) => {
-                let count = count_atomic.load(Ordering::Relaxed);
-                if count == 0 {
-                    println!(
-                        "{}Resolved conflicts:{}",
-                        CommonStyles::HEADERS,
-                        anstyle::Reset
-                    );
-                }
-                println!(
-                    "{}{}{}",
-                    CommonStyles::SUCCESS,
-                    display_path(data.path.as_str()),
-                    anstyle::Reset
-                );
-
-                count_atomic.fetch_add(1, Ordering::Relaxed);
+                resolved.print(&display_path(data.path.as_str()));
             }
-            LoreEvent::Complete(_) => {
-                let count = count_atomic.load(Ordering::Relaxed);
-                if count == 0 {
-                    println!("No conflicts resolved");
-                }
+            LoreEvent::BranchMergeLinkPinResolved(data) => {
+                resolved.print_link(data, &display_path(data.link_path.as_str()));
+            }
+            LoreEvent::Complete(data) if data.status == 0 && !resolved.any() => {
+                println!("No conflicts resolved");
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -1218,8 +1322,14 @@ fn handle_branch_merge_resolve_mine(
 
     let merge_resolve_mine_args = LoreBranchMergeResolveMineArgs { paths };
 
+    let resolved = ResolvedConflicts::default();
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::BranchMergeLinkPinResolved(data) => {
+                resolved.print_link(data, &display_path(data.link_path.as_str()));
+            }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -1240,8 +1350,14 @@ fn handle_branch_merge_resolve_theirs(
 
     let merge_resolve_theirs_args = LoreBranchMergeResolveTheirsArgs { paths };
 
+    let resolved = ResolvedConflicts::default();
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::BranchMergeLinkPinResolved(data) => {
+                resolved.print_link(data, &display_path(data.link_path.as_str()));
+            }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -1322,6 +1438,7 @@ pub fn handle_branch_merge(globals: LoreGlobalArgs, args: &BranchMergeArgs) -> u
             link: None,
             ignore_links: false,
             inherit_metadata: args.inherit_metadata.clone(),
+            link_messages: args.link_messages.clone(),
         };
 
         return handle_branch_merge_start(globals, &sub_args);
@@ -1348,6 +1465,181 @@ pub fn handle_branch_merge(globals: LoreGlobalArgs, args: &BranchMergeArgs) -> u
         BranchMergeCommands::Resolve(sub_args) => {
             return handle_branch_merge_resolve(globals, sub_args);
         }
+        BranchMergeCommands::Conflicts(sub_args) => {
+            return handle_branch_merge_conflicts(globals, sub_args);
+        }
+    }
+}
+
+fn handle_branch_merge_conflicts(globals: LoreGlobalArgs, args: &BranchMergeConflictsArgs) -> u8 {
+    match args.subcommand {
+        BranchMergeConflictsCommands::List => handle_branch_merge_conflicts_list(globals),
+    }
+}
+
+fn handle_branch_merge_conflicts_list(globals: LoreGlobalArgs) -> u8 {
+    let files: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let links = LinkPinConflicts::default();
+    let (seen_files, seen_links) = (files.clone(), links.clone());
+
+    let formatter = output_formatter();
+    let formatted = formatter.is_some();
+    let callback = formatter.unwrap_or(Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::BranchMergeConflictFile(data) => {
+                seen_files.lock().push(data.path.to_string());
+            }
+            LoreEvent::BranchMergeLinkPinConflict(data) => seen_links.push(data),
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    ));
+
+    let status = run_command(
+        globals.clone(),
+        LoreBranchMergeConflictsListArgs {}.into(),
+        callback,
+    ) as u8;
+    if status != 0 || formatted {
+        return status;
+    }
+
+    let files = files.lock();
+    if !files.is_empty() {
+        println!(
+            "{}Files in conflict:{}",
+            CommonStyles::HEADERS,
+            anstyle::Reset
+        );
+        let display_path = util::cwd_relativizer(&globals);
+        for path in files.iter() {
+            println!(
+                "{}{}{}",
+                BranchStyles::CONFLICT,
+                display_path(path.as_str()),
+                anstyle::Reset
+            );
+        }
+    }
+
+    if !links.print_any(globals) && files.is_empty() {
+        println!("No conflicts");
+    }
+
+    status
+}
+
+/// Link pin conflicts render after the command returns: naming a branch runs a
+/// sub-command, which cannot be driven from inside the callback's runtime thread.
+#[derive(Clone, Default)]
+struct LinkPinConflicts(Arc<Mutex<Vec<LoreBranchMergeLinkPinConflictEventData>>>);
+
+impl LinkPinConflicts {
+    fn push(&self, data: &LoreBranchMergeLinkPinConflictEventData) {
+        self.0.lock().push(data.clone());
+    }
+
+    fn print_any(&self, globals: LoreGlobalArgs) -> bool {
+        let conflicts = self.0.lock();
+        if conflicts.is_empty() {
+            return false;
+        }
+
+        println!(
+            "{}Linked repositories in conflict:{}",
+            CommonStyles::HEADERS,
+            anstyle::Reset
+        );
+        let display_path = util::cwd_relativizer(&globals);
+        let mut branches = util::BranchNameResolver::new(globals);
+        for data in conflicts.iter() {
+            print_link_pin_conflict(data, &display_path(data.link_path.as_str()), &mut branches);
+        }
+        true
+    }
+}
+
+#[derive(Default)]
+struct ResolvedConflicts(AtomicBool);
+
+impl ResolvedConflicts {
+    fn print(&self, path: &str) {
+        if !self.0.swap(true, Ordering::Relaxed) {
+            println!(
+                "{}Resolved conflicts:{}",
+                CommonStyles::HEADERS,
+                anstyle::Reset
+            );
+        }
+        println!("{}{}{}", CommonStyles::SUCCESS, path, anstyle::Reset);
+    }
+
+    fn print_link(&self, data: &LoreBranchMergeLinkPinResolvedEventData, display_path: &str) {
+        let side = match data.resolution {
+            LoreLinkPinResolution::Mine => "mine",
+            LoreLinkPinResolution::Theirs => "theirs",
+        };
+        self.print(&format!("{display_path} ({side})"));
+    }
+
+    fn any(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+fn link_pin_conflict_kind(data: &LoreBranchMergeLinkPinConflictEventData) -> &'static str {
+    let mounts_read = !data.mine.source_path.is_empty() && !data.theirs.source_path.is_empty();
+    if mounts_read && data.mine.source_path != data.theirs.source_path {
+        "mount change"
+    } else if data.mine.branch != data.theirs.branch {
+        "branch change"
+    } else if data.mine.flags != data.theirs.flags {
+        "flag change"
+    } else {
+        "revision divergence"
+    }
+}
+
+/// Only the attributes that differ, and each side's message, so the output carries the decision
+/// rather than the whole row twice.
+fn print_link_pin_conflict(
+    data: &LoreBranchMergeLinkPinConflictEventData,
+    display_path: &str,
+    branches: &mut util::BranchNameResolver,
+) {
+    let link_path = data.link_path.as_str();
+    println!(
+        "\n- Link conflict: {} ({})",
+        display_path,
+        link_pin_conflict_kind(data)
+    );
+
+    for (label, side, other) in [
+        ("Mine", &data.mine, &data.theirs),
+        ("Theirs", &data.theirs, &data.mine),
+    ] {
+        println!("    {}:", label);
+        if side.branch != other.branch {
+            println!("      Branch: {}", branches.name(side.branch, link_path));
+        }
+        if side.flags != other.flags {
+            println!(
+                "      Flags: {}",
+                super::link::format_link_flags(side.flags)
+            );
+        }
+        if side.source_path != other.source_path {
+            println!("      Source path: {}", side.source_path);
+        }
+        if side.revision != other.revision {
+            println!("      Revision: {}", side.revision);
+        }
+        if !side.message.as_str().is_empty() {
+            println!("      Message: {}", side.message);
+        }
     }
 }
 
@@ -1357,14 +1649,9 @@ pub fn handle_branch_list(globals: LoreGlobalArgs, args: &BranchListArgs) -> u8 
     };
 
     let archived_section = std::sync::atomic::AtomicBool::new(false);
-    let remote_seen = std::sync::atomic::AtomicBool::new(false);
-    let warn_on_missing_remote = !globals.local() && !globals.remote() && !globals.offline();
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::BranchListBegin(data) => {
-                if data.location == LoreBranchLocation::Remote {
-                    remote_seen.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
                 if data.location == LoreBranchLocation::Local
                     && archived_section.load(std::sync::atomic::Ordering::Relaxed)
                 {
@@ -1412,16 +1699,6 @@ pub fn handle_branch_list(globals: LoreGlobalArgs, args: &BranchListArgs) -> u8 
                         LoreBranchLocation::Remote => println!("No remote branches found"),
                     }
                 }
-            }
-            LoreEvent::Complete(_)
-                if warn_on_missing_remote
-                    && !remote_seen.load(std::sync::atomic::Ordering::Relaxed) =>
-            {
-                println!(
-                    "{}Warning: Could not query remote branch list{}",
-                    LogStyles::WARNING,
-                    anstyle::Reset,
-                );
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -1728,8 +2005,7 @@ pub fn handle_branch_metadata_clear(globals: LoreGlobalArgs, args: &BranchMetada
     let keys: Vec<LoreString> = args
         .keys
         .as_ref()
-        .map(|k| k.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|k| k.iter().map(|s| LoreString::from(s.as_str())).collect());
 
     let clear_args = LoreBranchMetadataClearArgs {
         branch: resolve_branch_arg(&args.branch),

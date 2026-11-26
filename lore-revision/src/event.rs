@@ -4,8 +4,10 @@
 #![allow(unused_parens)]
 
 pub mod metadata;
+pub mod revision_graph;
 pub mod revision_tree;
 
+use lore_macro::PositionBitcode;
 use lore_macro::VariantTypeSize;
 use serde::Serialize;
 
@@ -81,6 +83,13 @@ use crate::dependency::LoreFileDependencyListFileEventData;
 use crate::dependency::LoreFileDependencyRemoveBeginEventData;
 use crate::dependency::LoreFileDependencyRemoveEndEventData;
 use crate::dependency::LoreFileDependencyRemoveEntryEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchPushedEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchSyncedEventData;
+use crate::event::revision_graph::LoreRevisionGraphInstanceEventData;
+use crate::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
+use crate::event::revision_graph::LoreRevisionGraphRevisionEventData;
 use crate::event::revision_tree::LoreRevisionTreeAddCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeChildEventData;
@@ -98,6 +107,7 @@ use crate::event::revision_tree::LoreRevisionTreeMoveCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
 use crate::event::revision_tree::LoreRevisionTreeNodePathEventData;
 use crate::event::revision_tree::LoreRevisionTreeResolvePathCompleteEventData;
+use crate::file::audit::LoreFileAuditEventData;
 use crate::file::diff::LoreFileDiffEventData;
 use crate::file::dump::LoreFileDumpEventData;
 use crate::file::hash::LoreFileHashEventData;
@@ -118,7 +128,15 @@ use crate::filter::LoreFilterExcludeEventData;
 use crate::find::LoreRevisionFindEventData;
 use crate::immutable::LoreFragmentWriteEventData;
 use crate::instance::LoreBranchMultipleInstanceEventData;
+use crate::instance::LoreRepositoryInstanceCloneBeginEventData;
+use crate::instance::LoreRepositoryInstanceCloneCompleteEventData;
+use crate::instance::LoreRepositoryInstanceCloneProgressEventData;
+use crate::instance::LoreRepositoryInstanceDeleteBeginEventData;
+use crate::instance::LoreRepositoryInstanceDeleteCompleteEventData;
+use crate::instance::LoreRepositoryInstanceDeleteProgressEventData;
 use crate::instance::LoreRepositoryInstanceEventData;
+use crate::instance::LoreRepositoryInstanceMoveBeginEventData;
+use crate::instance::LoreRepositoryInstanceMoveCompleteEventData;
 use crate::interface::LoreArray;
 use crate::interface::LoreBinary;
 use crate::interface::LoreError;
@@ -241,6 +259,7 @@ use crate::store::event::LoreStorageMutableStoreItemCompleteEventData;
 use crate::store::event::LoreStorageObliterateItemCompleteEventData;
 use crate::store::event::LoreStorageOpenedEventData;
 use crate::store::event::LoreStoragePutItemCompleteEventData;
+use crate::store::event::LoreStoragePutStatsEventData;
 use crate::store::event::LoreStorageUploadItemCompleteEventData;
 
 pub fn convert_event_callback(callback: LoreEventCallbackConfig) -> LoreEventCallback {
@@ -271,7 +290,7 @@ pub trait EventError: std::fmt::Display {
 /// Data for a generic progress event.
 // TODO(vri): Implement with a union to enable command-specific progress events
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreProgressEventData {
     /// Placeholder field; carries no meaningful value.
@@ -282,7 +301,16 @@ pub struct LoreProgressEventData {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// Staged change to a link itself, as opposed to content inside it.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreLinkStagedState {
     /// The link carries no staged change.
@@ -299,7 +327,7 @@ pub enum LoreLinkStagedState {
 /// branch identifier rather than its name; a consumer that wants the name
 /// resolves it, so listing links costs no branch metadata reads.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkEntryEventData {
     /// Identifier of the repository the link points to.
@@ -327,7 +355,7 @@ pub struct LoreLinkEntryEventData {
 /// Data for an event describing a single link in detail: everything `LinkEntry`
 /// reports, plus the state only `link info` gathers.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkInfoEventData {
     /// The link as `LinkEntry` reports it.
@@ -402,9 +430,10 @@ impl serde::Serialize for LoreBytes {
 /// A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
 /// value says, as does a length no allocation can have.
 ///
-/// The memory must stay valid, and reach nobody else, for the duration of the call it is passed to.
-/// The buffers supplied by the items of one call must not overlap: the items run alongside each
-/// other, so two covering the same byte would write it at once.
+/// The memory must stay valid, and reach nobody else, until the call it is passed to completes: a
+/// synchronous call returns, and an asynchronous one delivers `END`. The buffers supplied by the
+/// items of one call must not overlap: the items run alongside each other, so two covering the same
+/// byte would write it at once.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct LoreBytesMut {
@@ -458,7 +487,7 @@ impl core::fmt::Debug for LoreBytesMut {
 /// Small discriminator enum for the per-item terminal events of the revision-tree API.
 ///
 /// Narrower than the general library error code: an event embeds this so a caller can branch on
-/// the common cases cheaply, without reading a message. The cost is that it names only five
+/// the common cases cheaply, without reading a message. The cost is that it names only six
 /// outcomes, so errors outside them arrive as `Internal`. The storage API carries a full
 /// [`LoreErrorDetail`] on its per-item events instead, and no longer uses this enum.
 ///
@@ -471,7 +500,16 @@ impl core::fmt::Debug for LoreBytesMut {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 #[derive(
-    Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub enum LoreErrorCode {
     /// No error; the operation succeeded.
@@ -485,6 +523,8 @@ pub enum LoreErrorCode {
     Internal = -1,
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 31,
+    /// A size bound refused the operation, such as a name over its length bound.
+    Oversized = 118,
 }
 
 // cbindgen cannot evaluate a const in a discriminant position — it drops the
@@ -498,10 +538,11 @@ const _: () =
 const _: () = assert!(LoreErrorCode::SlowDown as i32 == lore_base::error::SlowDown::FFI_CODE);
 const _: () =
     assert!(LoreErrorCode::AddressNotFound as i32 == lore_base::error::AddressNotFound::FFI_CODE);
+const _: () = assert!(LoreErrorCode::Oversized as i32 == lore_base::error::Oversized::FFI_CODE);
 
 /// Data for an error event.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreErrorEventData {
     /// The error code, matching one of the error codes.
@@ -521,7 +562,7 @@ impl LoreErrorEventData {
 
 /// Data for a completion event, marking the end of an operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompleteEventData {
     /// The completion status code of the operation.
@@ -533,7 +574,7 @@ pub struct LoreCompleteEventData {
 
 /// Data for a metadata event, carrying a single key and value.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataEventData {
     /// The metadata key.
@@ -559,11 +600,19 @@ impl LoreMetadataEventData {
 
         Ok(LoreMetadataEventData { key, value })
     }
+
+    /// The entry stored with `key` and `value` under `value_type`, as an event carries it. `None`
+    /// where `key` isn't UTF-8 or `value` doesn't decode as `value_type`.
+    pub fn from_stored(key: &[u8], value: &[u8], value_type: MetadataType) -> Option<Self> {
+        Self::new(std::str::from_utf8(key).ok()?, value, value_type).ok()
+    }
 }
 
 /// Data for a log event.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLogEventData {
     /// The severity level of the log message.
@@ -580,7 +629,16 @@ pub struct LoreLogEventData {
 
 /// Data for an end event, marking the final event of a callback stream.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Default,
+    PartialEq,
+    Debug,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEndEventData {
     /// Placeholder field; carries no meaningful value.
@@ -589,7 +647,7 @@ pub struct LoreEndEventData {
 
 /// Data for a maintenance event, carrying an informational message.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMaintenanceEventData {
     /// The maintenance message text.
@@ -609,7 +667,9 @@ pub struct LoreMaintenanceEventData {
 /// event. A consumer that keeps any of this data must copy it out before the
 /// callback returns.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreTraceLocation {
     /// The source file path.
@@ -668,7 +728,9 @@ impl std::fmt::Display for LoreTraceLocation {
 ///
 /// [`MAX_TRACE_DEPTH`]: lore_error_set::MAX_TRACE_DEPTH
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreErrorDetail {
     /// The error's error code. `0` on success; `-1` for an internal error.
@@ -731,22 +793,23 @@ impl LoreErrorDetail {
         }
     }
 
-    /// Builds the detail for a command result: the empty success detail on
-    /// `Ok`, the populated detail (read from the error's own trace) on `Err`.
-    pub fn from_result<T, E>(result: Result<T, E>) -> Self
+    /// Builds the detail for `result`: the empty success detail on `Ok`, the
+    /// populated detail (read from the error's own trace) on `Err`. The success
+    /// detail allocates nothing.
+    pub fn from_result<T, E>(result: &Result<T, E>) -> Self
     where
         E: lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
     {
         match result {
             Ok(_) => Self::default(),
-            Err(err) => Self::from_error(&err),
+            Err(err) => Self::from_error(err),
         }
     }
 }
 
 /// Data for the start of a store eviction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEvictionBeginEventData {
     /// Fragment capacity the pass is reducing the store toward.
@@ -755,7 +818,7 @@ pub struct LoreEvictionBeginEventData {
 
 /// Data for one bucket evicted during a store eviction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEvictionProgressEventData {
     /// Fragments evicted from this bucket.
@@ -764,7 +827,7 @@ pub struct LoreEvictionProgressEventData {
 
 /// Data for the end of a store eviction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreEvictionEndEventData {
     /// Total fragments evicted across the pass.
@@ -773,7 +836,7 @@ pub struct LoreEvictionEndEventData {
 
 /// Data for the start of a store compaction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompactionBeginEventData {
     /// Store size in bytes the pass is reducing the store toward.
@@ -782,7 +845,7 @@ pub struct LoreCompactionBeginEventData {
 
 /// Data for one group compacted during a store compaction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompactionProgressEventData {
     /// Bytes reclaimed from this group.
@@ -791,7 +854,7 @@ pub struct LoreCompactionProgressEventData {
 
 /// Data for the end of a store compaction pass.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCompactionEndEventData {
     /// Total bytes reclaimed across the pass.
@@ -801,7 +864,7 @@ pub struct LoreCompactionEndEventData {
 /// Data for the service status event, reporting whether the service is running
 /// and its current metadata.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreServiceStatusEventData {
     /// Whether the service is running: 1 for running, 0 for not running.
@@ -814,11 +877,67 @@ pub struct LoreServiceStatusEventData {
     pub connection_count: u32,
     /// Number of SWFS mounts currently active.
     pub swfs_mount_count: u32,
+    /// The path of the caller's external root, empty where its setting can't be read or there is
+    /// no global data directory. Reported whether or not the service is running.
+    pub external_root: LoreString,
+    /// Whether the external root can be used. Reported whether or not the service is running.
+    pub external_root_state: LoreExternalRootState,
+    /// The number of old external directory roots listed to be removed, 0 where the list can't be
+    /// read. Reported whether or not the service is running.
+    pub external_leftovers: u32,
+    /// Whether the service runs inside a program that doesn't serve from its own executable, as the
+    /// Lore CLI does: 1 if so, else 0.
+    pub embedded: u8,
+    /// The canonical path of each global data directory the service mounts virtual instances
+    /// for.
+    pub mounted_global_data_directories: LoreArray<LoreString>,
+    /// The path of each virtual instance the service mounts.
+    pub mounted_paths: LoreArray<LoreString>,
+    /// The service's process ID.
+    pub process_id: u32,
+}
+
+/// Whether the external root of a global data directory can be used.
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreExternalRootState {
+    /// The root can be used.
+    #[default]
+    Available = 0,
+    /// The root can't be used.
+    Unavailable = 1,
+    /// A move of the root is under way, or was interrupted.
+    Interrupted = 2,
+}
+
+impl From<&crate::global::external_dir::resolve::Availability> for LoreExternalRootState {
+    fn from(availability: &crate::global::external_dir::resolve::Availability) -> Self {
+        use crate::global::external_dir::resolve::Availability;
+        match availability {
+            Availability::Available(_) => LoreExternalRootState::Available,
+            Availability::Unavailable(_) => LoreExternalRootState::Unavailable,
+            Availability::Interrupted => LoreExternalRootState::Interrupted,
+        }
+    }
 }
 
 /// Data for a service log message captured outside command execution.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreServiceMessageEventData {
     /// The severity level of the log message.
@@ -831,8 +950,12 @@ pub struct LoreServiceMessageEventData {
 /// cbindgen:rename-all=ScreamingSnakeCase
 /// An event delivered to a callback. Each variant names a kind of event and
 /// carries the data for that event.
+///
+/// A new variant goes last, so that every other variant keeps its value, and
+/// its encoding in the messages of the Lore service, which name an event by
+/// its position in this list.
 #[repr(C, u32)]
-#[derive(Clone, PartialEq, Serialize, VariantTypeSize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, VariantTypeSize, PositionBitcode)]
 #[serde(tag = "tagName", content = "data", rename_all = "camelCase")]
 pub enum LoreEvent {
     // Standard events
@@ -1318,6 +1441,44 @@ pub enum LoreEvent {
     AuthPending(LoreAuthPendingEventData),
     /// One leaf fragment and its payload for a get-resolved item.
     StorageGetFragment(LoreStorageGetFragmentEventData),
+    /// One range of a file's lines, attributed to the revision that last changed them.
+    FileAudit(LoreFileAuditEventData),
+    /// The start of an instance delete operation.
+    RepositoryInstanceDeleteBegin(LoreRepositoryInstanceDeleteBeginEventData),
+    /// Progress during an instance delete operation.
+    RepositoryInstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData),
+    /// The completion of an instance delete operation.
+    RepositoryInstanceDeleteComplete(LoreRepositoryInstanceDeleteCompleteEventData),
+    /// The start of an instance move operation.
+    RepositoryInstanceMoveBegin(LoreRepositoryInstanceMoveBeginEventData),
+    /// The completion of an instance move operation.
+    RepositoryInstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData),
+    /// The start of an instance clone operation.
+    RepositoryInstanceCloneBegin(LoreRepositoryInstanceCloneBeginEventData),
+    /// Progress during an instance clone operation.
+    RepositoryInstanceCloneProgress(LoreRepositoryInstanceCloneProgressEventData),
+    /// The completion of an instance clone operation.
+    RepositoryInstanceCloneComplete(LoreRepositoryInstanceCloneCompleteEventData),
+    /// One branch, as one location holds it.
+    RevisionGraphBranch(LoreRevisionGraphBranchEventData),
+    /// One repository instance on a branch, as the local store records it.
+    RevisionGraphInstance(LoreRevisionGraphInstanceEventData),
+    /// One revision, as one location resolves it.
+    RevisionGraphRevision(LoreRevisionGraphRevisionEventData),
+    /// A revision graph call's outcome at one location.
+    RevisionGraphLocationComplete(LoreRevisionGraphLocationCompleteEventData),
+    /// One metadata entry of a branch, as one location holds it.
+    RevisionGraphBranchMetadata(LoreRevisionGraphBranchMetadataEventData),
+    /// A branch sync's outcome.
+    RevisionGraphBranchSynced(LoreRevisionGraphBranchSyncedEventData),
+    /// A link row both branches changed, which the merge holds open.
+    BranchMergeLinkPinConflict(crate::branch::merge::LoreBranchMergeLinkPinConflictEventData),
+    /// A divergent link row was settled to one side.
+    BranchMergeLinkPinResolved(crate::branch::merge::LoreBranchMergeLinkPinResolvedEventData),
+    /// What one storage put or upload call cost.
+    StoragePutStats(LoreStoragePutStatsEventData),
+    /// A branch push's outcome.
+    RevisionGraphBranchPushed(LoreRevisionGraphBranchPushedEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

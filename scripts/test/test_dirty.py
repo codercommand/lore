@@ -7,13 +7,18 @@ scan (--scan) setting dirty flags, and cross-operation sequences.
 All tests use --json structured output to validate event data.
 """
 
-import json
 import logging
 import os
+import shutil
 
 import pytest
-from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
-from test_utils import to_posix
+from lore_parsers import (
+    find_status_entry,
+    parse_jsonl,
+    parse_status_json,
+    parse_status_summary_json,
+)
+from test_utils import has_staged_anchor, to_posix
 
 from lore import Lore
 
@@ -52,31 +57,6 @@ def get_status_files_twice(repo: Lore, **kwargs) -> list[dict]:
         f"second: {second_fp}"
     )
     return second
-
-
-def find_status_entry(entries: list[dict], path: str) -> dict | None:
-    """Find a status entry by path (posix-normalized)."""
-    target = to_posix(path)
-    for entry in entries:
-        if to_posix(entry.get("path", "")) == target:
-            return entry
-    return None
-
-
-def has_staged_anchor(repo: Lore) -> bool:
-    """Check whether the repository has a staged revision."""
-    output = repo.status(json=True, offline=True)
-    zero_hash = "0" * 64
-    for line in output.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        data = event.get("data", {})
-        revision_staged = data.get("revisionStaged", "")
-        if revision_staged and revision_staged != zero_hash:
-            return True
-    return False
 
 
 # ===========================================================================
@@ -342,6 +322,7 @@ def test_dirty_move_scan_without_prior_status(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("marks a copy the working tree does not hold and reads it from a plain status, where a status on a virtual clone always scans, its provider's diff being exact")
 @pytest.mark.smoke
 def test_dirty_copy(new_lore_repo):
     """Mark a file as dirty-copied and verify status."""
@@ -406,7 +387,9 @@ def test_dirty_ignore_in_a_directory_that_does_not_exist(new_lore_repo):
 
     entries = get_status_files(repo)
     paths = sorted(entry.get("path") for entry in entries)
-    assert paths == ["base.txt"], f"Expected only the real change marked, got: {entries}"
+    assert paths == ["base.txt"], (
+        f"Expected only the real change marked, got: {entries}"
+    )
 
 
 # ===========================================================================
@@ -959,6 +942,7 @@ def test_stage_scan_stages_without_dirty(new_lore_repo):
     assert entry["flagStaged"] is True
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_stage_default_only_stages_dirty(new_lore_repo):
     """stage (default) only stages dirty-marked files, ignores unmarked changes."""
@@ -1211,6 +1195,27 @@ def test_dirty_add_in_new_directory(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_commit_of_a_directory_replacing_a_file_marked_deleted(new_lore_repo):
+    """A file replaced by a directory holding a file, the path marked dirty and staged by name,
+    commits as the directory with its file, after which status is clean."""
+    repo: Lore = new_lore_repo()
+    repo.write_files({"existing.txt": "base\n", "replaced.txt": "file\n"})
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    repo.remove_file("replaced.txt")
+    repo.make_dirs("replaced.txt")
+    repo.write_files({"replaced.txt/x.txt": b"below\n"})
+    repo.dirty("replaced.txt", offline=True)
+    repo.stage("replaced.txt", offline=True)
+    repo.commit(offline=True)
+
+    assert get_status_files(repo) == []
+    assert get_status_files_twice(repo, scan=True) == []
+    assert repo.file_info("replaced.txt/x.txt", offline=True)
+
+
+@pytest.mark.smoke
 def test_stage_named_nested_path_survives_commit(new_lore_repo):
     """staging a new file by name creates its ancestors, which the commit has to keep."""
     repo: Lore = new_lore_repo()
@@ -1277,6 +1282,7 @@ def test_dirty_ignored_path_skipped(new_lore_repo):
     assert entry is None, "file under ignored path should be skipped"
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_commit_excludes_dirty_only_node(new_lore_repo):
     """Dirty-only nodes must not change the committed revision.
@@ -1511,6 +1517,7 @@ def test_sync_with_stale_dirty_flag(new_lore_repo):
         assert f.read() == "v2 longer content\n"
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_status_reset_clears_tracked_state(new_lore_repo):
     """--reset drops the existing tracked state before computing status.
@@ -2474,14 +2481,16 @@ def remove_view_filter(repo: Lore) -> None:
         os.remove(view_path)
 
 
+@pytest.mark.own_vfs("reads the marks a dirty walk leaves through --check-dirty, which a status on a virtual clone replaces with a scan")
 @pytest.mark.smoke
 def test_dirty_delete_respects_view_filter(new_lore_repo):
     """A dirty-delete of a directory must not mark view-filtered descendants.
 
-    Regression guard for the carry-forward dirty recursion: a view pattern like
-    `/Templates/*` excludes the *contents* of `Templates` but not the directory
-    node itself, so `dirty Templates` would previously recurse the whole subtree
-    and mark every (filtered) child as a dirty-delete in the staged anchor.
+    Regression guard for the carry-forward dirty recursion: the view names
+    `Templates` with `!/Templates/` and excludes its *contents* with
+    `/Templates/*`, so the directory is in view while everything below it is
+    not, and `dirty Templates` must not recurse the subtree and mark every
+    (filtered) child as a dirty-delete in the staged anchor.
 
     The marking is hidden by the view (and a fresh scan would re-derive the
     on-disk deletion regardless), so it is observed with `--check-dirty` after
@@ -2504,8 +2513,8 @@ def test_dirty_delete_respects_view_filter(new_lore_repo):
     repo.stage(scan=True, offline=True)
     repo.commit(offline=True)
 
-    # View excludes the contents of Templates but not the Templates node itself.
-    write_view_filter(repo, ["/Templates/*"])
+    # View names Templates and excludes its contents.
+    write_view_filter(repo, ["!/Templates/", "/Templates/*"])
 
     # Remove the now-filtered subtree from disk and mark the directory dirty,
     # reproducing the phantom dirty-delete of a view-only directory. With it
@@ -2969,6 +2978,7 @@ def test_dirty_add_repeated_is_idempotent(new_lore_repo):
     check("second dirty, --check-dirty", check_dirty=True)
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_scan_answers_from_recorded_mtime_after_commit(new_lore_repo):
     """A commit reads and hashes every file it commits, and records the modified time it
@@ -2998,6 +3008,7 @@ def test_scan_answers_from_recorded_mtime_after_commit(new_lore_repo):
     assert summary["modifies"] == 0, summary
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_scan_hashes_a_same_size_edit(new_lore_repo):
     """An edit that keeps the file's size cannot be settled by the size comparison, so the
@@ -3034,6 +3045,7 @@ def test_scan_hashes_a_same_size_edit(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_scan_records_mtime_after_hash_check(new_lore_repo):
     """A file restored to its committed content has a new modified time, so the recorded
@@ -3075,3 +3087,172 @@ def test_scan_records_mtime_after_hash_check(new_lore_repo):
         f"the established match must be recorded, sparing the next scan, got {summary}"
     )
     assert summary["mtimeMatches"] == 2, summary
+
+
+def write_random_files(repo: Lore, prefix: str, count: int):
+    for index in range(count):
+        with repo.open_file(f"{prefix}{index}.bin", "w+b") as f:
+            f.write(os.urandom(4096))
+
+
+def assert_scan_answers_from_records(repo: Lore, file_count: int):
+    """A scan of `repo` hashes nothing: the instance's records answer for every file."""
+    summary = parse_status_summary_json(repo.status(scan=True, json=True, offline=True))
+    assert summary["hashChecks"] == 0, summary
+    assert summary["mtimeMatches"] >= file_count, summary
+    assert summary["modifies"] == 0, summary
+
+
+@pytest.mark.own_vfs("counts the hash checks and modified-time matches a scan of an ordinary working tree makes, where a virtual clone's status diffs by address")
+@pytest.mark.smoke
+def test_scan_answers_from_instance_records(new_lore_repo):
+    """The modified times a commit records live in the instance's own `.lore/records/`, so the
+    next scan answers from them.
+    """
+    repo: Lore = new_lore_repo()
+    file_count = 8
+    write_random_files(repo, "recorded", file_count)
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    assert_scan_answers_from_records(repo, file_count)
+    records = os.path.join(repo.dot_path(), "records")
+    shards = [name for name in os.listdir(records) if name != "no-store"]
+    assert shards, "the instance's records are written to its dot directory"
+    for shard in shards:
+        with open(os.path.join(records, shard), "rb") as f:
+            assert f.read(4) == b"LOMT", shard
+
+
+@pytest.mark.own_vfs("counts the hash checks and modified-time matches a scan of an ordinary working tree makes, where a virtual clone's status diffs by address")
+@pytest.mark.smoke
+def test_clone_and_sync_record_times_in_the_instance(new_lore_repo):
+    """A clone records the times of the files it writes in the new instance's records, and so
+    does a sync, so the scan after either hashes nothing.
+    """
+    repo: Lore = new_lore_repo()
+    file_count = 8
+    write_random_files(repo, "cloned", file_count)
+    repo.stage(scan=True, offline=True)
+    repo.commit("Seed", offline=True)
+    repo.push()
+
+    clone = repo.clone()
+    assert os.path.exists(os.path.join(clone.dot_path(), "records", "no-store"))
+    assert_scan_answers_from_records(clone, file_count)
+
+    write_random_files(repo, "cloned", file_count)
+    write_random_files(repo, "synced", file_count)
+    repo.stage(scan=True, offline=True)
+    repo.commit("Change", offline=True)
+    repo.push()
+
+    clone.sync()
+    assert_scan_answers_from_records(clone, 2 * file_count)
+
+
+@pytest.mark.own_vfs("copies an instance's directory, where a virtual clone keeps its .lore outside its mount")
+@pytest.mark.smoke
+def test_a_copied_instance_answers_from_the_records_it_carries(new_lore_repo, scratch_dir):
+    """A copy of an instance's directory that keeps modification times carries records that
+    describe its files, so its first scan hashes nothing.
+    """
+    repo: Lore = new_lore_repo()
+    file_count = 8
+    write_random_files(repo, "copied", file_count)
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    copy_path = scratch_dir("copy")
+    shutil.copytree(repo.path, copy_path, copy_function=shutil.copy2)
+    copy = Lore(
+        base_env=repo.base_env,
+        remote_path=repo.remote_path,
+        remote_url=repo.remote,
+        lore_executable_path=repo.lore_executable_path,
+        path=str(copy_path),
+        name=repo.name,
+        create_repo=False,
+        created_paths=repo.created_paths,
+        environment_vars=repo.environment_vars,
+    )
+    assert_scan_answers_from_records(copy, file_count)
+
+
+@pytest.mark.own_vfs("counts the hash checks and modified-time matches a scan of an ordinary working tree makes, where a virtual clone's status diffs by address")
+@pytest.mark.smoke
+def test_sync_drops_the_marker_of_a_path_it_rewrites_by_the_instance_records(new_lore_repo):
+    """A sync that rewrites a path a scan marked drops the marker against the time it recorded
+    in the instance's records, and the next scan answers from them.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Initial commit", {"rewritten.txt": "one\n", "kept.txt": "kept\n"})
+    clone = repo.clone()
+    assert os.path.exists(os.path.join(clone.dot_path(), "records", "no-store"))
+
+    clone.remove_file("rewritten.txt")
+    clone.status(scan=True)
+    assert _dirty_entries(clone) == [("rewritten.txt", "file", "delete")], (
+        "setup: the scan must mark the deletion"
+    )
+
+    repo.write_commit_push("Change", {"rewritten.txt": "two\n"})
+    clone.sync()
+
+    with clone.open_file("rewritten.txt", "r") as input_file:
+        assert input_file.read() == "two\n", "the sync must rewrite the file"
+    assert _dirty_entries(clone) == [], "the sync must drop the marker of what it rewrote"
+    assert_scan_answers_from_records(clone, 2)
+
+
+@pytest.mark.smoke
+def test_switch_drops_the_dirty_markers_of_what_it_restores(new_lore_repo):
+    """A switch that restores what a scan recorded as deleted leaves no marker on
+    it, and keeps the marker of each local change it leaves in place."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Initial commit",
+        {
+            "restored.txt": "one\n",
+            "edited.txt": "edited\n",
+            "folder/changed.txt": "one\n",
+            "folder/missing.txt": "missing\n",
+        },
+    )
+    repo.branch_create("feature")
+    repo.write_commit_push(
+        "Change on feature", {"restored.txt": "two\n", "folder/changed.txt": "two\n"}
+    )
+    repo.branch_switch("main")
+
+    repo.remove_file("restored.txt")
+    # Same size, so only the content tells it apart.
+    repo.write_files({"edited.txt": "EDITED\n"})
+    repo.rmtree("folder")
+    repo.status(scan=True)
+    assert _dirty_entries(repo) == [
+        ("edited.txt", "file", "keep"),
+        ("folder", "directory", "delete"),
+        ("restored.txt", "file", "delete"),
+    ], "setup: the scan must mark every change"
+
+    repo.branch_switch("feature")
+
+    with repo.open_file("restored.txt", "r") as input_file:
+        assert input_file.read() == "two\n", "the switch must restore the file"
+    with repo.open_file("folder/changed.txt", "r") as input_file:
+        assert input_file.read() == "two\n", "the switch must restore the folder"
+    assert _dirty_entries(repo) == [
+        ("edited.txt", "file", "keep"),
+        ("folder/missing.txt", "file", "delete"),
+    ], "only the local changes the switch left in place may stay marked"
+
+
+def _dirty_entries(repo: Lore) -> list[tuple[str, str, str]]:
+    """The dirty entries a plain status reports, sorted: status streams its entries in no set
+    order."""
+    return sorted(
+        (to_posix(entry["path"]), entry.get("type"), entry.get("action"))
+        for entry in get_status_files(repo)
+        if entry.get("flagDirty")
+    )

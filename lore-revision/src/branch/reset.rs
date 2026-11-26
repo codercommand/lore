@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::str::FromStr;
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
@@ -12,6 +13,7 @@ use crate::event::EventError;
 use crate::event::LoreEvent;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
+use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
 use crate::lore::execution_context;
@@ -23,6 +25,8 @@ use crate::state;
 
 #[error_set]
 pub enum ResetError {
+    Cancelled,
+    LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,
     NotFound,
@@ -95,7 +99,9 @@ impl EventError for ResetError {
 
 /// Event data reported when a branch is reset to a revision.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchResetEventData {
     /// Branch identifier.
@@ -115,7 +121,7 @@ pub async fn reset(
     let context = execution_context();
     let global = context.globals();
 
-    let (_current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
+    let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .forward::<ResetError>("loading current anchor")?;
 
@@ -128,9 +134,10 @@ pub async fn reset(
         .flatten()
         && !staged_revision.is_zero()
     {
-        let state_staged = state::State::deserialize(repository.clone(), staged_revision)
-            .await
-            .forward::<ResetError>("deserializing staged state")?;
+        let state_staged =
+            state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+                .await
+                .forward::<ResetError>("deserializing staged state")?;
         let has_staged = state_staged
             .node_has_staged_children(repository.clone(), crate::node::ROOT_NODE)
             .await
@@ -148,16 +155,21 @@ pub async fn reset(
         branch
     };
 
-    let branch = branch::resolve(repository.clone(), branch.as_str())
-        .await
-        .map_err(|err| {
-            ResetError::BranchNotFound(
+    let by_id = Context::from_str(&branch).is_ok();
+    let branch = match branch::resolve(repository.clone(), branch.as_str()).await {
+        Ok(resolved) => resolved,
+        Err(err) if is_refusal(&err) => {
+            return Err(err).forward_any("resolving branch");
+        }
+        Err(err) => {
+            return Err(ResetError::BranchNotFound(
                 BranchNotFound {
                     branch: branch.clone(),
                 }
                 .chain_err_from(err, "resolving branch"),
-            )
-        })?;
+            ));
+        }
+    };
 
     let branch_metadata = branch::metadata(repository.clone(), branch.id)
         .await
@@ -189,19 +201,8 @@ pub async fn reset(
         ));
     }
 
-    // Restore the name-to-id mapping for the branch to ensure it shows up in the local branch list.
-    let mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
-        .await
-        .unwrap_or_default();
-    if mapped != Context::default() && mapped != branch.id && !global.force() {
-        return Err(ResetError::internal(
-            "Given branch's name is already used by another branch",
-        ));
-    }
-    if mapped == Context::default() || global.force() {
-        branch::store_name_to_id(repository.clone(), branch.id, &branch_name)
-            .await
-            .forward::<ResetError>("restoring name-to-id mapping")?;
+    if by_id && !global.dry_run() {
+        branch::cache_name_mapping(repository.clone(), branch.id, branch_name).await;
     }
 
     let latest = branch::load_latest(repository.clone(), branch.id)
@@ -231,24 +232,9 @@ pub async fn reset(
             .forward::<ResetError>("storing current anchor")?;
     }
 
-    // We don't know if the revision is on the history line of the remote branch, set local flag
-    // to force the next sync to do divergence check. Also remove the last sync cache.
-    // A reset deliberately moves the tip to an arbitrary revision, so it compares
-    // against whatever the pointer holds now rather than a tracked value.
-    let stored_latest = branch::load_latest(repository.clone(), branch.id)
+    store_reset_latest(&repository, branch.id, revision)
         .await
-        .unwrap_or_default();
-    branch::store_latest(
-        repository.clone(),
-        branch.id,
-        stored_latest,
-        revision,
-        BranchLatestStatus::Divergent,
-    )
-    .await
-    .forward::<ResetError>("storing new latest revision for branch")?;
-
-    branch::store_last_sync(repository.clone(), branch.id, Hash::default()).await;
+        .forward::<ResetError>("storing new latest revision for branch")?;
 
     LoreEvent::BranchReset(LoreBranchResetEventData {
         id: branch.id,
@@ -257,4 +243,76 @@ pub async fn reset(
     })
     .send();
     Ok(())
+}
+
+/// Stores `revision` as the local latest of `branch`, divergent, since it may not be on the
+/// remote branch's history, and clears the stored last synchronized revision. A reset moves the
+/// latest to an arbitrary revision, so the swap is from whatever the latest holds as it is read.
+///
+/// A last sync at `revision`, left beside the new latest, reads as a push the peer accepted and
+/// never recorded. That one is cleared before the latest is stored, so a reset stopped between
+/// the two writes is never taken for such a push, and a failure to clear it fails the reset before
+/// the latest is stored. Any other last sync is cleared once the latest is stored. Where another
+/// command advances the latest after it is read, the swap fails with
+/// [`BranchAdvanced`](branch::BranchError::BranchAdvanced), having written nothing, and the last
+/// sync is left as it was, a cleared one put back as [`put_back_last_sync`] describes. Any other
+/// failure may follow a latest already stored, so the last sync is cleared.
+async fn store_reset_latest(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    revision: Hash,
+) -> Result<(), branch::BranchError> {
+    let stored_latest = branch::load_latest(repository.clone(), branch)
+        .await
+        .unwrap_or_default();
+    let last_sync = branch::load_stored_last_sync(repository.clone(), branch).await;
+    let cleared_first = last_sync == revision
+        && branch::swap_last_sync(repository.clone(), branch, last_sync, Hash::default()).await?;
+    let stored = branch::store_latest(
+        repository.clone(),
+        branch,
+        stored_latest,
+        revision,
+        BranchLatestStatus::Divergent,
+    )
+    .await;
+    let advanced = stored.as_ref().is_err_and(|err| err.is_branch_advanced());
+    if advanced && cleared_first {
+        put_back_last_sync(repository, branch, last_sync).await;
+    } else if !advanced && !cleared_first {
+        branch::store_last_sync(repository.clone(), branch, Hash::default()).await;
+    }
+    stored
+}
+
+/// Puts `last_sync` back as the stored last sync of `branch`, from which a reset to it cleared it
+/// before its swap of the latest lost to another command. A latest at `last_sync` beside it reads
+/// as a push the peer accepted and never recorded, so it stays cleared where the latest that won
+/// is `last_sync`, as another reset to it leaves it, or where another command stored a last sync
+/// other than zero since. A zero another command stored is not told apart from the clear, so a
+/// reset elsewhere can find the last sync put back. A put-back that a latest at `last_sync`
+/// overtakes is cleared again: here, where that latest lands before the second read, and by the
+/// reset that stores it otherwise, which clears the last sync after its swap where it read it
+/// before the put-back, and before its swap where it read it after.
+async fn put_back_last_sync(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    last_sync: Hash,
+) {
+    let at_last_sync = async || {
+        branch::load_latest(repository.clone(), branch)
+            .await
+            .is_ok_and(|latest| latest == last_sync)
+    };
+    if at_last_sync().await
+        || !branch::swap_last_sync(repository.clone(), branch, Hash::default(), last_sync)
+            .await
+            .unwrap_or(false)
+    {
+        return;
+    }
+    if at_last_sync().await {
+        let _ =
+            branch::swap_last_sync(repository.clone(), branch, last_sync, Hash::default()).await;
+    }
 }

@@ -2,3 +2,5 @@
 // SPDX-License-Identifier: MIT
 
 mod counting;
+mod growvec;
+mod reap;

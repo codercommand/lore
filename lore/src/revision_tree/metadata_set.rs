@@ -36,7 +36,9 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 /// One metadata pair to record. `value` is a typed value that carries its own
 /// kind, so there is no separate format tag and nothing to parse.
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema,
+)]
 pub struct LoreRevisionTreeMetadataSetEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `METADATA_SET_COMPLETE`
     pub entry_id: u64,
@@ -58,7 +60,16 @@ impl Default for LoreRevisionTreeMetadataSetEntry {
 
 /// Arguments for `lore_revision_tree_metadata_set`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(metadata_set_impl)]
 pub struct LoreRevisionTreeMetadataSetArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
@@ -171,7 +182,7 @@ fn plan_entries(
 
         let (value, value_type) = entry.value.to_stored();
 
-        if !Metadata::can_hold(entry.key.as_str(), &value) {
+        if !Metadata::can_hold([(entry.key.as_str(), value.as_ref())]) {
             return Err(reject(
                 entry_id,
                 index,
@@ -206,7 +217,7 @@ fn apply_plan(
     for item in planned {
         let key = entries[item.entry_index].key.as_str();
         match pending.set_typed(key, &item.value, item.value_type) {
-            Ok(()) => emit_set_complete(item.entry_id, LoreErrorCode::None),
+            Ok(_) => emit_set_complete(item.entry_id, LoreErrorCode::None),
             Err(error) => {
                 emit_set_complete(item.entry_id, LoreErrorCode::Internal);
                 return Err(MetadataSetError::internal_with_context(
@@ -282,12 +293,12 @@ fn apply_plan(
 /// The handle is claimed even though this edits no tree: that pending buffer is
 /// what a commit clones and then empties, so an edit landing inside a commit would
 /// be recorded and dropped without ever reaching a revision.
-pub async fn metadata_set(
+pub fn metadata_set(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_set_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_set_impl)
 }
 
 /// Plan and apply one batch. Split out of the dispatcher closure so the batch

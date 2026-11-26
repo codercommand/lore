@@ -189,6 +189,10 @@ pub fn spawned_task<F: Future>(future: F) -> ContextTask<F> {
     }
 }
 
+/// The blocking tasks [`spawned_blocking_task`] has made, which only a test build counts.
+#[cfg(feature = "test-util")]
+pub(crate) static BLOCKING_SPAWNS: AtomicUsize = AtomicUsize::new(0);
+
 /// `function`, to run within its caller's `LORE_CONTEXT`, if one is set. Both cases are one closure
 /// type, so the runtime's blocking task machinery is compiled once for each spawned closure type.
 pub fn spawned_blocking_task<F, T>(function: F) -> impl FnOnce() -> T + Send + 'static
@@ -196,10 +200,42 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: 'static,
 {
+    #[cfg(feature = "test-util")]
+    BLOCKING_SPAWNS.fetch_add(1, Ordering::Relaxed);
     let context = try_lore_context();
     move || match context {
         Some(context) => LORE_CONTEXT.sync_scope(context, function),
         None => function(),
+    }
+}
+
+/// A [`JoinSet`] that detaches its tasks when dropped rather than aborting them, for tasks that
+/// must not stop part way. A detached task runs to its end, and its output is dropped then.
+pub struct DetachingJoinSet<T: 'static>(JoinSet<T>);
+
+impl<T: 'static> Default for DetachingJoinSet<T> {
+    fn default() -> Self {
+        Self(JoinSet::new())
+    }
+}
+
+impl<T: 'static> std::ops::Deref for DetachingJoinSet<T> {
+    type Target = JoinSet<T>;
+
+    fn deref(&self) -> &JoinSet<T> {
+        &self.0
+    }
+}
+
+impl<T: 'static> std::ops::DerefMut for DetachingJoinSet<T> {
+    fn deref_mut(&mut self) -> &mut JoinSet<T> {
+        &mut self.0
+    }
+}
+
+impl<T: 'static> Drop for DetachingJoinSet<T> {
+    fn drop(&mut self) {
+        self.0.detach_all();
     }
 }
 
@@ -369,7 +405,15 @@ macro_rules! lore_spawn_core {
     };
 }
 
-/// Spawns a blocking task with `LORE_CONTEXT` set.
+/// Spawns a blocking task with `LORE_CONTEXT` set, on the core runtime's blocking pool.
+///
+/// The pool holds a few threads for the whole process, whatever the processor count, and is
+/// shared with every library on the core runtime that calls `spawn_blocking` itself (`tokio::fs`
+/// and DNS resolution among them). It is for short calls into blocking OS APIs with no async
+/// form. CPU work does not belong here: run it inline, bounded as
+/// `docs/developing/code-standards/tasks.md` requires. A closure here that runs for long holds a
+/// thread of the pool for that time, and once every thread is held, all other blocking work in
+/// the process waits.
 ///
 /// Uses `sync_scope` to make the context available in the blocking closure.
 #[macro_export]
@@ -404,35 +448,6 @@ macro_rules! lore_spawn_blocking {
         {
             $crate::runtime::core_runtime()
                 .spawn_blocking($crate::runtime::spawned_blocking_task($expression))
-        }
-    }};
-}
-
-/// Spawns a blocking task without context propagation.
-#[macro_export]
-macro_rules! lore_spawn_blocking_nocontext {
-    ($joinset:ident, $name:literal, $expression:expr) => {{
-        #[allow(clippy::disallowed_methods)]
-        {
-            $joinset.spawn_blocking_on($expression, &$crate::runtime::runtime())
-        }
-    }};
-    ($joinset:ident, $expression:expr) => {{
-        #[allow(clippy::disallowed_methods)]
-        {
-            $joinset.spawn_blocking_on($expression, &$crate::runtime::runtime())
-        }
-    }};
-    ($name:literal, $expression:expr) => {{
-        #[allow(clippy::disallowed_methods)]
-        {
-            $crate::runtime::runtime().spawn_blocking($expression)
-        }
-    }};
-    ($expression:expr) => {{
-        #[allow(clippy::disallowed_methods)]
-        {
-            $crate::runtime::runtime().spawn_blocking($expression)
         }
     }};
 }
@@ -546,32 +561,76 @@ pub fn runtime_shutdown_started() -> bool {
 /// Network runtime — see [`net_runtime`].
 static NET_RUNTIME: OnceLock<SharedRuntime> = OnceLock::new();
 
-/// Process-configured net-runtime default thread count (the server sets one
-/// per processor at startup; unset means the client default).
-static NET_THREADS_DEFAULT: OnceLock<usize> = OnceLock::new();
+/// Process-configured net-runtime default thread count, and whether it is one per processor
+/// (the server's default); unset means the client default.
+static NET_THREADS_DEFAULT: OnceLock<(usize, NetRequest)> = OnceLock::new();
 
 /// Net runtime worker threads when nothing configures it: one user's worth
 /// of QUIC streams and gRPC channels.
 #[lore_macro::test_pub]
 const DEFAULT_NET_THREADS: usize = 2;
 
-/// Requests a process-default net-runtime thread count — the server asks for one
-/// per processor, since serving thousands of concurrent client connections is its
-/// normal case. A thread limit still bounds the count granted. Must run before
-/// the net runtime is first used; returns false if a default was already set.
-pub fn set_net_threads_default(count: usize) -> bool {
-    NET_THREADS_DEFAULT.set(count.max(1)).is_ok()
+/// How the net pool's request is sized, which decides how a thread limit treats it (see
+/// [`apportion_thread_counts`]).
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetRequest {
+    /// A count of its own: the default, one per storage connection, or a configured count. A limit
+    /// leaves it as it leaves the blocking pool.
+    Fixed,
+    /// One thread per processor, which [`serving_runtime`] asks for by default. A limit shares it
+    /// evenly with the core workers and the syscall pool.
+    PerProcessor,
 }
 
-/// An explicit net-thread request: `LORE_NET_THREADS` if set, else the
-/// process-configured default (e.g. the server's one-per-processor). `None`
-/// leaves the net pool at [`DEFAULT_NET_THREADS`].
-fn requested_net_threads() -> Option<usize> {
-    env_thread_override("LORE_NET_THREADS").or_else(|| NET_THREADS_DEFAULT.get().copied())
+/// Requests a process-default net-runtime thread count. A thread limit still bounds the count
+/// granted. Must run before either runtime is built, since both are sized from it; returns false
+/// if a default was already set.
+pub fn set_net_threads_default(count: usize) -> bool {
+    NET_THREADS_DEFAULT
+        .set((count.max(1), NetRequest::Fixed))
+        .is_ok()
+}
+
+/// The storage connections a process sizes its runtimes for — see [`threads_for_connections`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetConnections {
+    /// A process that opens this many storage connections to a remote.
+    Opened(usize),
+    /// A process that serves commands which each open up to this many.
+    Served(usize),
+}
+
+/// The storage connections the process sized its runtimes for — see
+/// [`set_net_connections`]. `None` for a process that set none.
+static NET_CONNECTIONS: OnceLock<Option<NetConnections>> = OnceLock::new();
+
+/// Sizes the core and net runtimes for `connections`, as [`threads_for_connections`] divides
+/// them. An explicit net request (`LORE_NET_THREADS`, the `net_threads` setting or
+/// [`set_net_threads_default`]) takes precedence, and a thread limit bounds the total. A process
+/// that sets none keeps one core thread per processor and [`DEFAULT_NET_THREADS`]. Returns false,
+/// and changes nothing, once a runtime is built or the connections are set, so both runtimes are
+/// sized for the same ones.
+pub fn set_net_connections(connections: NetConnections) -> bool {
+    NET_CONNECTIONS.set(Some(connections)).is_ok()
+}
+
+/// Settles the connections the runtimes are sized for, as none when none were set.
+fn settle_net_connections() {
+    NET_CONNECTIONS.get_or_init(|| None);
+}
+
+/// An explicit net-thread request and how it is sized: `LORE_NET_THREADS` if set, else the
+/// process-configured default (e.g. the server's one-per-processor). `None` leaves the net pool
+/// at [`DEFAULT_NET_THREADS`], or sized for the process's storage connections.
+fn requested_net_threads() -> Option<(usize, NetRequest)> {
+    env_thread_override("LORE_NET_THREADS")
+        .map(|count| (count, NetRequest::Fixed))
+        .or_else(|| NET_THREADS_DEFAULT.get().copied())
 }
 
 /// Net runtime worker threads: the net share of the thread budget, which an
-/// explicit request raises (see [`thread_counts`]).
+/// explicit request or the storage connections raise (see [`thread_counts`]).
 pub fn default_net_threads() -> usize {
     budget_thread_counts().net
 }
@@ -591,23 +650,41 @@ pub fn default_net_threads() -> usize {
 /// resurrecting a runtime with fresh threads during teardown.
 pub fn net_runtime() -> Handle {
     NET_RUNTIME
-        .get_or_init(|| SharedRuntime::new(build_net_runtime()))
+        .get_or_init(|| {
+            crate::allocator::start_heap_reap();
+            SharedRuntime::new(build_net_runtime())
+        })
         .handle
         .clone()
 }
 
+#[lore_macro::test_pub]
 fn build_net_runtime() -> tokio::runtime::Runtime {
+    settle_net_connections();
+    let threads = default_net_threads();
+    crate::lore_debug!("Net runtime: {threads} workers");
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
         .enable_all()
-        .worker_threads(default_net_threads())
+        .worker_threads(threads)
         .max_blocking_threads(NET_BLOCKING_THREADS)
         .thread_keep_alive(Duration::from_secs(default_thread_keep_alive()))
         .thread_name_fn(|| {
             static ID: AtomicUsize = AtomicUsize::new(0);
             format!("lore-net-{}", ID.fetch_add(1, Ordering::Relaxed))
         });
+    leave_heaps_idle_while_parked(&mut builder);
     builder.build().expect("Failed to create net runtime")
+}
+
+/// Has the runtime's workers leave their allocator heap idle while they are parked, where the heaps
+/// of idle threads are reaped.
+fn leave_heaps_idle_while_parked(builder: &mut tokio::runtime::Builder) {
+    if crate::allocator::heap_reap_enabled() {
+        builder
+            .on_thread_park(crate::allocator::thread_idle_begin)
+            .on_thread_unpark(crate::allocator::thread_idle_end);
+    }
 }
 static DEFAULT_THREAD_KEEP_ALIVE_SECONDS: u64 = 10;
 
@@ -621,24 +698,32 @@ fn platform_processor_count() -> usize {
     unsafe { GetActiveProcessorCount(0xFFFF) as usize }
 }
 
-/// Returns the number of available processors.
+/// Returns the number of available processors, kept from the first read that succeeds; after a
+/// failed read the next call reads again. On Linux each read of
+/// `std::thread::available_parallelism` parses the cgroup files.
 ///
 /// On Windows, takes the maximum of `std::thread::available_parallelism` and the Win32
 /// `GetActiveProcessorCount` API, since the former underestimates on large machines.
 /// On other platforms, returns `std::thread::available_parallelism` (falling back to 1).
 pub fn processor_count() -> usize {
-    let std_count = std::thread::available_parallelism().map_or(1, |c| c.get());
-    #[cfg(target_os = "windows")]
-    {
-        std::cmp::max(std_count, platform_processor_count())
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&count) = COUNT.get() {
+        return count;
     }
+    let read = std::thread::available_parallelism();
+    let std_count = read.as_ref().map_or(1, |c| c.get());
+    #[cfg(target_os = "windows")]
+    let count = std::cmp::max(std_count, platform_processor_count());
     #[cfg(not(target_os = "windows"))]
-    {
-        std_count
+    let count = std_count;
+    if read.is_ok() {
+        *COUNT.get_or_init(|| count)
+    } else {
+        count
     }
 }
 
-/// Optional ceiling on the *sum* of the worker, blocking, and net pool sizes.
+/// Optional ceiling on the threads of every pool together, [`ThreadCounts::total`].
 /// Set once via [`set_thread_limit`]; `0` means "no limit". The
 /// `LORE_MAX_THREADS` env var overrides it when set above zero. See
 /// [`thread_limit`] and [`thread_counts`].
@@ -652,7 +737,7 @@ static THREAD_LIMIT: OnceLock<usize> = OnceLock::new();
 /// A set limit binds every pool: environment and configuration knobs raise a
 /// pool's ideal, never the granted total. The one exception is
 /// [`MIN_THREADS_PER_POOL`], which a pool keeps even under a smaller limit, so
-/// the least this can achieve is `3 * MIN_THREADS_PER_POOL`.
+/// the least this can achieve is `POOL_COUNT * MIN_THREADS_PER_POOL`.
 ///
 /// Returns `true` if applied, `false` if a limit was already set.
 pub fn set_thread_limit(count: usize) -> bool {
@@ -676,8 +761,9 @@ pub struct ThreadCounts {
     /// runtime's pool plus the net runtime's [`NET_BLOCKING_THREADS`].
     pub blocking: usize,
     /// Net runtime worker threads. [`set_net_threads_default`] and
-    /// `LORE_NET_THREADS` raise this pool's ideal — the server asks for one per
-    /// processor — but a thread limit still bounds what it is granted.
+    /// `LORE_NET_THREADS` set this pool's ideal — the server asks for one per
+    /// processor — and [`set_net_connections`] raises it, but a thread limit
+    /// bounds what it is granted.
     pub net: usize,
     /// The lore-io syscall pool, which every file operation dispatches through.
     /// `LORE_IO_POOL_THREADS` raises its ideal.
@@ -699,15 +785,6 @@ impl ThreadCounts {
     fn as_array(&self) -> [usize; POOL_COUNT] {
         [self.worker, self.blocking, self.net, self.io]
     }
-
-    fn from_array(pools: [usize; POOL_COUNT]) -> ThreadCounts {
-        ThreadCounts {
-            worker: pools[0],
-            blocking: pools[1],
-            net: pools[2],
-            io: pools[3],
-        }
-    }
 }
 
 /// Minimum threads per pool, even under a tight limit — a starved pool can
@@ -721,7 +798,9 @@ const MIN_THREADS_PER_POOL: usize = 2;
 /// this serves only genuinely blocking OS APIs with no async form (OS keyring
 /// access, AWS SDK initialization, service IPC pipe reads). Fixed and
 /// processor-count-independent by design — see the async file I/O enhancement
-/// proposal's thread budget.
+/// proposal's thread budget. Libraries running on the core runtime share it
+/// through their own `spawn_blocking` calls, so a task that holds a thread here
+/// for long can stall work in an unrelated subsystem.
 #[lore_macro::test_pub]
 const CORE_BLOCKING_THREADS: usize = 2;
 
@@ -745,48 +824,132 @@ fn default_thread_counts(cores: usize, io: usize) -> ThreadCounts {
     }
 }
 
-/// Scales the per-pool defaults down to fit a total `limit`, preserving their
-/// relative shape via the largest-remainder method. Each pool keeps at least
-/// [`MIN_THREADS_PER_POOL`], so a `limit` below `POOL_COUNT * MIN_THREADS_PER_POOL`
-/// floors there. Defaults that already fit are returned unchanged.
+/// Fits the per-pool requests into a total `limit`. Requests that already fit are returned
+/// unchanged.
+///
+/// The blocking pool, and the net pool where `net` is [`NetRequest::Fixed`], are fixed. The core
+/// workers, the syscall pool, and the net pool where `net` is [`NetRequest::PerProcessor`] share
+/// what the fixed pools leave, as [`apportion_pools`] divides them. Odd threads go to the shared
+/// pools in that order.
 #[lore_macro::test_pub]
-fn apportion_thread_counts(defaults: ThreadCounts, limit: usize) -> ThreadCounts {
-    let total = defaults.total();
+fn apportion_thread_counts(requested: ThreadCounts, net: NetRequest, limit: usize) -> ThreadCounts {
+    if requested.total() <= limit {
+        return requested;
+    }
+    let [worker, blocking, net_threads, io] = requested.as_array();
+    let ([worker, net_threads, io], blocking) = match net {
+        NetRequest::Fixed => {
+            let ([worker, io], [blocking, net_threads]) =
+                apportion_pools([worker, io], [blocking, net_threads], limit);
+            ([worker, net_threads, io], blocking)
+        }
+        NetRequest::PerProcessor => {
+            let (shared, [blocking]) =
+                apportion_pools([worker, net_threads, io], [blocking], limit);
+            (shared, blocking)
+        }
+    };
+    ThreadCounts {
+        worker,
+        blocking,
+        net: net_threads,
+        io,
+    }
+}
+
+/// Fits `shared` and `fixed` pools, whose total exceeds `limit`, into it: the `fixed` pools keep
+/// their requests, raised to [`MIN_THREADS_PER_POOL`], and the `shared` pools split what they
+/// leave by [`split_evenly`]. Where that is fewer than [`MIN_THREADS_PER_POOL`] for each shared
+/// pool, the shared pools keep the minimum and the fixed pools are scaled into the rest by
+/// [`scale_to_fit`], so a `limit` below `(S + F) * MIN_THREADS_PER_POOL` floors there.
+fn apportion_pools<const S: usize, const F: usize>(
+    shared: [usize; S],
+    fixed: [usize; F],
+    limit: usize,
+) -> ([usize; S], [usize; F]) {
+    let mut fixed = fixed.map(|pool| pool.max(MIN_THREADS_PER_POOL));
+    match limit.checked_sub(fixed.iter().sum()) {
+        Some(rest) if rest >= S * MIN_THREADS_PER_POOL => (split_evenly(shared, rest), fixed),
+        _ => {
+            scale_to_fit(&mut fixed, limit.saturating_sub(S * MIN_THREADS_PER_POOL));
+            ([MIN_THREADS_PER_POOL; S], fixed)
+        }
+    }
+}
+
+/// Splits `rest` threads evenly among pools with these `requests`, each capped at its request
+/// raised to [`MIN_THREADS_PER_POOL`]. What a capped pool leaves goes evenly to the others, and the
+/// threads an even split leaves over go one each to the uncapped pools, first pool first.
+fn split_evenly<const N: usize>(requests: [usize; N], rest: usize) -> [usize; N] {
+    let caps = requests.map(|request| request.max(MIN_THREADS_PER_POOL));
+    let mut granted = [0usize; N];
+    let mut capped = [false; N];
+    let mut remaining = rest;
+    loop {
+        let open = capped.iter().filter(|&&capped| !capped).count();
+        if open == 0 {
+            return granted;
+        }
+        let share = remaining / open;
+        let mut capped_any = false;
+        for i in 0..N {
+            if !capped[i] && caps[i] <= share {
+                granted[i] = caps[i];
+                capped[i] = true;
+                remaining -= caps[i];
+                capped_any = true;
+            }
+        }
+        if !capped_any {
+            let mut odd = remaining - share * open;
+            for i in (0..N).filter(|&i| !capped[i]) {
+                granted[i] = share + usize::from(odd > 0);
+                odd = odd.saturating_sub(1);
+            }
+            return granted;
+        }
+    }
+}
+
+/// Scales `pools` down to fit a total `limit`, preserving their relative shape via the
+/// largest-remainder method. Each pool keeps at least [`MIN_THREADS_PER_POOL`], so a `limit`
+/// below `N * MIN_THREADS_PER_POOL` floors there. Pools that already fit are left unchanged.
+fn scale_to_fit<const N: usize>(pools: &mut [usize; N], limit: usize) {
+    let total: usize = pools.iter().sum();
     if total <= limit {
-        return defaults;
+        return;
     }
 
-    let ideal = defaults.as_array();
-    let mut alloc = [0usize; POOL_COUNT];
-    let mut remainder = [0usize; POOL_COUNT];
-    for i in 0..POOL_COUNT {
-        let scaled = ideal[i] * limit;
-        alloc[i] = std::cmp::max(scaled / total, MIN_THREADS_PER_POOL);
-        remainder[i] = scaled % total;
+    let mut remainder = [0usize; N];
+    for (pool, remainder) in pools.iter_mut().zip(&mut remainder) {
+        let scaled = *pool * limit;
+        *pool = std::cmp::max(scaled / total, MIN_THREADS_PER_POOL);
+        *remainder = scaled % total;
     }
 
-    let mut sum: usize = alloc.iter().sum();
+    let mut sum: usize = pools.iter().sum();
     while sum > limit {
-        let Some(i) = (0..POOL_COUNT)
-            .filter(|&i| alloc[i] > MIN_THREADS_PER_POOL)
-            .max_by_key(|&i| alloc[i])
+        let Some(largest) = pools
+            .iter_mut()
+            .filter(|pool| **pool > MIN_THREADS_PER_POOL)
+            .max()
         else {
             break;
         };
-        alloc[i] -= 1;
+        *largest -= 1;
         sum -= 1;
     }
     while sum < limit {
-        let i = (0..POOL_COUNT).max_by_key(|&i| remainder[i]).unwrap();
+        let Some(i) = (0..N).max_by_key(|&i| remainder[i]) else {
+            break;
+        };
         if remainder[i] == 0 {
             break;
         }
-        alloc[i] += 1;
+        pools[i] += 1;
         remainder[i] = 0;
         sum += 1;
     }
-
-    ThreadCounts::from_array(alloc)
 }
 
 /// Reads a positive-integer per-pool thread override from `var`, returning
@@ -798,40 +961,94 @@ fn env_thread_override(var: &str) -> Option<usize> {
         .filter(|&val| val > 0)
 }
 
-/// Applies the total limit to per-pool requests, returning them unchanged when
-/// none is set.
+/// Applies the total limit to per-pool requests, with the net pool's sized as `net`, returning
+/// them unchanged when none is set.
 ///
 /// Every path that sizes a pool ends here, so that a limit bounds the process
 /// whatever asked for the threads. A request is an ideal, not a final count.
-fn apply_thread_limit(requested: ThreadCounts) -> ThreadCounts {
+fn apply_thread_limit(requested: ThreadCounts, net: NetRequest) -> ThreadCounts {
     match thread_limit() {
-        Some(limit) => apportion_thread_counts(requested, limit),
+        Some(limit) => apportion_thread_counts(requested, net, limit),
         None => requested,
     }
 }
 
-/// Per-pool sizes before any limit: the core-count defaults with an explicit net
-/// request substituted.
-fn requested_thread_counts() -> ThreadCounts {
-    let mut counts = default_thread_counts(processor_count(), lore_io::requested_max_threads());
-    if let Some(net) = requested_net_threads() {
-        counts.net = net;
+/// The core and net pools for a process sized for `connections`, from the `defaults` for its
+/// processor count.
+///
+/// The core runtime runs one thread fewer than `defaults`, which leaves a processor for the net
+/// runtime, and never fewer than [`MIN_THREADS_PER_POOL`]. The net runtime takes one thread for
+/// each connection, since each connection's QUIC endpoint receives and decrypts on a task of its
+/// own, and never fewer than its default. It takes at most half of the core and net threads
+/// together, rounded down. A process that opens the connections takes these threads from the core
+/// runtime, so it runs as many CPU-bound threads as with one connection: 10 connections on 8
+/// processors run 5 core and 4 net threads. A process that serves them adds them to the core
+/// runtime, since the commands it serves may open fewer: 7 core and 4 net threads.
+#[lore_macro::test_pub]
+fn threads_for_connections(defaults: ThreadCounts, connections: NetConnections) -> ThreadCounts {
+    let worker = defaults.worker.saturating_sub(1).max(MIN_THREADS_PER_POOL);
+    let shared = worker + defaults.net;
+    let (NetConnections::Opened(count) | NetConnections::Served(count)) = connections;
+    let net = count.clamp(defaults.net, (shared / 2).max(defaults.net));
+    ThreadCounts {
+        worker: match connections {
+            NetConnections::Opened(_) => shared - net,
+            NetConnections::Served(_) => worker,
+        },
+        net,
+        ..defaults
     }
-    counts
 }
 
-/// Per-pool counts from the core count, an explicit net request, and the limit.
+/// Per-pool sizes before any limit: `defaults`, with an explicit `net_request`
+/// substituted, or else sized for the process's storage `connections` where it set any.
+#[lore_macro::test_pub]
+fn requested_counts(
+    defaults: ThreadCounts,
+    net_request: Option<usize>,
+    connections: Option<NetConnections>,
+) -> ThreadCounts {
+    match (net_request, connections) {
+        (Some(net), _) => ThreadCounts { net, ..defaults },
+        (None, Some(connections)) => threads_for_connections(defaults, connections),
+        (None, None) => defaults,
+    }
+}
+
+/// Per-pool sizes before any limit, for this process (see [`requested_counts`]), and how its net
+/// request is sized.
+fn requested_thread_counts() -> (ThreadCounts, NetRequest) {
+    let net_request = requested_net_threads();
+    let requested = requested_counts(
+        default_thread_counts(processor_count(), lore_io::requested_max_threads()),
+        net_request.map(|(count, _)| count),
+        NET_CONNECTIONS.get().copied().flatten(),
+    );
+    (
+        requested,
+        net_request.map_or(NetRequest::Fixed, |(_, net)| net),
+    )
+}
+
+/// Per-pool counts from the core count, an explicit net request or the storage
+/// connections, and the limit.
 fn budget_thread_counts() -> ThreadCounts {
-    apply_thread_limit(requested_thread_counts())
+    let (requested, net) = requested_thread_counts();
+    apply_thread_limit(requested, net)
 }
 
 /// Per-pool thread counts Lore sizes its runtime for.
 ///
-/// `LORE_NET_THREADS` and [`set_net_threads_default`] raise the net pool's ideal,
-/// and `LORE_IO_POOL_THREADS` the syscall pool's; worker follows the core count
-/// and blocking is a small fixed count. Whatever the ideals, a thread limit is a
-/// ceiling on their total rather than a starting point to negotiate from: the
-/// pools are scaled to fit it, down to [`MIN_THREADS_PER_POOL`] each.
+/// `LORE_NET_THREADS` and [`set_net_threads_default`] set the net pool's ideal,
+/// with worker at the core count; otherwise the connections [`set_net_connections`]
+/// sets size both, as [`threads_for_connections`] divides them, and a process that
+/// sets none keeps the defaults. `LORE_IO_POOL_THREADS` raises the
+/// syscall pool's ideal, and blocking is a small fixed count. Whatever the ideals,
+/// a thread limit is a ceiling on their total rather than a starting point to
+/// negotiate from: the blocking pool and a fixed net pool keep their requests, and
+/// the core workers, the syscall pool and a net pool of one per processor split the
+/// rest evenly, each up to its request and at least [`MIN_THREADS_PER_POOL`] (see
+/// [`apportion_thread_counts`]).
 pub fn thread_counts() -> ThreadCounts {
     budget_thread_counts()
 }
@@ -861,9 +1078,9 @@ fn requested_blocking_threads() -> usize {
 /// Controls the number of blocking threads, thread keep-alive duration,
 /// and optionally the number of worker threads.
 ///
-/// The thread counts here are requests. A thread limit scales them to fit,
-/// so configuring a pool cannot raise the process above a ceiling an embedder
-/// asked for.
+/// The thread counts here are requests. A thread limit bounds their total (see
+/// [`apportion_thread_counts`]), so configuring a pool cannot raise the process
+/// above a ceiling an embedder asked for.
 #[derive(Clone, Debug, Deserialize)]
 pub struct TokioSettings {
     #[serde(default = "requested_blocking_threads")]
@@ -871,8 +1088,9 @@ pub struct TokioSettings {
     #[serde(default = "default_thread_keep_alive")]
     pub thread_keep_alive_seconds: u64,
     pub worker_threads: Option<usize>,
-    /// Net runtime worker threads; `None` keeps the process default (2 on
-    /// clients, one per processor where the server sets it).
+    /// Net runtime worker threads; `None` keeps the process default: 2, or one per
+    /// storage connection [`set_net_connections`] sets, up to half the core and net
+    /// threads together, or one per processor in a [`serving_runtime`].
     #[serde(default)]
     pub net_threads: Option<usize>,
 }
@@ -908,6 +1126,114 @@ impl TokioSettings {
     }
 }
 
+/// The timer a core runtime keeps its sleeps and timeouts in.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoreTimer {
+    /// Tokio's default timer: one wheel for the runtime, behind one lock.
+    Shared,
+    /// Tokio's alternative timer: one wheel per worker, which only that worker reads and writes.
+    /// A cancel still locks the cancel queue of the wheel that holds the timer, and a timer set
+    /// from outside the workers locks a queue the whole runtime shares. It needs
+    /// `cfg(tokio_unstable)`; a build without it keeps [`CoreTimer::Shared`].
+    PerWorker,
+}
+
+/// Environment variable naming the timer [`serving_runtime`] builds the core runtime with:
+/// `per-worker`, the default, or `shared`.
+pub const CORE_TIMER_ENV: &str = "LORE_CORE_TIMER";
+
+/// The timer [`serving_core_timer`] reads from a value of [`CORE_TIMER_ENV`], with the value when
+/// it names neither timer.
+#[lore_macro::test_pub]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CoreTimerChoice {
+    timer: CoreTimer,
+    unknown_value: Option<String>,
+}
+
+/// What [`serving_runtime`] chose, kept for [`report_serving_runtime`]: a process that serves
+/// builds its runtime before its logging is set up, so a message logged then is lost.
+static SERVING_CORE_TIMER: OnceLock<CoreTimerChoice> = OnceLock::new();
+
+/// The timer a value of [`CORE_TIMER_ENV`] names, without surrounding whitespace:
+/// [`CoreTimer::Shared`] for `shared`, and [`CoreTimer::PerWorker`] for `per-worker`, for no value,
+/// for a blank one, and for any other.
+#[lore_macro::test_pub]
+fn serving_core_timer(value: Option<&str>) -> CoreTimerChoice {
+    let (timer, unknown_value) = match value.map(str::trim) {
+        None | Some("" | "per-worker") => (CoreTimer::PerWorker, None),
+        Some("shared") => (CoreTimer::Shared, None),
+        Some(_) => (CoreTimer::PerWorker, value.map(str::to_string)),
+    };
+    CoreTimerChoice {
+        timer,
+        unknown_value,
+    }
+}
+
+/// The timer the core runtime was built with, once it is built.
+static CORE_RUNTIME_TIMER: OnceLock<CoreTimer> = OnceLock::new();
+
+/// Logs what a process that serves built its runtime with: a warning for each retired thread
+/// variable still set, a warning for a [`CORE_TIMER_ENV`] that names neither timer, and the core
+/// runtime's timer. Call it once the process's logging is set up.
+pub fn report_serving_runtime() {
+    warn_retired_thread_vars();
+    if let Some(value) = SERVING_CORE_TIMER
+        .get()
+        .and_then(|choice| choice.unknown_value.as_ref())
+    {
+        crate::lore_warn!(
+            "{CORE_TIMER_ENV} is `{value}`, not `per-worker` or `shared`; keeping the per-worker timer"
+        );
+    }
+    if let Some(timer) = CORE_RUNTIME_TIMER.get() {
+        crate::lore_info!("Core runtime timer: {timer:?}");
+    }
+}
+
+/// `timer` where the build has `cfg(tokio_unstable)`, and [`CoreTimer::Shared`] where it does not.
+fn available_core_timer(timer: CoreTimer) -> CoreTimer {
+    if cfg!(tokio_unstable) {
+        timer
+    } else {
+        CoreTimer::Shared
+    }
+}
+
+/// Returns a handle to the core runtime of a process that serves, building it with `settings`
+/// if none exists: one core thread and one net thread per processor, since serving thousands of
+/// concurrent client connections is its normal case. `settings.net_threads` and
+/// `LORE_NET_THREADS` set the net threads instead. A thread limit bounds the total, and shares
+/// one net thread per processor evenly with the core threads and the syscall pool
+/// ([`NetRequest::PerProcessor`]). The net
+/// threads are set before the runtime is built, since both runtimes are sized from them once.
+/// The core runtime keeps a [`CoreTimer::PerWorker`] timer, since its workers set and cancel
+/// many timers at once, unless [`CORE_TIMER_ENV`] is `shared`: Tokio's per-worker timer is
+/// unstable, and the variable lets an operator leave it without a rebuild. The process reports the
+/// choice with [`report_serving_runtime`] once its logging is set up.
+pub fn serving_runtime(settings: Option<TokioSettings>) -> Handle {
+    let _ = NET_THREADS_DEFAULT.set(
+        settings
+            .as_ref()
+            .and_then(|settings| settings.net_threads)
+            .filter(|&count| count > 0)
+            .map_or((processor_count(), NetRequest::PerProcessor), |count| {
+                (count, NetRequest::Fixed)
+            }),
+    );
+    let choice = SERVING_CORE_TIMER.get_or_init(|| {
+        serving_core_timer(
+            std::env::var_os(CORE_TIMER_ENV)
+                .as_deref()
+                .map(|value| value.to_string_lossy())
+                .as_deref(),
+        )
+    });
+    current_or_core_runtime(settings, choice.timer)
+}
+
 /// Returns a handle to the shared tokio runtime, creating it lazily with default settings.
 pub fn runtime() -> Handle {
     runtime_with_settings(None)
@@ -919,10 +1245,16 @@ pub fn runtime() -> Handle {
 /// If a tokio runtime is already active on the current thread, returns its handle instead.
 /// Worker count comes from `settings` when it sets one, else from the thread budget.
 pub fn runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
+    current_or_core_runtime(settings, CoreTimer::Shared)
+}
+
+/// The current runtime's handle, else the core runtime's, built with `settings` and `timer` if
+/// none exists.
+fn current_or_core_runtime(settings: Option<TokioSettings>, timer: CoreTimer) -> Handle {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle
     } else {
-        core_runtime_with_settings(settings)
+        core_runtime_with_settings(settings, timer)
     }
 }
 
@@ -936,17 +1268,21 @@ pub fn runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
 /// Built once per process, with the same post-shutdown behaviour as
 /// [`net_runtime`].
 pub fn core_runtime() -> Handle {
-    core_runtime_with_settings(None)
+    core_runtime_with_settings(None, CoreTimer::Shared)
 }
 
-fn core_runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
+fn core_runtime_with_settings(settings: Option<TokioSettings>, timer: CoreTimer) -> Handle {
     CORE_RUNTIME
-        .get_or_init(|| SharedRuntime::new(build_core_runtime(settings)))
+        .get_or_init(|| {
+            let _ = CORE_RUNTIME_TIMER.set(available_core_timer(timer));
+            crate::allocator::start_heap_reap();
+            SharedRuntime::new(build_core_runtime(settings, timer))
+        })
         .handle
         .clone()
 }
 
-/// Warns once for a retired per-pool thread variable that is still set.
+/// Warns for each retired per-pool thread variable that is still set.
 ///
 /// Removing the knob silently would lose whatever tuning a caller had configured without telling
 /// them; `LORE_MAX_THREADS` is what replaces it.
@@ -962,16 +1298,36 @@ fn warn_retired_thread_vars() {
     }
 }
 
-fn build_core_runtime(settings: Option<TokioSettings>) -> tokio::runtime::Runtime {
+/// Builds a core runtime sized by `settings` over the defaults, with `timer` where the build has
+/// `cfg(tokio_unstable)` and [`CoreTimer::Shared`] where it does not.
+#[lore_macro::test_pub]
+fn build_core_runtime(
+    settings: Option<TokioSettings>,
+    timer: CoreTimer,
+) -> tokio::runtime::Runtime {
     warn_retired_thread_vars();
     let settings = settings.unwrap_or_default();
     if let Some(net_threads) = settings.net_threads.filter(|&count| count > 0) {
-        let _ = NET_THREADS_DEFAULT.set(net_threads);
+        let _ = set_net_threads_default(net_threads);
     }
+    settle_net_connections();
     let counts = core_thread_counts(&settings);
+    let timer = available_core_timer(timer);
+    crate::lore_debug!(
+        "Core runtime: {} workers, {} blocking, {timer:?} timer; syscall pool: {}",
+        counts.worker,
+        core_blocking_threads(counts),
+        counts.io
+    );
     // The syscall pool builds itself on the first file operation, which in every Lore process
     // happens on this runtime and so after this point.
     lore_io::set_max_threads(counts.io);
+    if crate::allocator::heap_reap_enabled() {
+        lore_io::set_idle_hooks(lore_io::IdleHooks {
+            begin: crate::allocator::thread_idle_begin,
+            end: crate::allocator::thread_idle_end,
+        });
+    }
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
         .enable_all()
@@ -981,8 +1337,13 @@ fn build_core_runtime(settings: Option<TokioSettings>) -> tokio::runtime::Runtim
             static ID: AtomicUsize = AtomicUsize::new(0);
             format!("lore-tokio-{}", ID.fetch_add(1, Ordering::Relaxed))
         });
+    leave_heaps_idle_while_parked(&mut builder);
     // Tokio would otherwise default to the raw core count and ignore the thread limit.
     builder.worker_threads(counts.worker);
+    #[cfg(tokio_unstable)]
+    if timer == CoreTimer::PerWorker {
+        builder.enable_alt_timer();
+    }
     builder.build().expect("Failed to create runtime")
 }
 
@@ -994,18 +1355,19 @@ fn build_core_runtime(settings: Option<TokioSettings>) -> tokio::runtime::Runtim
 /// `max_blocking_threads` sizes the core runtime's own pool, so the net runtime's
 /// thread is added to reach the budgeted total.
 fn core_thread_counts(settings: &TokioSettings) -> ThreadCounts {
-    let mut requested = requested_thread_counts();
+    let (mut requested, net) = requested_thread_counts();
     if let Some(worker) = settings.worker_threads.filter(|&count| count > 0) {
         requested.worker = worker;
     }
     if settings.max_blocking_threads > 0 {
         requested.blocking = settings.max_blocking_threads + NET_BLOCKING_THREADS;
     }
-    apply_thread_limit(requested)
+    apply_thread_limit(requested, net)
 }
 
 /// The core runtime's blocking pool: the budgeted blocking threads less the one
 /// the net runtime holds, and never zero — a pool of none runs nothing.
+#[lore_macro::test_pub]
 fn core_blocking_threads(counts: ThreadCounts) -> usize {
     counts.blocking.saturating_sub(NET_BLOCKING_THREADS).max(1)
 }
@@ -1108,7 +1470,8 @@ where
 }
 
 /// Gracefully shuts down the tokio runtimes: flushes guarded tasks, then shuts
-/// down tokio with a timeout.
+/// down tokio with a timeout. Then stops the thread that reaps idle allocator
+/// heaps.
 ///
 /// Terminal for the process — neither runtime is rebuilt afterwards, and the
 /// accessors keep handing out the shut-down handles. Concurrent callers past
@@ -1127,6 +1490,8 @@ pub fn runtime_shutdown_timeout(wait_timeout: Duration) {
     let core = CORE_RUNTIME.get().and_then(SharedRuntime::take);
     let net = NET_RUNTIME.get().and_then(SharedRuntime::take);
     if core.is_none() && net.is_none() {
+        // Also where no runtime was built, so that none built later starts the reap.
+        crate::allocator::stop_heap_reap();
         return;
     }
 
@@ -1151,4 +1516,6 @@ pub fn runtime_shutdown_timeout(wait_timeout: Duration) {
     if let Err(panic) = shutdown.join() {
         std::panic::resume_unwind(panic);
     }
+    // Before the allocator is finalized, which the C `lore_shutdown()` does next.
+    crate::allocator::stop_heap_reap();
 }

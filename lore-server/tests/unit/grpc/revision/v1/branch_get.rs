@@ -14,8 +14,11 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::revision::v1::branch_get::*;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
@@ -51,13 +54,15 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
 
     let latest = branch_push::push(
         repository_context.clone(),
+        None,
         main,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("Failed to push latest revision")
@@ -121,6 +126,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let latest = create_test_branch(repository_context, branch_id).await;
 
@@ -161,6 +167,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let latest = create_test_branch(repository_context, branch_id).await;
 
@@ -196,6 +203,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_test_branch(repository_context.clone(), branch_id).await;
             branch::delete(repository_context, branch_id)
@@ -230,6 +238,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_test_branch(repository_context.clone(), branch_id).await;
             branch::delete(repository_context, branch_id)
@@ -416,6 +425,13 @@ mod forwarded_request {
 {
             unreachable!("forwarded_repository_service should not be called in branch_create tests")
         }
+
+        fn forwarded_lock_service(
+            &self,
+        ) -> Box<dyn lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient>
+        {
+            unreachable!("forwarded_lock_service should not be called in branch_get tests")
+        }
     }
 
     fn make_request(repository: RepositoryId, branch_id: BranchId) -> Request<BranchGetRequest> {
@@ -542,6 +558,7 @@ mod forwarded_request {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_test_branch(repository_context, branch_id).await;
 

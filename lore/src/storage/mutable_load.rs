@@ -19,6 +19,7 @@ use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::store::event::LoreStorageMutableLoadItemCompleteEventData;
@@ -30,14 +31,21 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::store::EffectiveFlags;
 use crate::storage::store::StoreInternal;
 
 /// One `mutable_load` item — the `(partition, key, key_type)` to read.
 #[repr(C)]
 #[derive(
-    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+    Copy,
+    Clone,
+    Default,
+    Debug,
+    PartialEq,
+    ValidateText,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
 )]
 pub struct LoreStorageMutableLoadItem {
     /// Caller-chosen id echoed back in `MUTABLE_LOAD_ITEM_COMPLETE`
@@ -52,7 +60,16 @@ pub struct LoreStorageMutableLoadItem {
 
 /// Arguments for `lore_storage_mutable_load`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Default,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(mutable_load_impl)]
 pub struct LoreStorageMutableLoadArgs {
     /// Open storage handle
@@ -62,12 +79,12 @@ pub struct LoreStorageMutableLoadArgs {
 }
 
 /// Read one or more mutable key values.
-pub async fn mutable_load(
+pub fn mutable_load(
     globals: LoreGlobalArgs,
     args: LoreStorageMutableLoadArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, mutable_load_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, mutable_load_impl)
 }
 
 async fn mutable_load_impl(
@@ -172,7 +189,7 @@ fn emit_complete(
     LoreEvent::StorageMutableLoadItemComplete(LoreStorageMutableLoadItemCompleteEventData {
         id: item.id,
         value,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result

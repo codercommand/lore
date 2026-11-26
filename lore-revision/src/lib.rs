@@ -52,6 +52,7 @@ pub mod path;
 pub mod progress;
 pub mod proto;
 pub mod protocol;
+pub mod records;
 pub mod relay;
 pub mod repository;
 pub mod revision;
@@ -60,6 +61,8 @@ pub mod service_state;
 pub mod stage;
 pub mod state;
 pub mod store;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub mod util;
 
 #[cfg(all(target_family = "windows", feature = "vfs"))]
@@ -68,7 +71,6 @@ pub mod projfs;
 pub use lore_base::lore_drain_tasks;
 pub use lore_base::lore_limit_drain_tasks;
 pub use lore_base::lore_spawn_blocking;
-pub use lore_base::lore_spawn_blocking_nocontext;
 
 /// Ceiling on concurrently-spawned tasks in a filesystem or state tree walk:
 /// the diff, stage, realize and verify-filesystem walks.

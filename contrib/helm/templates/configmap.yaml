@@ -1,6 +1,7 @@
 {{- if and .Values.tls.grpcTls (eq .Values.tls.mode "ephemeral") -}}
 {{- fail "tls.grpcTls=true does nothing when tls.mode=ephemeral, because the server makes that cert itself and the chart cannot point gRPC at it. Use selfSigned, certManager, or secret." -}}
 {{- end -}}
+{{- include "lore.validate" . -}}
 {{- if ne (int .Values.service.quicPort) (int .Values.service.grpcPort) -}}
 {{- fail (printf "service.quicPort (%v) and service.grpcPort (%v) must be equal. The server serves QUIC and gRPC on one port, so a client URL carries a single port number for both, and the AWS TCP_UDP listener annotation needs one number for both. Splitting them leaves the gRPC half of that URL pointing at a port the Service does not publish over TCP." .Values.service.quicPort .Values.service.grpcPort) -}}
 {{- end -}}
@@ -44,18 +45,7 @@ data:
   {{- $primary := printf "%s://%s-0.%s.%s.svc.cluster.local:41337" $upstreamScheme $fullname $headless $ns }}
   data.toml: |-
     {{- if .Values.auth.enabled }}
-    {{- if or .Values.auth.issuer .Values.auth.audience }}
-    [server.auth]
-    {{- if .Values.auth.issuer }}
-    jwt_issuer = {{ .Values.auth.issuer | quote }}
-    {{- end }}
-    {{- if .Values.auth.audience }}
-    jwt_audience = [{{ range $idx, $aud := .Values.auth.audience }}{{ if $idx }}, {{ end }}{{ $aud | quote }}{{ end }}]
-    {{- end }}
-    {{- end }}
-
-    [server.auth.jwk]
-    endpoint = {{ .Values.auth.jwksEndpoint | quote }}
+    {{- include "lore.authToml" $ | nindent 4 }}
     {{- end }}
 
     {{- if ne .Values.tls.mode "ephemeral" }}
@@ -99,18 +89,7 @@ data:
     {{- end }}
   handler.toml: |-
     {{- if .Values.auth.enabled }}
-    {{- if or .Values.auth.issuer .Values.auth.audience }}
-    [server.auth]
-    {{- if .Values.auth.issuer }}
-    jwt_issuer = {{ .Values.auth.issuer | quote }}
-    {{- end }}
-    {{- if .Values.auth.audience }}
-    jwt_audience = [{{ range $idx, $aud := .Values.auth.audience }}{{ if $idx }}, {{ end }}{{ $aud | quote }}{{ end }}]
-    {{- end }}
-    {{- end }}
-
-    [server.auth.jwk]
-    endpoint = {{ .Values.auth.jwksEndpoint | quote }}
+    {{- include "lore.authToml" $ | nindent 4 }}
     {{- end }}
 
     {{- if ne .Values.tls.mode "ephemeral" }}
@@ -164,18 +143,7 @@ data:
 {{- else }}
   local.toml: |-
     {{- if .Values.auth.enabled }}
-    {{- if or .Values.auth.issuer .Values.auth.audience }}
-    [server.auth]
-    {{- if .Values.auth.issuer }}
-    jwt_issuer = {{ .Values.auth.issuer | quote }}
-    {{- end }}
-    {{- if .Values.auth.audience }}
-    jwt_audience = [{{ range $idx, $aud := .Values.auth.audience }}{{ if $idx }}, {{ end }}{{ $aud | quote }}{{ end }}]
-    {{- end }}
-    {{- end }}
-
-    [server.auth.jwk]
-    endpoint = {{ .Values.auth.jwksEndpoint | quote }}
+    {{- include "lore.authToml" $ | nindent 4 }}
     {{- end }}
 
     {{- if ne .Values.tls.mode "ephemeral" }}
@@ -193,6 +161,14 @@ data:
     {{- end }}
     {{- end }}
 
+    {{- if eq .Values.backend.type "aws" }}
+    {{- "\n" }}
+    {{- include "lore.awsStoreToml" $ | nindent 4 }}
+    {{- else if eq .Values.backend.type "edge" }}
+    {{- "\n" }}
+    {{- include "lore.edgeStoreToml" $ | nindent 4 }}
+    {{- else }}
+
     [immutable_store.local]
     path = "/data"
     {{- with (include "lore.storeGcToml" .Values.data.store) }}
@@ -201,6 +177,7 @@ data:
 
     [mutable_store.local]
     path = "/data"
+    {{- end }}
 
     {{- include "lore.serverHttpToml" (dict "ctx" $ "storeHealthCheck" true) | nindent 4 }}
     {{- if .Values.replication.enabled }}

@@ -68,7 +68,11 @@ pub async fn spawn_gated_provider(
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a loopback port");
-    let issuer = format!("http://{}", listener.local_addr().expect("local address"));
+    let issuer = format!(
+        "http://{}{}",
+        listener.local_addr().expect("local address"),
+        unique_issuer_path()
+    );
     let requests = Arc::new(AtomicUsize::new(0));
     let in_flight = Arc::new(AtomicUsize::new(0));
 
@@ -104,6 +108,22 @@ pub async fn spawn_gated_provider(
         requests,
         in_flight,
     }
+}
+
+/// An issuer path no other provider in the process has. Discovery caches documents per issuer
+/// until they are evicted, and the OS can hand a provider the port an earlier test's provider
+/// used, so an issuer of only host and port could be answered from that test's document.
+fn unique_issuer_path() -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!("/issuer-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The scheme, host and port of `url`.
+pub fn origin(url: &str) -> String {
+    url::Url::parse(url)
+        .expect("a valid URL")
+        .origin()
+        .ascii_serialization()
 }
 
 pub fn document(issuer: &str, endpoint_base: &str) -> serde_json::Value {
@@ -152,6 +172,7 @@ pub async fn wait_for_requests(provider: &Provider, count: usize) {
 #[derive(Clone, Debug)]
 pub struct Received {
     pub method: Method,
+    /// The request path relative to the issuer's path.
     pub path: String,
     pub headers: HeaderMap,
     pub body: String,
@@ -194,10 +215,21 @@ impl RecordingProvider {
 pub async fn spawn_recording_provider(
     respond: impl Fn(&str, &Received, usize) -> Response + Clone + Send + Sync + 'static,
 ) -> RecordingProvider {
+    spawn_recording_provider_named("127.0.0.1", respond).await
+}
+
+/// A [`RecordingProvider`] whose issuer names the loopback port it listens on as `host`,
+/// so two providers can sit on different hosts.
+pub async fn spawn_recording_provider_named(
+    host: &str,
+    respond: impl Fn(&str, &Received, usize) -> Response + Clone + Send + Sync + 'static,
+) -> RecordingProvider {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a loopback port");
-    let issuer = format!("http://{}", listener.local_addr().expect("local address"));
+    let port = listener.local_addr().expect("local address").port();
+    let issuer_path = unique_issuer_path();
+    let issuer = format!("http://{host}:{port}{issuer_path}");
     let received: Arc<Mutex<Vec<Received>>> = Arc::default();
 
     let handler = {
@@ -207,10 +239,15 @@ pub async fn spawn_recording_provider(
             let issuer = issuer.clone();
             let received = received.clone();
             let respond = respond.clone();
+            let path = uri
+                .path()
+                .strip_prefix(issuer_path.as_str())
+                .unwrap_or(uri.path())
+                .to_owned();
             async move {
                 let request = Received {
                     method,
-                    path: uri.path().to_owned(),
+                    path,
                     headers,
                     body,
                 };

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,7 @@ use super::branch_metadata_get;
 use super::branch_metadata_set;
 use super::branch_push;
 use super::revision_list;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -69,13 +71,18 @@ impl InstrumentProvider for RevisionServiceInstrumentProvider {
 #[derive(Clone)]
 pub struct LoreRevisionV1Service {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    /// The store that reads through `immutable_store` fill with what they read. `None` where they
+    /// fill none.
+    local_tier: Option<Arc<dyn lore_storage::ImmutableStore>>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
+    branch_list_concurrency: NonZeroUsize,
     instrument_provider: RevisionServiceInstrumentProvider,
     revision_list_instruments: RevisionListInstruments,
 }
@@ -84,13 +91,16 @@ impl LoreRevisionV1Service {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        local_tier: Option<Arc<dyn lore_storage::ImmutableStore>>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         notification: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         history_step_size: u64,
         acceleration: crate::grpc::server::RevisionListAcceleration,
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
+        branch_list_concurrency: NonZeroUsize,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider;
         let seconds_in_one_day = 86400f64;
@@ -115,13 +125,16 @@ impl LoreRevisionV1Service {
         };
         Self {
             immutable_store,
+            local_tier,
             mutable_store,
             notification,
             hook_dispatcher,
+            repository_authorizer,
             history_step_size,
             acceleration,
             forwarded_requests,
             rpc_timeout,
+            branch_list_concurrency,
             instrument_provider,
             revision_list_instruments,
         }
@@ -158,6 +171,7 @@ impl RevisionService for LoreRevisionV1Service {
             self.rpc_timeout,
             branch_create::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -177,6 +191,7 @@ impl RevisionService for LoreRevisionV1Service {
             self.rpc_timeout,
             branch_delete::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -215,6 +230,7 @@ impl RevisionService for LoreRevisionV1Service {
             self.immutable_store.clone(),
             self.mutable_store.clone(),
             &self.forwarded_requests,
+            self.branch_list_concurrency,
         )
         .await
     }
@@ -227,7 +243,9 @@ impl RevisionService for LoreRevisionV1Service {
             self.rpc_timeout,
             branch_push::handler(
                 request,
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
+                self.local_tier.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
                 &self.hook_dispatcher,
@@ -262,6 +280,7 @@ impl RevisionService for LoreRevisionV1Service {
             self.rpc_timeout,
             branch_metadata_set::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),

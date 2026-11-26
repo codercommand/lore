@@ -8,6 +8,8 @@ use lore_proto::RepositoryQueryRequest;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::allow_all_repositories;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
@@ -17,6 +19,7 @@ use tonic::Code;
 use tonic::Request;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::RefusingAuthorizer;
 use crate::store::test_support::test_store_create;
 
 /// Denies every request.
@@ -28,7 +31,7 @@ impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         _repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), Status> {
         Err(Status::permission_denied("denied"))
     }
@@ -46,6 +49,7 @@ async fn seed_repository(
         immutable_store,
         mutable_store,
         id,
+        allow_all_repositories(),
     ));
     let metadata_hash = repository::metadata_store(
         repository.clone(),
@@ -99,6 +103,65 @@ async fn denied_query_answers_not_found_for_an_existing_repository() {
                 )
                 .await
                 .expect_err("denied query must fail");
+                assert_eq!(err.code(), Code::NotFound, "{err:?}");
+            }
+        })
+        .await;
+}
+
+/// A check that could not be made answers its failure, by ID and by name,
+/// rather than `NOT_FOUND`.
+#[tokio::test]
+async fn failed_authorization_check_answers_its_failure() {
+    let id = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            seed_repository(immutable_store.clone(), mutable_store.clone(), id, "repo").await;
+            for (failure, code) in [
+                (
+                    Status::resource_exhausted("rate limited"),
+                    Code::ResourceExhausted,
+                ),
+                (Status::internal("failed"), Code::Internal),
+            ] {
+                for request in [query_by_id(id), query_by_name("repo")] {
+                    let err = handler(
+                        request,
+                        Arc::new(RefusingAuthorizer(failure.clone())),
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                    )
+                    .await
+                    .expect_err("a failed check must fail the query");
+                    assert_eq!(err.code(), code, "{err:?}");
+                }
+            }
+        })
+        .await;
+}
+
+/// A permitted lookup of a repository that does not exist still answers
+/// `NOT_FOUND`, by ID and by name.
+#[tokio::test]
+async fn a_missing_repository_answers_not_found() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            for request in [
+                query_by_id(random::<RepositoryId>()),
+                query_by_name("missing"),
+            ] {
+                let err = handler(
+                    request,
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                )
+                .await
+                .expect_err("a missing repository must not resolve");
                 assert_eq!(err.code(), Code::NotFound, "{err:?}");
             }
         })

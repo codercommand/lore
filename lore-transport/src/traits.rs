@@ -10,13 +10,16 @@ use lore_base::types::*;
 use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
+use crate::error::BranchPushError;
 use crate::error::ProtocolError;
+use crate::quic::client::CongestionAlgorithm;
 use crate::types::*;
 
 /// Protocol interface
 #[async_trait]
 pub trait Protocol: Send + Sync {
-    /// Connect to remote storage service
+    /// Connect to remote storage service, pacing what it sends with `congestion_algorithm` where
+    /// the transport has a congestion controller.
     #[allow(clippy::too_many_arguments)]
     async fn storage(
         &self,
@@ -27,9 +30,10 @@ pub trait Protocol: Send + Sync {
         partition: Partition,
         index: usize,
         credentials: &Arc<SuppliedCredentials>,
+        congestion_algorithm: CongestionAlgorithm,
     ) -> Result<Arc<dyn Storage>, ProtocolError>;
 
-    /// Connect to remote revision service
+    /// Connect to remote revision service, over gRPC as every protocol reaches it.
     #[allow(clippy::too_many_arguments)]
     async fn revision(
         &self,
@@ -39,9 +43,19 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Revision>, ProtocolError>;
+    ) -> Result<Arc<dyn Revision>, ProtocolError> {
+        crate::grpc::revision(
+            connection,
+            remote_url,
+            auth_endpoint,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
+    }
 
-    /// Connect to remote repository service
+    /// Connect to remote repository service, over gRPC as every protocol reaches it.
     async fn repository(
         &self,
         connection: Weak<Connection>,
@@ -49,9 +63,11 @@ pub trait Protocol: Send + Sync {
         auth_endpoint: &AuthEndpoint,
         identity: &str,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Repository>, ProtocolError>;
+    ) -> Result<Arc<dyn Repository>, ProtocolError> {
+        crate::grpc::repository(connection, remote_url, auth_endpoint, identity, credentials).await
+    }
 
-    /// Connect to remote admin service
+    /// Connect to remote admin service, over gRPC as every protocol reaches it.
     #[allow(clippy::too_many_arguments)]
     async fn admin(
         &self,
@@ -61,9 +77,19 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Admin>, ProtocolError>;
+    ) -> Result<Arc<dyn Admin>, ProtocolError> {
+        crate::grpc::admin(
+            connection,
+            remote_url,
+            auth_endpoint,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
+    }
 
-    /// Connect to remote lock service
+    /// Connect to remote lock service, over gRPC as every protocol reaches it.
     #[allow(clippy::too_many_arguments)]
     async fn lock(
         &self,
@@ -73,14 +99,26 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Lock>, ProtocolError>;
+    ) -> Result<Arc<dyn Lock>, ProtocolError> {
+        crate::grpc::lock(
+            connection,
+            remote_url,
+            auth_endpoint,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
+    }
 
-    /// Connect to remote environment service
+    /// Connect to remote environment service, over gRPC as every protocol reaches it.
     async fn environment(
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-    ) -> Result<Arc<dyn Environment>, ProtocolError>;
+    ) -> Result<Arc<dyn Environment>, ProtocolError> {
+        crate::grpc::environment(connection, remote_url).await
+    }
 }
 
 /// Storage protocol
@@ -98,6 +136,13 @@ pub trait Storage: Send + Sync {
 
     /// Stop an active session, releasing server-side capacity.
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError>;
+
+    /// The congestion controller the transport connection runs, as the transport reports it, where
+    /// it has one.
+    #[cfg(feature = "test-util")]
+    async fn running_congestion_algorithm(&self) -> Option<CongestionAlgorithm> {
+        None
+    }
 
     /// Get the immutable fragment and payload for address
     async fn get(
@@ -118,10 +163,10 @@ pub trait Storage: Send + Sync {
     /// Get only the fragment metadata for an address — no payload bytes.
     ///
     /// Use this when the caller needs `Fragment` (`flags`, `size_payload`, `size_content`) but
-    /// not the payload bytes — e.g. existence-with-size queries, metadata audits. Saves one
-    /// full payload transfer per address vs. `get`. The default implementation falls back to
-    /// `get` and discards the payload, so transports that haven't been updated still work;
-    /// gRPC and QUIC override with optimized wire-level metadata-only paths.
+    /// not the payload bytes, for example to learn whether an address exists and its size. It
+    /// saves one payload transfer per address over `get`. The default implementation falls back
+    /// to `get` and discards the payload; the gRPC, QUIC and socket clients override it with a
+    /// metadata-only request.
     async fn get_metadata(
         &self,
         session_id: u32,
@@ -250,9 +295,9 @@ pub trait Storage: Send + Sync {
 /// Revision protocol
 #[async_trait]
 pub trait Revision: Send + Sync {
-    /// Create a branch with the given identifier and name (must match) and parent branch stack
-    /// Will return the current LATEST pointer to allow the caller to distinguish created branch
-    /// and an already existing branch.
+    /// Create a branch with the given identifier and name and parent branch stack.
+    /// Returns the branch's record, whose latest revision tells a created branch from one that
+    /// already existed.
     async fn branch_create(
         &self,
         branch: BranchId,
@@ -260,7 +305,7 @@ pub trait Revision: Send + Sync {
         category: &str,
         creator: &str,
         stack: &[BranchPoint],
-    ) -> Result<Hash, ProtocolError>;
+    ) -> Result<BranchRecord, ProtocolError>;
 
     /// Destroy the given branch
     async fn branch_delete(&self, branch: BranchId) -> Result<(), ProtocolError>;
@@ -272,19 +317,36 @@ pub trait Revision: Send + Sync {
         name: Option<&str>,
     ) -> Result<BranchQueryResponse, ProtocolError>;
 
-    /// Push a new LATEST pointer for branch. Returns the (new) current LATEST pointer for the branch,
-    /// if this is different from the given LATEST pointer the operation failed due to the
-    /// LATEST pointer having moved.
+    /// Offer `latest` as the latest revision of `branch`, and return the latest the remote holds
+    /// after it. A remote that refuses the offer because its latest has moved on, or because a
+    /// fast-forward merge onto it conflicts, and marks that refusal, fails it with
+    /// `BranchAdvanced`, and one that lacks a fragment the revision names with `AddressNotFound`.
     async fn branch_push(
         &self,
         branch: BranchId,
         latest: Hash,
         force: bool,
         fast_forward_merge: bool,
-    ) -> Result<BranchPushResponse, ProtocolError>;
+    ) -> Result<BranchPushResponse, BranchPushError>;
 
-    /// List all branches
-    async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError>;
+    /// List the live branches, and the archived ones too with `include_deleted`; with `creator`,
+    /// only those it created.
+    async fn branch_list(
+        &self,
+        creator: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<BranchListResponse, ProtocolError>;
+
+    /// List at most `limit` branches. `None` means enumeration exceeded the limit.
+    /// Implementations must stop consuming the stream when the limit is exceeded.
+    async fn branch_list_bounded(
+        &self,
+        _limit: usize,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        Err(ProtocolError::from(lore_base::error::NotSupported {
+            operation: "bounded branch listing".to_string(),
+        }))
+    }
 
     async fn revision_list(
         &self,
@@ -425,13 +487,38 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
 
+    /// Obtains an authentication token for a confidential client registered with
+    /// the auth backend, which authenticates with its own ID and secret.
+    async fn authenticate_client(
+        &self,
+        auth_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError>;
+
     /// Refreshes the authentication token using a one-time-use refresh token.
+    ///
+    /// Fails with [`Disconnected`](lore_base::error::Disconnected) only when the refresh token
+    /// cannot have reached the backend, so the caller may present it again. After any other
+    /// failure the backend may have consumed it.
     async fn refresh_authentication(
         &self,
         auth_url: &str,
         refresh_token: &str,
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
+
+    /// Revokes the refresh token of a login at the auth backend.
+    ///
+    /// Fails with [`NotSupported`](lore_base::error::NotSupported) when the backend offers no
+    /// revocation.
+    async fn revoke_refresh_token(
+        &self,
+        auth_url: &str,
+        refresh_token: &str,
+        correlation_id: &str,
+    ) -> Result<(), ProtocolError>;
 
     /// Exchanges an authentication token for an authorization token scoped
     /// to the given repository.
@@ -443,15 +530,15 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError>;
 
-    /// Exchanges an authentication token for an authorization token scoped
-    /// to an arbitrary, non-repository resource identifier. The `resource_id`
-    /// is passed through verbatim to the auth backend; the caller is
-    /// responsible for any prefix convention.
-    async fn exchange_for_custom_resource(
+    /// Exchanges an authentication token for one authorization token scoped
+    /// to every one of `resource_ids`, arbitrary non-repository resource
+    /// identifiers. Each is passed through verbatim to the auth backend; the
+    /// caller is responsible for any prefix convention.
+    async fn exchange_for_custom_resources(
         &self,
         auth_url: &str,
         authn_token: &str,
-        resource_id: &str,
+        resource_ids: &[&str],
         correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError>;
 }

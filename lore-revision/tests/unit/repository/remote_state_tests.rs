@@ -6,8 +6,7 @@
 
 //! Tests for the `RemoteState` state machine and the `RepositoryContext::remote()`
 //! lazy resolution path. These exercise the classification logic and the Pending →
-//! terminal-state promotion without requiring a real `Arc<Connection>` (Connection
-//! construction is non-trivial and covered by integration tests instead). We cover:
+//! terminal-state promotion without a real `Arc<Connection>`. We cover:
 //!
 //! - Classification: `RemoteState::from_result` routes each error variant correctly.
 //! - Terminal-state passthrough: `remote()` on Offline/Failed returns the expected
@@ -16,17 +15,46 @@
 //! - Concurrent awaiters: N tasks awaiting the same Pending converge on one result.
 //! - Cancellation: cancelling awaiters mid-await does not break subsequent awaiters
 //!   or the promotion.
+//! - Session pools: the pool a context holds and reuses, and the endpoint it takes pools from
+//!   where one is set, over a detached connection.
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use lore_base::error::Disconnected;
 use lore_base::error::NoRemote;
+use lore_base::runtime::LORE_CONTEXT;
+use lore_base::test_util::TempDir;
+use lore_base::types::Address;
+use lore_base::types::Context;
+use lore_base::types::FragmentFlags;
+use lore_base::types::Hash;
+use lore_revision::immutable::load_raw;
+use lore_revision::immutable::read_options_from_repository;
+use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::RepositoryId;
-use lore_revision::repository::RemoteFuture;
+use lore_revision::protocol::RemoteFuture;
+use lore_revision::repository::MountKind;
 use lore_revision::repository::RemoteState;
+use lore_revision::repository::RepositoryConfig;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::test_util::context_with_state;
+use lore_storage::options::ReadOptions;
+use lore_transport::Connection;
 use lore_transport::ProtocolError;
+
+use super::test_helpers::built_context;
+use super::test_helpers::cached_remote_url;
+use super::test_helpers::counted_endpoint;
+use super::test_helpers::store_fragment;
+use super::test_helpers::with_auth_path;
+use crate::helper::setup_test_execution;
+use crate::helper::test_execution_with;
+use crate::immutable::serving::Serving;
+use crate::immutable::serving::remote_copy;
+use crate::immutable::serving::serving_remote;
 
 fn disconnected() -> ProtocolError {
     ProtocolError::from(Disconnected)
@@ -43,25 +71,6 @@ fn ready_remote(result: Result<Arc<lore_transport::Connection>, ProtocolError>) 
     fut.shared()
 }
 
-/// Build a minimal `RepositoryContext` carrying the given `RemoteState`. We construct
-/// in-memory stores so the rest of the context is valid, but only `remote()` is
-/// exercised.
-async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
-    let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
-        .await
-        .expect("in-memory stores should be creatable");
-    Arc::new(RepositoryContext::new_with_state(
-        None,
-        immutable,
-        mutable,
-        RepositoryId::default(),
-        lore_revision::instance::InstanceId::default(),
-        state,
-        Arc::default(),
-        None,
-    ))
-}
-
 /// Nothing is cached until something resolves it, so the first reader or
 /// writer drives the connect and a command that does neither remotely never
 /// does.
@@ -70,7 +79,7 @@ async fn a_fresh_context_has_no_session_pool_to_reuse() {
     for state in [RemoteState::Offline, RemoteState::Failed(no_remote())] {
         let context = context_with_state(state).await;
         assert!(
-            context.cached_session_pool().is_none(),
+            context.cached_session_pool("correlation").is_none(),
             "a context that has resolved nothing reported a pool"
         );
     }
@@ -82,17 +91,19 @@ async fn a_fresh_context_has_no_session_pool_to_reuse() {
 async fn an_offline_context_resolves_no_session_pool() {
     let context = context_with_state(RemoteState::Offline).await;
     assert!(context.session_pool("correlation").await.is_err());
-    assert!(context.cached_session_pool().is_none());
+    assert!(context.cached_session_pool("correlation").is_none());
 }
 
-/// A pool for a context to hold, the strong reference left to the caller as the
-/// connection's session cache holds it. The session in it is never resolved:
-/// these tests ask which pool answered, not what it yields.
-fn held_pool() -> Arc<lore_transport::SessionPool> {
+/// A pool to hold, started for `correlation_id`. The session in it is never
+/// resolved: these tests ask which pool answered, not what it yields.
+fn held_pool(correlation_id: &str) -> Arc<lore_transport::SessionPool> {
     let session = Arc::new(lore_transport::StorageSession::pending(|| async {
         Err(ProtocolError::internal("a pooled session no test resolves"))
     }));
-    Arc::new(lore_transport::SessionPool::new(vec![session]))
+    Arc::new(lore_transport::SessionPool::new(
+        Arc::from(correlation_id),
+        vec![session],
+    ))
 }
 
 /// A pool once resolved is handed back without consulting the remote. This
@@ -101,7 +112,7 @@ fn held_pool() -> Arc<lore_transport::SessionPool> {
 #[tokio::test]
 async fn a_resolved_pool_is_reused_without_touching_the_remote() {
     let context = context_with_state(RemoteState::Failed(disconnected())).await;
-    let pool = held_pool();
+    let pool = held_pool("correlation");
     context.set_session_pool(&pool);
 
     let reused = context
@@ -111,22 +122,199 @@ async fn a_resolved_pool_is_reused_without_touching_the_remote() {
     assert!(Arc::ptr_eq(&reused, &pool));
 }
 
-/// The pool is held weakly, so dropping the pin — which is what
-/// `StorageSession::invalidate` does to the connection's cache — sends the next
-/// caller back to the remote rather than handing out sessions the server has
-/// forgotten.
+/// A pool a session over it has invalidated is stale, so the next caller goes back to the
+/// remote rather than being handed sessions the server has forgotten.
 #[tokio::test]
-async fn a_pool_whose_pin_is_dropped_is_not_reused() {
+async fn a_stale_pool_is_not_reused() {
     let context = context_with_state(RemoteState::Failed(disconnected())).await;
-    let pool = held_pool();
+    let pool = held_pool("correlation");
     context.set_session_pool(&pool);
     assert!(context.session_pool("correlation").await.is_ok());
 
-    drop(pool);
+    lore_transport::StorageSession::pooled(pool)
+        .invalidate()
+        .await;
     assert!(
         context.session_pool("correlation").await.is_err(),
-        "an expired pool must send the caller back to the remote"
+        "a stale pool must send the caller back to the remote"
     );
+}
+
+/// A pool started for one correlation id is not handed to a call under another, which goes back
+/// to the remote for its own.
+#[tokio::test]
+async fn a_pool_is_not_reused_under_another_correlation_id() {
+    let context = context_with_state(RemoteState::Failed(disconnected())).await;
+    context.set_session_pool(&held_pool("first"));
+
+    assert!(context.session_pool("first").await.is_ok());
+    assert!(
+        context.session_pool("second").await.is_err(),
+        "another correlation id must send the caller back to the remote"
+    );
+}
+
+/// Building a context with an endpoint, and a read the local store serves, ask the endpoint for
+/// nothing. The first read that needs a session asks it once, under the correlation id of the call
+/// that read, and the context holds the pool the endpoint started and holds.
+#[tokio::test]
+async fn an_endpoint_is_asked_only_when_a_read_needs_a_session() {
+    let globals = LoreGlobalArgs {
+        correlation_id: "c1".into(),
+        ..Default::default()
+    };
+    LORE_CONTEXT
+        .scope(test_execution_with(globals), async {
+            let (endpoint, connection) = counted_endpoint(RepositoryId::default()).await;
+            let context =
+                built_context(|context| context.with_remote_endpoint(endpoint.clone())).await;
+            let stored = store_fragment(&context, b"held", FragmentFlags::empty(), 4).await;
+            load_raw(context.clone(), stored, ReadOptions::default())
+                .await
+                .expect("the local store serves what it holds");
+            assert_eq!(connection.storage_session_starts(), 0);
+
+            let absent = Address {
+                hash: Hash::from([0xa5u8; 32]),
+                context: Context::from([0xa5u8; 16]),
+            };
+            load_raw(context.clone(), absent, ReadOptions::default())
+                .await
+                .expect_err("the endpoint's remote holds nothing");
+            assert_eq!(connection.storage_session_starts(), 1);
+            let held = endpoint
+                .pools
+                .get(context.id, "c1")
+                .expect("the endpoint holds the pool it started");
+            assert!(
+                context
+                    .cached_session_pool("c1")
+                    .is_some_and(|pool| Arc::ptr_eq(&pool, &held))
+            );
+        })
+        .await;
+}
+
+/// A context answers with the pool the endpoint holds for its correlation id, and a call under
+/// another correlation id asks the endpoint again, which starts a pool for that id.
+#[tokio::test]
+async fn the_endpoint_answer_serves_its_correlation_id() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (endpoint, connection) = counted_endpoint(RepositoryId::default()).await;
+            let held = held_pool("c1");
+            endpoint.pools.hold(RepositoryId::default(), held.clone());
+            let context =
+                built_context(|context| context.with_remote_endpoint(endpoint.clone())).await;
+
+            let answered = context
+                .session_pool("c1")
+                .await
+                .expect("the endpoint answers with the pool it holds");
+            assert!(Arc::ptr_eq(&answered, &held));
+            assert!(context.cached_session_pool("c2").is_none());
+            assert_eq!(connection.storage_session_starts(), 0);
+
+            let other = context
+                .session_pool("c2")
+                .await
+                .expect("the endpoint starts a pool for another correlation id");
+            assert!(other.serves("c2"));
+            assert_eq!(connection.storage_session_starts(), 1);
+        })
+        .await;
+}
+
+/// A pool the endpoint holds that a session over it has invalidated is not handed out again: the
+/// endpoint starts a pool for the correlation id and holds it in the stale one's place.
+#[tokio::test]
+async fn the_endpoint_replaces_a_stale_pool() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let partition = RepositoryId::default();
+            let (endpoint, connection) = counted_endpoint(partition).await;
+            let stale = held_pool("c1");
+            endpoint.pools.hold(partition, stale.clone());
+            lore_transport::StorageSession::pooled(stale.clone())
+                .invalidate()
+                .await;
+
+            let answered = endpoint
+                .session_pool(&partition, "c1")
+                .await
+                .expect("the endpoint starts a pool in place of the stale one");
+            assert_eq!(connection.storage_session_starts(), 1);
+            assert!(!Arc::ptr_eq(&answered, &stale));
+            assert!(
+                endpoint
+                    .pools
+                    .get(partition, "c1")
+                    .is_some_and(|held| Arc::ptr_eq(&held, &answered)),
+                "the endpoint holds the pool it started in place of the stale one"
+            );
+        })
+        .await;
+}
+
+/// A link context keeps the local reads, the trust of the remote and the endpoint of the context it
+/// is derived from, and asks the endpoint for a pool on the link's partition. Each context trusts
+/// the remote where the call's globals don't, and the reverse, so the link reads with the context's
+/// trust only where it keeps it.
+#[tokio::test]
+async fn a_link_context_keeps_the_local_reads_the_remote_trust_and_the_endpoint() {
+    type Build = fn(RepositoryContext) -> RepositoryContext;
+    let builds: [(Build, (bool, bool, bool, bool)); 2] = [
+        (
+            RepositoryContext::reading_remote_only,
+            (false, true, false, true),
+        ),
+        (
+            RepositoryContext::strict_local_reads,
+            (true, false, true, false),
+        ),
+    ];
+    for (build, expected) in builds {
+        let trust = expected.3;
+        let globals = LoreGlobalArgs {
+            trust_remote: u8::from(!trust),
+            ..LoreGlobalArgs::default()
+        };
+        LORE_CONTEXT
+            .scope(test_execution_with(globals), async {
+                let link_id: RepositoryId = Context::from(uuid::Uuid::now_v7()).into();
+                let (endpoint, connection) = counted_endpoint(link_id).await;
+                let context = built_context(|context| {
+                    build(context)
+                        .with_remote_trust(trust)
+                        .with_remote_endpoint(endpoint.clone())
+                })
+                .await;
+                let link = context.to_link_context(link_id).await;
+
+                let options = read_options_from_repository(&link);
+                assert_eq!(
+                    (
+                        options.local,
+                        options.no_local_write,
+                        options.strict_local,
+                        options.trust_remote
+                    ),
+                    expected
+                );
+                let pool = link
+                    .session_pool("c1")
+                    .await
+                    .expect("the endpoint answers for the link's partition");
+                assert_eq!(connection.storage_session_starts(), 1);
+                assert!(
+                    endpoint
+                        .pools
+                        .get(link_id, "c1")
+                        .is_some_and(|held| Arc::ptr_eq(&held, &pool))
+                );
+            })
+            .await;
+    }
 }
 
 /// Only the terminal no-remote state answers yes. A failure and a connect
@@ -158,6 +346,179 @@ async fn a_held_state_lock_does_not_answer_offline() {
     assert!(!context.is_offline());
     drop(guard);
     assert!(context.is_offline());
+}
+
+/// The configuration naming the remote at `remote_url`.
+fn remote_config(remote_url: String) -> RepositoryConfig {
+    RepositoryConfig {
+        remote_url: Some(remote_url),
+        ..Default::default()
+    }
+}
+
+/// A connected context keeps its connection, whatever the configuration names.
+#[tokio::test]
+async fn a_connected_context_keeps_its_connection_on_reconnect() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let held = Connection::detached(Vec::new());
+            let config = remote_config(cached_remote_url(Connection::detached(Vec::new())));
+            let context = context_with_state(RemoteState::Connected(held.clone())).await;
+
+            context.reconnect_if_lost(&config);
+            let remote = context.remote().await.expect("the context is connected");
+
+            assert!(Arc::ptr_eq(&remote, &held));
+        })
+        .await;
+}
+
+/// A context whose connection went stale, as one does once the transport gives up reconnecting
+/// it, reaches a new connection on reconnect.
+#[tokio::test]
+async fn a_context_whose_connection_went_stale_reconnects() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let stale = Connection::detached(Vec::new());
+            stale.stale.store(true, Ordering::Relaxed);
+            let fresh = Connection::detached(Vec::new());
+            let config = remote_config(cached_remote_url(fresh.clone()));
+            let context = context_with_state(RemoteState::Connected(stale)).await;
+
+            context.reconnect_if_lost(&config);
+            let remote = context.remote().await.expect("the context reconnects");
+
+            assert!(Arc::ptr_eq(&remote, &fresh));
+        })
+        .await;
+}
+
+/// A context whose connect failed reads through the connect armed in its place, not the storage
+/// session it held for the failed one.
+#[tokio::test]
+async fn a_context_reads_through_a_connect_armed_after_one_failed() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (source, address, _) = remote_copy(b"held by the remote alone", 3, 0).await;
+            let context =
+                context_with_state(RemoteState::Pending(ready_remote(Err(disconnected())))).await;
+            let failed = load_raw(
+                context.clone(),
+                address,
+                read_options_from_repository(&context),
+            )
+            .await;
+            let storage = serving_remote(&source, Serving::default());
+            let url = cached_remote_url(Connection::detached(vec![storage]));
+
+            context.reconnect_if_lost(&remote_config(url));
+            let read = load_raw(
+                context.clone(),
+                address,
+                read_options_from_repository(&context),
+            )
+            .await;
+
+            assert!(failed.is_err());
+            assert_eq!(
+                read.expect("the read reaches the remote").1.as_ref(),
+                b"held by the remote alone"
+            );
+        })
+        .await;
+}
+
+/// A reconnect runs in the execution context that armed it, so it reads the credential store of
+/// that call, whichever call polls it first.
+#[tokio::test]
+async fn a_reconnect_runs_in_the_context_that_armed_it() {
+    let armed_with = TempDir::new("lore-remote-armed-auth-");
+    let polled_with = TempDir::new("lore-remote-polled-auth-");
+    let connection = Connection::detached(Vec::new());
+    let context = LORE_CONTEXT
+        .scope(with_auth_path(&armed_with), async {
+            let config = remote_config(cached_remote_url(connection.clone()));
+            let context = context_with_state(RemoteState::Failed(disconnected())).await;
+            context.reconnect_if_lost(&config);
+            context
+        })
+        .await;
+
+    let remote = LORE_CONTEXT
+        .scope(with_auth_path(&polled_with), context.remote())
+        .await;
+
+    assert!(Arc::ptr_eq(
+        &remote.expect("the connect finds the connection of the arming call"),
+        &connection
+    ));
+}
+
+/// A context mounted on first use connects through its parent's remote only once it is used, and
+/// answers what its parent's connect answers.
+#[tokio::test]
+async fn a_context_mounted_on_first_use_connects_through_its_parent_when_used() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let polled = Arc::new(AtomicBool::new(false));
+            let connect = {
+                let polled = polled.clone();
+                async move {
+                    polled.store(true, Ordering::SeqCst);
+                    Err(disconnected())
+                }
+                .boxed()
+                .shared()
+            };
+            let parent = context_with_state(RemoteState::Pending(connect)).await;
+
+            let linked = parent
+                .to_mounted_context_on_first_use(RepositoryId::from([4; 16]), MountKind::Link);
+            tokio::task::yield_now().await;
+            let unused = polled.load(Ordering::SeqCst);
+            let remote = linked.remote().await;
+
+            assert!(
+                !unused,
+                "the parent's connect is not polled before the context is used"
+            );
+            assert!(matches!(remote, Err(ProtocolError::Disconnected(_))));
+        })
+        .await;
+}
+
+/// A caller that awaited a connect which failed leaves the connect armed in its place since as it
+/// is, rather than promoting the old failure over it.
+#[tokio::test]
+async fn an_awaited_connect_does_not_promote_over_one_armed_since() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (fail, failed) = tokio::sync::oneshot::channel::<()>();
+            let first = async move {
+                let _ = failed.await;
+                Err(disconnected())
+            }
+            .boxed()
+            .shared();
+            let context = context_with_state(RemoteState::Pending(first)).await;
+            let mut waiting = Box::pin(context.remote());
+            assert!(futures::poll!(&mut waiting).is_pending());
+            fail.send(()).expect("the first connect is awaited");
+            let promoted = context.remote().await;
+            let connection = Connection::detached(Vec::new());
+            context.reconnect_if_lost(&remote_config(cached_remote_url(connection.clone())));
+
+            let waited = waiting.await;
+            let remote = context.remote().await;
+
+            assert!(matches!(promoted, Err(ProtocolError::Disconnected(_))));
+            assert!(matches!(waited, Err(ProtocolError::Disconnected(_))));
+            assert!(Arc::ptr_eq(
+                &remote.expect("the connect armed since reaches the remote"),
+                &connection
+            ));
+        })
+        .await;
 }
 
 #[tokio::test]

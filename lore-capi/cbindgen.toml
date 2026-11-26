@@ -43,7 +43,22 @@ header = '''// LORE C API
 //
 // The library copies argument data before it starts the call. The caller may
 // free or reuse the argument memory once the call returns. This holds for
-// synchronous and asynchronous calls.
+// synchronous and asynchronous calls, except for the memory a lore_bytes_mut_t
+// names, which the library writes while the call runs: see lore_bytes_mut_t.
+//
+// Call lore_shutdown only once every call has completed: a synchronous call has
+// returned, and an asynchronous one has delivered END. The library makes a best
+// effort to cancel calls still executing safely, but a call it does not stop in
+// time may still use the library and the memory passed to it after
+// lore_shutdown returns.
+//
+// Structures
+//
+// Zero every byte of a structure before passing it to the library, padding
+// included, as memset does, then set the fields the call uses. A field left
+// zero selects the default its documentation names. A release can add a field
+// in a structure's padding, which code built against an earlier header leaves
+// unset: such code keeps its behavior only where it zeroed every byte.
 //
 // See lore_event_callback_config_t for how callbacks work.'''
 
@@ -63,14 +78,19 @@ documentation_style = "c99"
 # `FilterState` and `FilterStates` are public so a tree walk can thread the
 # filter verdict down as it descends, and so the filter tests can build one.
 # `FileInfo` is public so the walk and the stage path can pass what a path
-# measured. All three are Rust-side only -- no C entry point takes or returns
-# them -- so cbindgen would otherwise emit opaque typedefs no caller can use.
-exclude = ["FileInfo", "FilterState", "FilterStates"]
+# measured. `FlushOptions` is how a store's flush is asked to write, which a C
+# caller sets through the `sync_data` and `fast_flush` globals. `Schemas` is
+# what a client and the service compare before a call, which cbindgen sees
+# though it is crate-visible. All five are Rust-side only -- no C entry point
+# takes or returns them -- so cbindgen would otherwise emit opaque typedefs no
+# caller can use.
+exclude = ["FileInfo", "FilterState", "FilterStates", "FlushOptions", "Schemas"]
 # `LoreStore` and `LoreRevisionTree` are reachable via `lore_*_args_t::handle`
 # but cbindgen misses transitive types behind a typedef field; emit them
-# explicitly. The `lore_revision_tree_*_args_t` types live here too so the
-# args struct definitions land in the header before their extern "C" entry
-# points reference them. `LoreBytes` and `LoreErrorCode` are reachable via
+# explicitly. The `lore_revision_tree_*_args_t` and
+# `lore_revision_graph_*_args_t` types live here too so the args struct
+# definitions land in the header before their extern "C" entry points
+# reference them. `LoreBytes` and `LoreErrorCode` are reachable via
 # the `lore_*_event_data_t` variants and do not need to be listed.
 # `LoreNodeStagedAction` names the values of the `staged_action` field on the
 # child and node-info records; the field is a `uint32_t` there, as `kind` is, so
@@ -98,6 +118,17 @@ include = [
     "LoreRevisionTreeMetadataClearArgs",
     "LoreRevisionTreeCommitArgs",
     "LoreRevisionTreeCommitOptions",
+    "LoreRevisionGraphRevisionResolveArgs",
+    "LoreRevisionGraphBranchResolveArgs",
+    "LoreRevisionGraphBranchListArgs",
+    "LoreRevisionGraphBranchMetadataGetArgs",
+    "LoreRevisionGraphBranchMetadataSetArgs",
+    "LoreRevisionGraphBranchCreateArgs",
+    "LoreRevisionGraphBranchArchiveArgs",
+    "LoreRevisionGraphBranchSyncOptions",
+    "LoreRevisionGraphBranchSyncArgs",
+    "LoreRevisionGraphBranchPushOptions",
+    "LoreRevisionGraphBranchPushArgs",
 ]
 
 [export.rename]
@@ -173,7 +204,12 @@ include = [
 "LoreBranchMergeResolveArgs" = "lore_branch_merge_resolve_args_t"
 "LoreBranchMergeResolveFileEventData" = "lore_branch_merge_resolve_file_event_data_t"
 "LoreBranchMergeConflictFileEventData" = "lore_branch_merge_conflict_file_event_data_t"
+"LoreBranchMergeConflictsListArgs" = "lore_branch_merge_conflicts_list_args_t"
+"LoreBranchMergeLinkPinConflictEventData" = "lore_branch_merge_link_pin_conflict_event_data_t"
+"LoreBranchMergeLinkPinResolvedEventData" = "lore_branch_merge_link_pin_resolved_event_data_t"
 "LoreBranchMergeLinkSkippedEventData" = "lore_branch_merge_link_skipped_event_data_t"
+"LoreLinkPinSideData" = "lore_link_pin_side_data_t"
+"LoreLinkPinResolution" = "lore_link_pin_resolution_t"
 "LoreBranchMergeUnresolveFileEventData" = "lore_branch_merge_unresolve_file_event_data_t"
 "LoreBranchMergeUnresolveRevisionEventData" = "lore_branch_merge_unresolve_revision_event_data_t"
 "LoreBranchMergeUnresolveArgs" = "lore_branch_merge_unresolve_args_t"
@@ -254,6 +290,9 @@ include = [
 "LoreFileHashEventData" = "lore_file_hash_event_data_t"
 "LoreFileHistoryArgs" = "lore_file_history_args_t"
 "LoreFileHistoryEventData" = "lore_file_history_event_data_t"
+"LoreFileAuditArgs" = "lore_file_audit_args_t"
+"LoreFileAuditEventData" = "lore_file_audit_event_data_t"
+"LoreFileAuditOutcome" = "lore_file_audit_outcome_t"
 "LoreFileDirtyArgs" = "lore_file_dirty_args_t"
 "LoreFileDirtyMoveArgs" = "lore_file_dirty_move_args_t"
 "LoreFileDirtyCopyArgs" = "lore_file_dirty_copy_args_t"
@@ -310,6 +349,20 @@ include = [
 "LoreRepositoryInstanceEventData" = "lore_repository_instance_event_data_t"
 "LoreRepositoryInstanceListArgs" = "lore_repository_instance_list_args_t"
 "LoreRepositoryInstancePruneArgs" = "lore_repository_instance_prune_args_t"
+"LoreRepositoryInstanceCloneArgs" = "lore_repository_instance_clone_args_t"
+"LoreRepositoryInstanceCloneBeginEventData" = "lore_repository_instance_clone_begin_event_data_t"
+"LoreRepositoryInstanceCloneCompleteEventData" = "lore_repository_instance_clone_complete_event_data_t"
+"LoreRepositoryInstanceCloneMethod" = "lore_repository_instance_clone_method_t"
+"LoreRepositoryInstanceClonePhase" = "lore_repository_instance_clone_phase_t"
+"LoreRepositoryInstanceCloneProgressEventData" = "lore_repository_instance_clone_progress_event_data_t"
+"LoreRepositoryInstanceDeletePhase" = "lore_repository_instance_delete_phase_t"
+"LoreRepositoryInstanceDeleteArgs" = "lore_repository_instance_delete_args_t"
+"LoreRepositoryInstanceDeleteBeginEventData" = "lore_repository_instance_delete_begin_event_data_t"
+"LoreRepositoryInstanceDeleteCompleteEventData" = "lore_repository_instance_delete_complete_event_data_t"
+"LoreRepositoryInstanceDeleteProgressEventData" = "lore_repository_instance_delete_progress_event_data_t"
+"LoreRepositoryInstanceMoveArgs" = "lore_repository_instance_move_args_t"
+"LoreRepositoryInstanceMoveBeginEventData" = "lore_repository_instance_move_begin_event_data_t"
+"LoreRepositoryInstanceMoveCompleteEventData" = "lore_repository_instance_move_complete_event_data_t"
 "LoreRepositoryUpdatePathArgs" = "lore_repository_update_path_args_t"
 "LoreRepositoryConfigGetArgs" = "lore_repository_config_get_args_t"
 "LoreRepositoryConfigGetEventData" = "lore_repository_config_get_event_data_t"
@@ -455,9 +508,11 @@ include = [
 "LoreServiceStartArgs" = "lore_service_start_args_t"
 "LoreServiceStopArgs" = "lore_service_stop_args_t"
 "LoreServiceSetExecutableArgs" = "lore_service_set_executable_args_t"
+"LoreServiceSetExternalDirectoryArgs" = "lore_service_set_external_directory_args_t"
 "LoreServiceSetUseAutomaticallyArgs" = "lore_service_set_use_automatically_args_t"
 "LoreServiceStatusArgs" = "lore_service_status_args_t"
 "LoreServiceStatusEventData" = "lore_service_status_event_data_t"
+"LoreExternalRootState" = "lore_external_root_state_t"
 "LoreServiceMessageEventData" = "lore_service_message_event_data_t"
 "LoreStore" = "lore_store_t"
 "LoreStorageCloseArgs" = "lore_storage_close_args_t"
@@ -514,6 +569,7 @@ include = [
 "LoreArray_lore_storage_mutable_list_item" = "lore_storage_mutable_list_item_array_t"
 "LoreStorageOpenedEventData" = "lore_storage_opened_event_data_t"
 "LoreStoragePutItemCompleteEventData" = "lore_storage_put_item_complete_event_data_t"
+"LoreStoragePutStatsEventData" = "lore_storage_put_stats_event_data_t"
 "LoreStorageGetHeaderEventData" = "lore_storage_get_header_event_data_t"
 "LoreStorageGetDataEventData" = "lore_storage_get_data_event_data_t"
 "LoreStorageGetFragmentEventData" = "lore_storage_get_fragment_event_data_t"
@@ -546,6 +602,13 @@ include = [
 "LoreRevisionTreeCommitCompleteEventData" = "lore_revision_tree_commit_complete_event_data_t"
 "LoreRevisionTreeCloseCompleteEventData" = "lore_revision_tree_close_complete_event_data_t"
 "LoreRevisionTreeListChildrenBeginEventData" = "lore_revision_tree_list_children_begin_event_data_t"
+"LoreRevisionGraphBranchEventData" = "lore_revision_graph_branch_event_data_t"
+"LoreRevisionGraphInstanceEventData" = "lore_revision_graph_instance_event_data_t"
+"LoreRevisionGraphRevisionEventData" = "lore_revision_graph_revision_event_data_t"
+"LoreRevisionGraphLocationCompleteEventData" = "lore_revision_graph_location_complete_event_data_t"
+"LoreRevisionGraphBranchMetadataEventData" = "lore_revision_graph_branch_metadata_event_data_t"
+"LoreRevisionGraphBranchSyncedEventData" = "lore_revision_graph_branch_synced_event_data_t"
+"LoreRevisionGraphBranchPushedEventData" = "lore_revision_graph_branch_pushed_event_data_t"
 "LoreRevisionTree" = "lore_revision_tree_t"
 "LoreRevisionTreeLoadArgs" = "lore_revision_tree_load_args_t"
 "LoreRevisionTreeCloseArgs" = "lore_revision_tree_close_args_t"
@@ -577,6 +640,20 @@ include = [
 "LoreArray_lore_revision_tree_metadata_get_entry" = "lore_revision_tree_metadata_get_entry_array_t"
 "LoreRevisionTreeCommitArgs" = "lore_revision_tree_commit_args_t"
 "LoreRevisionTreeCommitOptions" = "lore_revision_tree_commit_options_t"
+"LoreRevisionIdentifier" = "lore_revision_identifier_t"
+"LoreRevisionGraphRevisionResolveArgs" = "lore_revision_graph_revision_resolve_args_t"
+"LoreRevisionGraphBranchResolveArgs" = "lore_revision_graph_branch_resolve_args_t"
+"LoreRevisionGraphBranchListArgs" = "lore_revision_graph_branch_list_args_t"
+"LoreRevisionGraphBranchMetadataGetArgs" = "lore_revision_graph_branch_metadata_get_args_t"
+"LoreRevisionGraphBranchMetadataEntry" = "lore_revision_graph_branch_metadata_entry_t"
+"LoreArray_lore_revision_graph_branch_metadata_entry" = "lore_revision_graph_branch_metadata_entry_array_t"
+"LoreRevisionGraphBranchMetadataSetArgs" = "lore_revision_graph_branch_metadata_set_args_t"
+"LoreRevisionGraphBranchCreateArgs" = "lore_revision_graph_branch_create_args_t"
+"LoreRevisionGraphBranchArchiveArgs" = "lore_revision_graph_branch_archive_args_t"
+"LoreRevisionGraphBranchSyncOptions" = "lore_revision_graph_branch_sync_options_t"
+"LoreRevisionGraphBranchSyncArgs" = "lore_revision_graph_branch_sync_args_t"
+"LoreRevisionGraphBranchPushOptions" = "lore_revision_graph_branch_push_options_t"
+"LoreRevisionGraphBranchPushArgs" = "lore_revision_graph_branch_push_args_t"
 "LoreString" = "lore_string_t"
 "LoreArray_instance_id" = "lore_instance_id_array_t"
 "LoreStringArray" = "lore_string_array_t"

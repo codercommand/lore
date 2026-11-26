@@ -11,9 +11,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
 
-        assert!(lore_transport::auth::exchange::is_expired(
-            current.as_millis() as u64
-        ));
+        assert!(lore_credential::is_expired(current.as_millis() as u64));
     }
 
     #[test]
@@ -22,7 +20,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
 
-        assert!(!lore_transport::auth::exchange::is_expired(
+        assert!(!lore_credential::is_expired(
             (current + Duration::from_secs(1)).as_millis() as u64
         ));
     }
@@ -33,7 +31,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
 
-        assert!(lore_transport::auth::exchange::is_expired(
+        assert!(lore_credential::is_expired(
             (current - Duration::from_secs(1)).as_millis() as u64
         ));
     }
@@ -47,9 +45,12 @@ mod tests {
             JWTUserInfo {
                 issuer: "my_test_issuer.example.com".to_string(),
                 user_id: "my_user_id".into(),
+                identity: None,
+                identity_namespaced: None,
                 name: Some("my_name".into()),
                 preferred_username: None,
                 is_service_account: None,
+                issued_at: None,
                 expires: 1,
                 audience,
                 root_domains: None,

@@ -15,6 +15,7 @@ use lore_base::types::Partition;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -25,6 +26,7 @@ use lore_server::protocol::storage::messages::LoreResponse;
 use lore_server::protocol::storage::messages::Message;
 use lore_server::protocol::storage::messages::MessageHandleError;
 use lore_server::protocol::storage::messages::MessageParseError;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
@@ -32,6 +34,7 @@ use lore_storage::StoreObliterateStats;
 use lore_storage::immutable_store::CopyBehavior;
 use rand::random;
 
+use crate::store::test_support::SlowDownImmutableStore;
 use crate::store::test_support::test_store_create;
 
 fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
@@ -49,7 +52,7 @@ impl RepositoryAuthorizer for FixedPartitionsAuthorizer {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), tonic::Status> {
         if self.0.contains(&repository_id) {
             Ok(())
@@ -79,6 +82,16 @@ struct MockCopyFailStore;
 
 #[async_trait]
 impl ImmutableStore for MockCopyFailStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn query(
         self: Arc<Self>,
         _partition: Partition,
@@ -151,7 +164,7 @@ impl ImmutableStore for MockCopyFailStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -180,6 +193,16 @@ struct MockCopySuccessStore;
 
 #[async_trait]
 impl ImmutableStore for MockCopySuccessStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn query(
         self: Arc<Self>,
         _partition: Partition,
@@ -252,7 +275,7 @@ impl ImmutableStore for MockCopySuccessStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -504,6 +527,30 @@ async fn test_handle_fragment_not_found() {
 }
 
 #[tokio::test]
+async fn test_handle_slow_down() {
+    let message = make_copy_message();
+
+    let destination_repository = random::<RepositoryId>();
+    let context_map = Arc::new(AttributeMap::default());
+    context_map.insert(destination_repository);
+
+    let store: Arc<dyn ImmutableStore> = Arc::new(SlowDownImmutableStore);
+
+    let (_unused_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            match message.handle(context_map, store, allow_all()).await {
+                Err(MessageHandleError::SlowDown) => (),
+                Err(e) => panic!("Expected SlowDown error, got {e:?}"),
+                Ok(_) => panic!("Expected SlowDown error, got Ok"),
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn test_handle_success() {
     let message = make_copy_message();
 
@@ -579,7 +626,11 @@ async fn test_copy_full_pipeline_success() {
                 .await
                 .expect("Failed to put fragment into repo A");
 
-            store.clone().flush(true).await.expect("Failed to flush");
+            store
+                .clone()
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("Failed to flush");
 
             // Build a context map connected to repo B (the destination)
             let context_map = Arc::new(AttributeMap::default());
@@ -682,7 +733,11 @@ async fn test_copy_idempotent_via_handler() {
                 .await
                 .expect("Failed to put fragment into repo A");
 
-            store.clone().flush(true).await.expect("Failed to flush");
+            store
+                .clone()
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("Failed to flush");
 
             let context_map = Arc::new(AttributeMap::default());
             context_map.insert(repo_b);
@@ -808,7 +863,11 @@ async fn test_copy_stream_continuity_not_found_in_middle() {
                 .await
                 .expect("Failed to put fragment 2");
 
-            store.clone().flush(true).await.expect("Failed to flush");
+            store
+                .clone()
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("Failed to flush");
 
             let context_map = Arc::new(AttributeMap::default());
             context_map.insert(repo_b);

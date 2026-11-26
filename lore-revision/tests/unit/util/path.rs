@@ -4,17 +4,13 @@ use std::str::FromStr;
 
 use lore_revision::util::path::*;
 
-/// What `f` returns and the allocations the calling thread made running it.
-///
-/// Counting stays on, since switching it off would undercount a test measuring on another thread.
-fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
-    lore_base::allocator::set_allocation_counting(true);
-    let before = lore_base::allocator::thread_allocation_count();
-    let value = std::hint::black_box(f());
-    (
-        value,
-        lore_base::allocator::thread_allocation_count() - before,
-    )
+use super::allocations_during;
+
+/// A walk holds a path per change, millions for a large tree, so a path stays 24 bytes: the shared
+/// data and four 32-bit offsets.
+#[test]
+fn a_path_is_24_bytes() {
+    assert_eq!(std::mem::size_of::<RelativePath>(), 24);
 }
 
 /// A path built from a string makes its two strings and the shared data once each, never
@@ -72,6 +68,22 @@ fn a_path_below_a_partial_name_match_is_nothing() {
         )),
         None
     );
+}
+
+/// A path is strictly below an ancestor whatever the case of either, as node lookups ignore
+/// case; the ancestor itself, a case-only respelling of it and a name that merely shares its
+/// prefix are not below it, and nothing is below an empty ancestor.
+#[test]
+fn a_path_strictly_below_an_ancestor_is_found_case_aside() {
+    let path = |name: &str| RelativePath::new_from_clean_parts(name, "");
+    assert!(path("a/b").is_below_ignore_case(&path("a")));
+    assert!(path("A/b").is_below_ignore_case(&path("a")));
+    assert!(path("ä/b").is_below_ignore_case(&path("Ä")));
+    assert!(!path("a").is_below_ignore_case(&path("a")));
+    assert!(!path("A").is_below_ignore_case(&path("a")));
+    assert!(!path("ab/x").is_below_ignore_case(&path("a")));
+    assert!(!path("a").is_below_ignore_case(&path("a/b")));
+    assert!(!path("a").is_below_ignore_case(&RelativePath::new()));
 }
 
 #[test]
@@ -232,6 +244,90 @@ fn shared_component_depth_counts_whole_components() {
     assert_eq!(shared_component_depth("a/b", "a/b/c"), 2);
     assert_eq!(shared_component_depth("", "a"), 0);
     assert_eq!(shared_component_depth("a", "a"), 1);
+}
+
+/// The paths a search of a sorted set is checked against. They hold the cases a search can get
+/// wrong: names that sort between `a` and `a/` (`a-x`, `a.x`), names that share a prefix but not a
+/// component (`ab`), the empty path, paths that are not clean (`a/`, `a//b`), and names past ASCII.
+const SEARCHED_PATHS: [&str; 14] = [
+    "", "a", "a/b", "a/b/c", "a-x", "a.x", "a/b-x", "a/b.x", "ab", "a/", "a//b", "b", "é", "é/b",
+];
+
+/// Each set of [`SEARCHED_PATHS`], in byte order.
+fn sorted_sets() -> impl Iterator<Item = Vec<&'static str>> {
+    (0u32..1 << SEARCHED_PATHS.len()).map(|set| {
+        let mut sorted: Vec<&str> = (0..SEARCHED_PATHS.len())
+            .filter(|at| set & (1 << at) != 0)
+            .map(|at| SEARCHED_PATHS[at])
+            .collect();
+        sorted.sort_unstable();
+        sorted
+    })
+}
+
+/// The search of a sorted set for a path or a path below it answers as a scan for the path and for
+/// the paths starting with it and a `/`, for each set of [`SEARCHED_PATHS`], and allocates nothing.
+#[test]
+fn covers_any_answers_as_a_scan_for_the_path_and_the_paths_below_it() {
+    for sorted in sorted_sets() {
+        for path in SEARCHED_PATHS {
+            let below = format!("{path}/");
+            let scanned = sorted
+                .iter()
+                .any(|held| *held == path || held.starts_with(&below));
+            let (covered, allocated) = allocations_during(|| covers_any(&sorted, path));
+            assert_eq!(covered, scanned, "{path:?} against {sorted:?}");
+            assert_eq!(allocated, 0, "{path:?} against {sorted:?} allocated");
+        }
+    }
+}
+
+/// The search of a sorted set for a path covering one answers as a scan comparing
+/// `RelativePath::covers` against every path of it, for each set of [`SEARCHED_PATHS`], and
+/// allocates nothing.
+#[test]
+fn covered_by_any_answers_as_a_scan_of_covers() {
+    for sorted in sorted_sets() {
+        for path in SEARCHED_PATHS {
+            let relative = RelativePath::from_str(path).expect("path");
+            let scanned = sorted.iter().any(|held| {
+                RelativePath::from_str(held)
+                    .expect("path")
+                    .covers(&relative)
+            });
+            let (covered, allocated) = allocations_during(|| covered_by_any(&sorted, path));
+            assert_eq!(covered, scanned, "{path:?} against {sorted:?}");
+            assert_eq!(allocated, 0, "{path:?} against {sorted:?} allocated");
+        }
+    }
+}
+
+/// The search of a sorted set answers as a scan comparing `RelativePath::overlaps` against every
+/// path of it, for each set of [`SEARCHED_PATHS`].
+#[test]
+fn overlaps_any_answers_as_a_scan_of_overlaps() {
+    let relative: Vec<RelativePath> = SEARCHED_PATHS
+        .iter()
+        .map(|path| RelativePath::from_str(path).expect("path"))
+        .collect();
+    let relative_of = |path: &str| {
+        &relative[SEARCHED_PATHS
+            .iter()
+            .position(|searched| *searched == path)
+            .expect("a searched path")]
+    };
+    for sorted in sorted_sets() {
+        for path in SEARCHED_PATHS {
+            let scanned = sorted
+                .iter()
+                .any(|held| relative_of(held).overlaps(relative_of(path)));
+            assert_eq!(
+                overlaps_any(&sorted, path),
+                scanned,
+                "{path:?} against {sorted:?}"
+            );
+        }
+    }
 }
 
 /// The steps a path takes to reach canonical form, each of which leaves a
@@ -407,6 +503,70 @@ mod repository_relative_path {
     }
 }
 
+/// A path of `components`, joined without the checks a parsed path is held to, as a tree's names
+/// are.
+fn joined(components: &[&str]) -> RelativePath {
+    components
+        .iter()
+        .fold(RelativePath::new(), |path, component| path.join(component))
+}
+
+/// A path is placed below the root only where it names an entry below it on every platform, so
+/// one that starts at a root, or holds a component no node may be named, is refused.
+#[test]
+fn a_path_that_leaves_the_root_on_any_platform_has_no_absolute_path() {
+    let root = std::path::Path::new("root");
+    for components in [
+        &["C:"][..],
+        &["C:", "Temp", "planted.bat"],
+        &["C:.."],
+        &["a", "C:", "b"],
+        &["a", "C:x"],
+        &[".."],
+        &["a", ".."],
+        &["a", "..", "..", "escape"],
+        &["/etc", "passwd"],
+        &["a\\..\\..\\escape"],
+        &["."],
+        &["a", "..."],
+        &[" "],
+        &["a", "file::$DATA"],
+        &[".lore", "config.toml"],
+        &["sub", "LORE~1"],
+        &["sub.", "x"],
+        &["a", "name "],
+    ] {
+        let path = joined(components);
+        assert!(
+            path.to_absolute_path(root).is_err(),
+            "{path} must be refused"
+        );
+    }
+}
+
+#[test]
+fn a_path_below_the_root_has_the_absolute_path_it_names() {
+    let root = std::path::Path::new("root");
+    for components in [
+        &[][..],
+        &["a"],
+        &["a", "b.txt"],
+        &[".hidden"],
+        &["a..b"],
+        &[".loreignore"],
+        &["notes:draft"],
+        &["logs", "12:00.log"],
+        &["File::Spec.3pm"],
+    ] {
+        let path = joined(components);
+        assert_eq!(
+            path.to_absolute_path(root).expect("a path below the root"),
+            root.join(path.as_str()),
+            "{path}"
+        );
+    }
+}
+
 /// The lowercase view has to narrow with the one it mirrors, or a filter would fold a
 /// parent against a name the path no longer holds.
 #[test]
@@ -465,6 +625,38 @@ mod a_user_path_through_the_dot_directory {
     #[test]
     fn a_name_that_merely_begins_with_it_is_accepted() {
         for candidate in ["/a/b/.loreignore", "/a/b/.urcignore", "/a/b/.lorebak/x"] {
+            assert!(
+                RelativePath::new_from_user_path(Path::new("/a/b"), candidate).is_ok(),
+                "{candidate} must be accepted"
+            );
+        }
+    }
+
+    /// No node carries a name Windows reads as a drive, a stream alias or the dot directory, so
+    /// a user path through one is refused as the dot directory is, and one through any other
+    /// colon is a path like any other.
+    #[test]
+    fn is_refused_through_a_name_no_node_carries() {
+        for candidate in [
+            "/a/b/sub/C:",
+            "/a/b/sub/file::$DATA",
+            "/a/b/dir:$I30:$INDEX_ALLOCATION/x",
+            "/a/b/.lore./config.toml",
+            "/a/b/.lore:stream",
+            "/a/b/LORE~1/id",
+            "/a/b/sub./x",
+            "/a/b/name ",
+        ] {
+            assert!(
+                RelativePath::new_from_user_path(Path::new("/a/b"), candidate).is_err(),
+                "{candidate} must be refused"
+            );
+        }
+        for candidate in [
+            "/a/b/notes:draft",
+            "/a/b/logs/12:00.log",
+            "/a/b/File::Spec.3pm",
+        ] {
             assert!(
                 RelativePath::new_from_user_path(Path::new("/a/b"), candidate).is_ok(),
                 "{candidate} must be accepted"

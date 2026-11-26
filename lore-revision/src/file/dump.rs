@@ -14,7 +14,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event reporting the stored representation of file content.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode, lore_macro::WireSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDumpEventData {
     /// Address of the content.
@@ -31,6 +31,8 @@ pub struct LoreFileDumpEventData {
 
 #[error_set]
 pub enum DumpError {
+    Cancelled,
+    LinkPinsDiverge,
     AddressNotFound,
     Disconnected,
     InvalidArguments,
@@ -95,25 +97,23 @@ pub(crate) async fn dump_file(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<DumpError>("deserializing state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<DumpError>("deserializing state")?;
 
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let found = state
+        .locate_node(repository.clone(), relative_path.as_str())
         .await
         .forward::<DumpError>("invalid node")?;
 
-    if !node_link.is_valid() {
+    if !found.is_valid() {
         return Err(DumpError::internal("invalid node"));
     }
 
-    let node = state
-        .node(repository.clone(), node_link.node)
-        .await
-        .forward::<DumpError>("invalid node")?;
-
-    dump_address(repository, node.address).await?;
+    let held = found.held((repository, state));
+    let node = held.read().await.forward::<DumpError>("invalid node")?;
+    dump_address(held.repository().clone(), node.address).await?;
 
     Ok(())
 }

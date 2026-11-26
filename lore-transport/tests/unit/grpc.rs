@@ -1,14 +1,20 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use lore_base::error::AddressNotFound;
+use lore_base::types::Hash;
 use lore_transport::error::ProtocolError;
+use lore_transport::error::branch_push_error;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Status;
+use tonic::service::Routes;
 use tower::ServiceBuilder;
 
 mod environment_client;
+mod revision_client;
 mod storage_client;
 
 use std::sync::atomic::AtomicUsize;
@@ -24,6 +30,38 @@ fn test_connection() -> GRPCConnection {
         .layer(RequestLoggerLayer {})
         .service(endpoint.connect_lazy());
     GRPCConnection::for_test("http://127.0.0.1:1".parse().expect("test url"), channel)
+}
+
+/// Serves `routes` on a loopback listener for the rest of the test, and returns the listener's
+/// address.
+pub(crate) async fn serve_on_loopback(routes: Routes) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback listener");
+    let address = listener.local_addr().expect("the listener's address");
+    lore_base::lore_spawn!(
+        tonic::transport::Server::builder()
+            .add_routes(routes)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+    );
+    address
+}
+
+/// Serves `routes` as [`serve_on_loopback`] does, and returns the listener's address and a
+/// channel connected to it through [`RequestLoggerLayer`].
+pub(crate) async fn serve_logged(routes: Routes) -> (SocketAddr, Channel) {
+    let address = serve_on_loopback(routes).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{address}"))
+        .expect("the server's URL")
+        .connect()
+        .await
+        .expect("connect to the test server");
+    (
+        address,
+        ServiceBuilder::new()
+            .layer(RequestLoggerLayer {})
+            .service(channel),
+    )
 }
 
 /// An operation the remote answers is returned as-is, without reconnecting.
@@ -88,6 +126,34 @@ async fn attempts_are_bounded_when_the_channel_never_recovers() {
     assert_eq!(rebuilds.load(Ordering::Relaxed), MAX_RECONNECTS_PER_OP);
 }
 
+/// A failed rebuild ends the call with its error, without another attempt.
+#[tokio::test]
+async fn a_failed_rebuild_returns_its_error() {
+    let connection = test_connection();
+    let attempts = AtomicUsize::new(0);
+    let rebuilds = AtomicUsize::new(0);
+
+    let result: Result<(), ProtocolError> = with_reconnect(
+        &connection,
+        || async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(ProtocolError::from(lore_base::error::Disconnected))
+        },
+        |_| async {
+            rebuilds.fetch_add(1, Ordering::Relaxed);
+            Err(ProtocolError::from(lore_base::error::NotAuthenticated))
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(&result, Err(err) if err.is_not_authenticated()),
+        "{result:?}"
+    );
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(rebuilds.load(Ordering::Relaxed), 1);
+}
+
 /// Each attempt reads the epoch afresh, so a later attempt still drives a real reconnect.
 ///
 /// Capturing it once outside the loop is the defect this pins: after the first rebuild the
@@ -128,7 +194,7 @@ async fn a_request_does_not_hold_its_rebuild() {
 
     let request = with_reconnect(
         &connection,
-        || async { Ok(()) },
+        || async { Ok::<(), ProtocolError>(()) },
         |_| async {
             let state = [0u8; 4096];
             tokio::task::yield_now().await;
@@ -181,6 +247,59 @@ fn a_missing_address_round_trips_through_the_headers() {
     );
 }
 
+/// `Unauthenticated` maps to `NotAuthenticated`.
+#[test]
+fn unauthenticated_maps_to_not_authenticated() {
+    let error = ProtocolError::from(Status::unauthenticated("authorization header required"));
+    assert!(error.is_not_authenticated(), "{error:?}");
+}
+
+/// A refusal keeps the remote's reason for it on its trace.
+#[test]
+fn a_refusal_keeps_the_remotes_reason_on_its_trace() {
+    for status in [
+        Status::unauthenticated("the token expired"),
+        Status::permission_denied("the token expired"),
+    ] {
+        let error = ProtocolError::from(status);
+        assert!(
+            error.trace().locations().iter().any(|location| location
+                .context()
+                .is_some_and(|context| context.contains("the token expired"))),
+            "{error:?}"
+        );
+    }
+}
+
+/// A slow down keeps the remote's reason on its trace, as a refusal does.
+#[test]
+fn a_slow_down_keeps_the_remotes_reason_on_its_trace() {
+    let error = ProtocolError::from(Status::resource_exhausted("use branch info"));
+    assert!(error.is_slow_down(), "{error:?}");
+    assert!(
+        error.trace().locations().iter().any(|location| location
+            .context()
+            .is_some_and(|context| context.contains("use branch info"))),
+        "{error:?}"
+    );
+}
+
+/// A refusal the remote gives no reason for adds no context to the trace.
+#[test]
+fn a_refusal_without_a_reason_adds_no_context() {
+    for status in [Status::unauthenticated(""), Status::permission_denied("")] {
+        let error = ProtocolError::from(status);
+        assert!(
+            error
+                .trace()
+                .locations()
+                .iter()
+                .all(|location| location.context().is_none()),
+            "{error:?}"
+        );
+    }
+}
+
 /// `NotFound` names an absent object, which a caller recovers from by
 /// creating it, and never an address.
 #[test]
@@ -205,6 +324,35 @@ fn a_failed_precondition_without_details_is_not_an_address() {
     assert!(error.is_internal(), "{error:?}");
 }
 
+/// A branch push the remote refuses as not a fast-forward, or as a fast-forward merge that
+/// conflicts, and marks so, is `BranchAdvanced`. One it refuses for a missing fragment names the
+/// fragment, and another status maps as any call's does.
+#[test]
+fn a_refused_branch_push_is_branch_advanced() {
+    let refused = branch_push_error(branch_advanced_status(
+        Hash::from([3; 32]),
+        "Branch push is not a fast-forward",
+    ));
+    let missing = branch_push_error(Status::from(ProtocolError::from(missing_address())));
+    let unavailable = branch_push_error(Status::unavailable("restarting"));
+
+    assert!(
+        refused.is_branch_advanced()
+            && missing.is_address_not_found()
+            && unavailable.is_disconnected(),
+        "{refused:?}; {missing:?}; {unavailable:?}"
+    );
+}
+
+/// A branch push refused with `FAILED_PRECONDITION` and no mark, as a pre-push hook or an older
+/// Lore Server refuses it, is no `BranchAdvanced`.
+#[test]
+fn an_unmarked_refusal_of_a_branch_push_is_internal() {
+    let refused = branch_push_error(Status::failed_precondition("refused by a hook"));
+
+    assert!(refused.is_internal(), "{refused:?}");
+}
+
 /// Details of any other length are not guessed at.
 #[test]
 fn details_of_another_length_are_not_read_as_an_address() {
@@ -216,4 +364,41 @@ fn details_of_another_length_are_not_read_as_an_address() {
 
     let error = ProtocolError::from(status);
     assert!(error.is_internal(), "{error:?}");
+}
+
+fn authorization_header(auth: GRPCAuth) -> Option<String> {
+    let mut interceptor = AuthnInterceptor {
+        auth: std::sync::Arc::new(parking_lot::RwLock::new(auth)),
+    };
+    let request = tonic::service::Interceptor::call(&mut interceptor, tonic::Request::new(()))
+        .expect("the interceptor accepts the request");
+    request
+        .metadata()
+        .get("authorization")
+        .map(|value| value.to_str().expect("an ASCII header").to_string())
+}
+
+/// The repository service sends the authentication token, and the authorization token when there
+/// is none: a caller that supplied only an access token presents it.
+#[test]
+fn the_authn_interceptor_falls_back_to_the_authorization_token() {
+    let both = GRPCAuth {
+        authentication_token: "identity".to_string(),
+        authorization_token: "access".to_string(),
+        ..Default::default()
+    };
+    let access_only = GRPCAuth {
+        authorization_token: "access".to_string(),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        authorization_header(both).as_deref(),
+        Some("Bearer identity")
+    );
+    assert_eq!(
+        authorization_header(access_only).as_deref(),
+        Some("Bearer access")
+    );
+    assert_eq!(authorization_header(GRPCAuth::default()), None);
 }

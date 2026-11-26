@@ -314,9 +314,9 @@ pub fn serve(
     };
 
     let mut layers = vec![VirtualLayer {
-        module: repository.clone(),
-        module_path: RelativePath::default(),
-        layer_path: RelativePath::default(),
+        repository: repository.clone(),
+        source_path: RelativePath::default(),
+        mount_path: RelativePath::default(),
         state: state.clone(),
     }];
     if let Some(layer) = layer {
@@ -426,15 +426,14 @@ unsafe extern "system" fn start_directory_enumeration(
 
             if let Ok(metadata) = instance_context.layers[0]
                 .state
-                .revision_metadata(instance_context.layers[0].module.clone())
+                .revision_metadata(instance_context.layers[0].repository.clone())
                 .await
             {
                 metadata.timestamp
             } else {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|t| t.as_millis())
-                    .unwrap_or_default() as u64
+                    .map_or_default(|t| t.as_millis()) as u64
             }
         },
     ));
@@ -547,19 +546,19 @@ async unsafe fn get_directory_enumeration_async(
 
         // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
         let relative_path = RelativePath::new_from_mount_path(
-            instance_context.layers[0].module.path.as_path(),
+            instance_context.layers[0].repository.path.as_path(),
             file_path.as_str(),
         )
         .unwrap_or_default();
 
         for (layer_index, layer) in instance_context.layers.iter().enumerate() {
             if !file_path.is_empty() {
-                if layer.layer_path.is_empty()
-                    || layer.layer_path.as_str().starts_with(file_path.as_str())
+                if layer.mount_path.is_empty()
+                    || layer.mount_path.as_str().starts_with(file_path.as_str())
                 {
-                    let Ok(node_link) = layer
+                    let Ok(found) = layer
                         .state
-                        .find_node_link(layer.module.clone(), relative_path.as_str())
+                        .locate_node(layer.repository.clone(), relative_path.as_str())
                         .await
                     else {
                         lore_debug!(
@@ -567,17 +566,16 @@ async unsafe fn get_directory_enumeration_async(
                         );
                         continue;
                     };
-                    if node_link.repository != layer.module.id {
+                    let Some(node) = found.own_node() else {
                         lore_debug!("Layer {layer_index} modules not yet supported");
                         continue;
-                    }
-                    base_nodes[layer_index] = Some(node_link.node);
+                    };
+                    base_nodes[layer_index] = Some(node);
                     lore_debug!(
-                        "Layer {layer_index} base directory: {relative_path} (node {})",
-                        node_link.node
+                        "Layer {layer_index} base directory: {relative_path} (node {node})"
                     );
                 }
-            } else if layer.layer_path.is_empty() {
+            } else if layer.mount_path.is_empty() {
                 base_nodes[layer_index] = Some(ROOT_NODE);
             }
         }
@@ -595,27 +593,27 @@ async unsafe fn get_directory_enumeration_async(
                 let (directory_path, search) = enum_instance.search.split_at(sep);
 
                 let relative_path = RelativePath::new_from_mount_path(
-                    instance_context.layers[0].module.path.as_path(),
+                    instance_context.layers[0].repository.path.as_path(),
                     directory_path,
                 )
                 .unwrap_or_default();
 
                 // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
                 for (layer_index, layer) in instance_context.layers.iter().enumerate() {
-                    if layer.layer_path.is_empty()
-                        || layer.layer_path.as_str().starts_with(directory_path)
+                    if layer.mount_path.is_empty()
+                        || layer.mount_path.as_str().starts_with(directory_path)
                     {
-                        if let Ok(base_link) = layer
+                        if let Ok(found) = layer
                             .state
-                            .find_node_link(layer.module.clone(), relative_path.as_str())
+                            .locate_node(layer.repository.clone(), relative_path.as_str())
                             .await
                         {
-                            base_nodes[layer_index] = Some(base_link.node);
+                            base_nodes[layer_index] = found.own_node();
                             lore_debug!(
-                                "Search directory: Layer {layer_index} search {} directory {} matched node {}",
+                                "Search directory: Layer {layer_index} search {} directory {} matched node {:?}",
                                 enum_instance.search,
                                 directory_path,
-                                base_nodes[layer_index].unwrap_or_default()
+                                base_nodes[layer_index]
                             );
                         } else {
                             lore_debug!(
@@ -650,7 +648,12 @@ async unsafe fn get_directory_enumeration_async(
                 // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
                 let Ok(child_nodes) = layer
                     .state
-                    .collect_named_children_unsorted(layer.module.clone(), base_node, false, false)
+                    .collect_named_children_unsorted(
+                        layer.repository.clone(),
+                        base_node,
+                        false,
+                        false,
+                    )
                     .await
                 else {
                     lore_debug!(
@@ -663,7 +666,7 @@ async unsafe fn get_directory_enumeration_async(
                 for child_node in child_nodes.iter() {
                     if let Ok(node) = layer
                         .state
-                        .node(layer.module.clone(), child_node.node)
+                        .node(layer.repository.clone(), child_node.node)
                         .await
                     {
                         lore_debug!(
@@ -832,27 +835,24 @@ async unsafe fn get_placeholder_info_async(
     path: String,
 ) -> Result<(), i32> {
     for (layer_index, layer) in instance_context.layers.iter().enumerate() {
-        let repository = layer.module.clone();
+        let repository = layer.repository.clone();
         let state = layer.state.clone();
 
         let relative_path =
             RelativePath::new_from_mount_path(repository.require_path()?, path.as_str())
                 .unwrap_or_default();
 
-        let Ok(node_link) = state
-            .find_node_link(repository.clone(), relative_path.as_str())
+        let Ok(found) = state
+            .locate_node(repository.clone(), relative_path.as_str())
             .await
         else {
             continue;
         };
-        if !node_link.is_valid() {
+        if !found.is_valid() {
             continue;
         }
-        let Ok((repository, state)) = node_link.resolve(repository.clone(), state.clone()).await
-        else {
-            continue;
-        };
-        let Ok(node) = state.node(repository.clone(), node_link.node).await else {
+        let (node_id, (repository, state)) = found.held((repository, state)).into_parts();
+        let Ok(node) = state.node(repository.clone(), node_id).await else {
             continue;
         };
         if node.is_staged_delete() {
@@ -864,8 +864,7 @@ async unsafe fn get_placeholder_info_async(
         } else {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|t| t.as_millis())
-                .unwrap_or_default() as u64
+                .map_or_default(|t| t.as_millis()) as u64
         };
 
         let timestamp = ms_filetime(timestamp) as i64;
@@ -928,7 +927,7 @@ unsafe extern "system" fn query_file_name(
         unsafe { slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName)) };
     let path = String::from_utf16_lossy(path);
     let relative_path = RelativePath::new_from_mount_path(
-        instance_context.layers[0].module.path.as_path(),
+        instance_context.layers[0].repository.path.as_path(),
         path.as_str(),
     )
     .unwrap_or_default();
@@ -950,12 +949,12 @@ async fn query_file_name_async(
     relative_path: RelativePath,
 ) -> Result<NodeLink, i32> {
     for layer in instance_context.layers.iter() {
-        if let Ok(node_link) = layer
+        if let Ok(found) = layer
             .state
-            .find_node_link(layer.module.clone(), relative_path.as_str())
+            .locate_node(layer.repository.clone(), relative_path.as_str())
             .await
         {
-            return Ok(node_link);
+            return Ok(found.identity());
         }
     }
 
@@ -974,7 +973,7 @@ unsafe extern "system" fn get_file_data(
         unsafe { slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName)) };
     let path = String::from_utf16_lossy(path);
     let relative_path = RelativePath::new_from_mount_path(
-        instance_context.layers[0].module.path.as_path(),
+        instance_context.layers[0].repository.path.as_path(),
         path.as_str(),
     )
     .unwrap_or_default();
@@ -1004,26 +1003,23 @@ async fn get_file_data_async(
     lore_debug!("Get file data: {path}");
 
     for layer in instance_context.layers.iter() {
-        let Ok(node_link) = layer
+        let Ok(found) = layer
             .state
-            .find_node_link(layer.module.clone(), path.as_str())
+            .locate_node(layer.repository.clone(), path.as_str())
             .await
         else {
             continue;
         };
 
-        if !node_link.is_valid() {
+        if !found.is_valid() {
             continue;
         }
 
-        let Ok((repository, state)) = node_link
-            .resolve(layer.module.clone(), layer.state.clone())
-            .await
-        else {
-            continue;
-        };
+        let (node_id, (repository, state)) = found
+            .held((layer.repository.clone(), layer.state.clone()))
+            .into_parts();
 
-        let Ok(node) = state.node(repository.clone(), node_link.node).await else {
+        let Ok(node) = state.node(repository.clone(), node_id).await else {
             continue;
         };
 
@@ -1063,10 +1059,10 @@ async fn get_file_data_async(
                 },
                 // Safety: Ok as buffer is verified non-null and range is clamped above
                 unsafe { slice::from_raw_parts_mut(write_buffer.cast::<u8>(), to_read) },
-                immutable::ReadOptions::default()
-                    .with_decompress()
-                    .with_remote()
-                    .with_verify(),
+                immutable::ReadOptions {
+                    trust_remote: immutable::read_options_from_repository(&repository).trust_remote,
+                    ..immutable::ReadOptions::default()
+                },
             )
             .await
             {
@@ -1109,25 +1105,6 @@ async fn get_file_data_async(
     Err(ERROR_FILE_NOT_FOUND)
 }
 
-fn format_bytes_to_string(bytes: usize) -> String {
-    let mut unit = "bytes";
-
-    let converted = if bytes > 1024 * 1024 * 1024 {
-        unit = "GiB";
-        (bytes / (1024 * 1024)) as f64 / 1024.0
-    } else if bytes > 1024 * 1024 {
-        unit = "MiB";
-        (bytes / 1024) as f64 / 1024.0
-    } else if bytes > 1024 {
-        unit = "KiB";
-        bytes as f64 / 1024.0
-    } else {
-        bytes as f64
-    };
-
-    format!("{converted:.2} {unit}")
-}
-
 async fn prefetch_files(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -1148,36 +1125,29 @@ async fn prefetch_files(
             let repository = repository.clone();
             let state = state.clone();
             async move {
-                if let Ok(node_link) = state
-                    .find_node_link(repository.clone(), path.as_str())
-                    .await
-                {
-                    if node_link.is_valid() {
-                        if let Ok((repository, state)) = node_link.resolve(repository, state).await
-                        {
-                            if let Ok(node) = state.node(repository.clone(), node_link.node).await {
-                                if !node.address.hash.is_zero() {
-                                    let _ = immutable::cache(
-                                        repository.clone(),
-                                        vec![node.address],
-                                        true,
-                                    )
-                                    .await;
+                if let Ok(found) = state.locate_node(repository.clone(), path.as_str()).await {
+                    if found.is_valid() {
+                        let (node_id, (repository, state)) =
+                            found.held((repository, state)).into_parts();
+                        if let Ok(node) = state.node(repository.clone(), node_id).await {
+                            if !node.address.hash.is_zero() {
+                                let _ =
+                                    immutable::cache(repository.clone(), vec![node.address], true)
+                                        .await;
 
-                                    if let Ok(result) = repository
-                                        .immutable_store()
-                                        .query(repository.id, node.address, StoreMatch::MatchHash)
-                                        .await
-                                    {
-                                        /*
-                                        file_count
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        */
-                                        file_size.fetch_add(
-                                            result.fragment.size_content as usize,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                    }
+                                if let Ok(result) = repository
+                                    .immutable_store()
+                                    .query(repository.id, node.address, StoreMatch::MatchHash)
+                                    .await
+                                {
+                                    /*
+                                    file_count
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    */
+                                    file_size.fetch_add(
+                                        result.fragment.size_content as usize,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
                                 }
                             }
                         }
@@ -1208,7 +1178,9 @@ async fn prefetch_files(
                 println!(
                     "Prefetched {} files, {}",
                     current_file_count,
-                    format_bytes_to_string(file_size.load(std::sync::atomic::Ordering::Relaxed))
+                    lore_base::units::format_bytes_to_string(
+                        file_size.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                    )
                 );
                 last_file_count = current_file_count;
                 last_print = Instant::now();
@@ -1231,7 +1203,9 @@ async fn prefetch_files(
                 println!(
                     "Prefetched {} files, {}",
                     current_file_count,
-                    format_bytes_to_string(file_size.load(std::sync::atomic::Ordering::Relaxed))
+                    lore_base::units::format_bytes_to_string(
+                        file_size.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                    )
                 );
                 last_file_count = current_file_count;
                 last_print = Instant::now();
@@ -1242,6 +1216,8 @@ async fn prefetch_files(
     println!(
         "Prefetched done: {} files, {}",
         file_count.load(std::sync::atomic::Ordering::Relaxed),
-        format_bytes_to_string(file_size.load(std::sync::atomic::Ordering::Relaxed))
+        lore_base::units::format_bytes_to_string(
+            file_size.load(std::sync::atomic::Ordering::Relaxed) as u64,
+        )
     );
 }

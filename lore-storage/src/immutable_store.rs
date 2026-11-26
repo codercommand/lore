@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::types::HealResult;
 use lore_error_set::prelude::*;
 
 use crate::Address;
@@ -27,6 +28,7 @@ use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
+use crate::local::store_lock::StoreGuard;
 use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
@@ -46,6 +48,17 @@ pub enum StoreError {
     Maintenance,
     NoRemote,
     NotSupported,
+}
+
+impl StoreError {
+    /// Whether this is a store's answer for content it does not hold: `AddressNotFound`,
+    /// `PayloadNotFound` or `NotFound`.
+    pub fn is_absent(&self) -> bool {
+        matches!(
+            self,
+            Self::AddressNotFound(_) | Self::PayloadNotFound(_) | Self::NotFound(_)
+        )
+    }
 }
 
 /// Validate that a fragment's sizes appear valid. Use before allocating or
@@ -168,18 +181,128 @@ const FRAGMENT_FLAGS_DEFINED_COMPRESSORS: u32 = FragmentFlags::PayloadCompressed
 /// - Compressed fragments have `size_content <= FRAGMENT_SIZE_THRESHOLD`
 /// - Uncompressed, unfragmented fragments have `size_payload == size_content`
 ///
-/// All three Put protocols (QUIC, gRPC storage v1, legacy gRPC storage) and
-/// the replication-store Put call this at ingress so malformed metadata fails
-/// fast with a specific error rather than propagating into the store layer.
+/// All three Put protocols (QUIC, gRPC storage v1, legacy gRPC storage) call
+/// this at ingress so malformed metadata fails fast with a specific error
+/// rather than propagating into the store layer. A valid fragment passes in a
+/// few inlined instructions; the error is built in a cold function.
+#[inline]
 pub fn validate_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError> {
-    validate_fragment_size(fragment)?;
+    if fragment_metadata_is_valid(fragment) {
+        return Ok(());
+    }
+    refuse_fragment_metadata(fragment)
+}
 
+/// Whether a put of `fragment`, with a payload of `payload_len` bytes when there is one, is one a
+/// store keeps: [`fragment_is_consistent`] passes the fragment, a fragment list's payload size is
+/// a whole number of references, and the payload is the size it says. One expression, so that a
+/// local store's put, which nearly always passes, spends a few instructions on it and calls
+/// nothing.
+#[lore_macro::test_pub]
+#[inline]
+pub(crate) fn put_is_valid(fragment: &Fragment, payload_len: Option<usize>) -> bool {
+    fragment_is_consistent(fragment)
+        && (fragment.flags & FragmentFlags::PayloadFragmented.bits() == 0
+            || (fragment.size_payload as usize).is_multiple_of(size_of::<FragmentReference>()))
+        && payload_len.is_none_or(|len| len == fragment.size_payload as usize)
+}
+
+/// Why a put [`put_is_valid`] refuses is refused. Unless `enforced`, only the size checks of
+/// [`validate_fragment_payload`], or of [`validate_fragment_size`] without a payload, are made.
+#[lore_macro::test_pub]
+#[cold]
+#[inline(never)]
+pub(crate) fn refuse_put(
+    fragment: &Fragment,
+    payload_len: Option<usize>,
+    enforced: bool,
+) -> Result<(), StoreError> {
+    if !enforced {
+        return match payload_len {
+            Some(len) => validate_fragment_payload(fragment, len),
+            None => validate_fragment_size(fragment),
+        };
+    }
+    refuse_inconsistency(fragment)?;
+    if fragment.flags & FragmentFlags::PayloadFragmented.bits() != 0
+        && !(fragment.size_payload as usize).is_multiple_of(size_of::<FragmentReference>())
+    {
+        return Err(StoreError::internal(format!(
+            "fragment list of {} bytes is not a whole number of references",
+            fragment.size_payload
+        )));
+    }
+    if let Some(len) = payload_len {
+        validate_fragment_payload(fragment, len)?;
+    }
+    Ok(())
+}
+
+/// The checks of [`validate_fragment_metadata`] as one expression, without saying which fails.
+#[lore_macro::test_pub]
+#[inline]
+fn fragment_metadata_is_valid(fragment: &Fragment) -> bool {
+    fragment.flags & !FragmentFlags::all().bits() == 0
+        && fragment.flags
+            & FragmentFlags::PayloadCompressed.bits()
+            & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS
+            == 0
+        && fragment_is_consistent(fragment)
+}
+
+/// Whether nothing `fragment` says contradicts what this build knows, as one expression: no
+/// server-managed flag, at most one compression bit, not compressed and fragmented at once, and
+/// sizes within their bounds and agreeing with each other. A flag bit this build gives no meaning
+/// is not checked.
+#[lore_macro::test_pub]
+#[inline]
+fn fragment_is_consistent(fragment: &Fragment) -> bool {
+    let flags = fragment.flags;
+    let compressed = flags & FragmentFlags::PayloadCompressed.bits();
+    let fragmented = flags & FragmentFlags::PayloadFragmented.bits() != 0;
+    let size_payload = u64::from(fragment.size_payload);
+    let threshold = crate::FRAGMENT_SIZE_THRESHOLD as u64;
+    flags & FRAGMENT_FLAGS_SERVER_MANAGED_INGRESS_REJECTED == 0
+        && compressed & compressed.wrapping_sub(1) == 0
+        && (compressed == 0 || !fragmented)
+        && size_payload != 0
+        && size_payload <= threshold
+        && size_payload <= fragment.size_content
+        && (fragmented || fragment.size_content <= threshold)
+        && (compressed != 0 || fragmented || size_payload == fragment.size_content)
+}
+
+/// Which check of [`validate_fragment_metadata`] `fragment` fails, for one
+/// [`fragment_metadata_is_valid`] refuses.
+#[lore_macro::test_pub]
+#[cold]
+#[inline(never)]
+fn refuse_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError> {
     if fragment.flags & !FragmentFlags::all().bits() != 0 {
         return Err(StoreError::internal(format!(
             "fragment flags contain unknown bits: {:#x}",
             fragment.flags & !FragmentFlags::all().bits()
         )));
     }
+
+    let reserved = fragment.flags
+        & FragmentFlags::PayloadCompressed.bits()
+        & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS;
+    if reserved != 0 {
+        return Err(StoreError::internal(format!(
+            "fragment has reserved compression bit set: {reserved:#x}"
+        )));
+    }
+
+    refuse_inconsistency(fragment)
+}
+
+/// Which check of [`fragment_is_consistent`] `fragment` fails, for one it refuses.
+#[lore_macro::test_pub]
+#[cold]
+#[inline(never)]
+fn refuse_inconsistency(fragment: &Fragment) -> Result<(), StoreError> {
+    validate_fragment_size(fragment)?;
 
     if fragment.flags & FRAGMENT_FLAGS_SERVER_MANAGED_INGRESS_REJECTED != 0 {
         return Err(StoreError::internal(format!(
@@ -192,12 +315,6 @@ pub fn validate_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError>
     if compressed_bits.count_ones() > 1 {
         return Err(StoreError::internal(format!(
             "fragment has multiple compression flags set: {compressed_bits:#x}"
-        )));
-    }
-    if compressed_bits & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS != 0 {
-        return Err(StoreError::internal(format!(
-            "fragment has reserved compression bit set: {:#x}",
-            compressed_bits & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS
         )));
     }
 
@@ -243,11 +360,16 @@ pub fn validate_fragment_metadata(fragment: &Fragment) -> Result<(), StoreError>
 /// Checks:
 /// - `size_payload` is a non-zero multiple of `size_of::<FragmentReference>()`
 /// - Payload buffer length matches `size_payload`
-/// - At least two references are present
+/// - At least two references are present, or one that is a hole
 /// - `offset_content` is strictly increasing
 /// - `first_offset + size_content` does not overflow u64
 /// - `last_offset` is strictly inside the content window
 ///   `[first_offset, first_offset + size_content)`
+/// - No hole follows a hole, and in a list holding a hole, which is a list of leaves, every other
+///   reference spans at most [`FRAGMENT_SIZE_THRESHOLD`](crate::FRAGMENT_SIZE_THRESHOLD)
+///
+/// A hole is a reference with the zero hash: it names no fragment, and stands for a range holding
+/// no data, from its offset to the next reference's, which reads as zeros.
 pub fn validate_fragment_list(
     fragment: &Fragment,
     payload: &bytes::Bytes,
@@ -274,24 +396,15 @@ pub fn validate_fragment_list(
     let aligned = payload.clone().to_aligned::<FragmentReference>();
     let references = aligned.as_type_slice::<FragmentReference>();
 
-    if references.len() < 2 {
+    let one_hole = references.len() == 1 && references[0].is_hole();
+    if references.len() < 2 && !one_hole {
         return Err(StoreError::internal(format!(
             "fragmented fragment has fewer than 2 references ({})",
             references.len()
         )));
     }
 
-    for i in 1..references.len() {
-        if references[i].offset_content <= references[i - 1].offset_content {
-            return Err(StoreError::internal(format!(
-                "fragmented fragment offsets are not strictly increasing at index {i}"
-            )));
-        }
-    }
-
     let first = references[0].offset_content;
-    let last = references[references.len() - 1].offset_content;
-
     let content_end = first.checked_add(fragment.size_content).ok_or_else(|| {
         StoreError::internal(format!(
             "fragmented fragment first offset {first} + size_content {} overflows u64",
@@ -299,9 +412,50 @@ pub fn validate_fragment_list(
         ))
     })?;
 
-    if last >= content_end {
+    let fragment_size = crate::FRAGMENT_SIZE_THRESHOLD as u64;
+    let mut holes = references[0].is_hole();
+    let mut first_oversized = None;
+    for i in 1..references.len() {
+        let (previous, reference) = (&references[i - 1], &references[i]);
+        if reference.offset_content <= previous.offset_content {
+            return Err(StoreError::internal(format!(
+                "fragmented fragment offsets are not strictly increasing at index {i}"
+            )));
+        }
+        if reference.is_hole() {
+            if previous.is_hole() {
+                return Err(StoreError::internal(format!(
+                    "fragmented fragment holds a hole following a hole at index {i}"
+                )));
+            }
+            holes = true;
+        }
+        if first_oversized.is_none()
+            && !previous.is_hole()
+            && reference.offset_content - previous.offset_content > fragment_size
+        {
+            first_oversized = Some(i - 1);
+        }
+    }
+
+    let last_index = references.len() - 1;
+    let last = references[last_index];
+    if last.offset_content >= content_end {
         return Err(StoreError::internal(format!(
-            "fragmented fragment last offset {last} is outside content window [{first}, {content_end})"
+            "fragmented fragment last offset {} is outside content window [{first}, {content_end})",
+            last.offset_content
+        )));
+    }
+    if first_oversized.is_none()
+        && !last.is_hole()
+        && content_end - last.offset_content > fragment_size
+    {
+        first_oversized = Some(last_index);
+    }
+
+    if holes && let Some(i) = first_oversized {
+        return Err(StoreError::internal(format!(
+            "fragmented fragment with holes has a reference at index {i} larger than a fragment"
         )));
     }
 
@@ -344,11 +498,101 @@ pub async fn query_one(
     Ok(result[0])
 }
 
+/// A claim on `store` for a task spawned to outlive the operation spawning it, which the span
+/// covering that operation no longer covers once it ends.
+///
+/// `joined` is what [`ImmutableStore::try_join_claim`] returned to the operation before it
+/// spawned the task: a guard on the span's flock, which holds it without a gap from the
+/// operation to the end of the work it spawned. Where the operation could not join, the task
+/// claims `store` here as its first step, see [`ImmutableStore::hold_for_task`]. Held until the
+/// task ends. `None` for a store with nothing on disk to claim, or where the claim cannot be
+/// taken, which leaves the task's operations to claim for themselves and fail as they would have.
+///
+/// The claim keeps the flock and covers no operation: once the span has ended, each of the
+/// task's operations takes a guard of its own, and an operation outside the task does not run on
+/// a claim that ends with the task.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn claim_for_task(
+    store: &Arc<dyn ImmutableStore>,
+    joined: Option<StoreGuard>,
+) -> impl Future<Output = Option<StoreGuard>> + '_ {
+    async move {
+        if joined.is_some() {
+            return joined;
+        }
+        store.clone().hold_for_task().await.ok().flatten()
+    }
+}
+
+/// What a store keeps for a correlation id while the hold lives, given up as it drops.
+pub type CorrelationHold = Box<dyn Any + Send + Sync>;
+
 #[async_trait]
 pub trait ImmutableStore: Any + Send + Sync {
     /// Check if this store is backed by local disk
     fn is_local(&self) -> bool {
         false
+    }
+
+    /// Claims this store for the span it is about to be used — a storage handle from
+    /// open to close, or one repository command.
+    ///
+    /// The claim is what tells other processes this one is using the store, so it
+    /// belongs to the span rather than to each call within it. It is also the pair a
+    /// repository lock is contained within: store locks are the outer ones, because
+    /// they are the pair the storage API can also take, and two orders over one pair
+    /// would be a cycle.
+    ///
+    /// `None` means this store has nothing on disk to claim — a remote store, or an
+    /// in-memory one. There is no default answer: every store decides for itself, so a
+    /// wrapper around a store with files on disk delegates to it rather than answering
+    /// `None`, which would open a handle holding nothing that then reads and writes a
+    /// store no process has claimed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the lock cannot be taken, or if the reload a stale
+    /// acquisition demands fails.
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError>;
+
+    /// Joins the claim this process holds on this store, without waiting: a counted guard when
+    /// the store's flock is held and this store is current, `None` otherwise and for a store
+    /// with nothing on disk to claim.
+    ///
+    /// Taken by an operation for work it spawns to outlive it: see [`claim_for_task`]. A wrapper
+    /// delegates it as it delegates [`Self::hold_for_command`].
+    fn try_join_claim(&self) -> Option<StoreGuard> {
+        None
+    }
+
+    /// The lock of the store directory this store keeps its files in, which a store opened beside
+    /// it nests its own lock in, see [`crate::local::store_lock::StoreLock::new_within`]: `None`
+    /// for a store with nothing on disk. A wrapper delegates it as it delegates
+    /// [`Self::hold_for_command`].
+    fn store_lock(&self) -> Option<Arc<crate::local::store_lock::StoreLock>> {
+        None
+    }
+
+    /// Keeps what this store holds for calls under `correlation_id`, such as its sessions with a
+    /// remote, until this and every other hold on `correlation_id` have dropped. `None` for a store
+    /// that keeps nothing per correlation id; a wrapper delegates it.
+    fn hold_correlation(&self, _correlation_id: &str) -> Option<CorrelationHold> {
+        None
+    }
+
+    /// Claims this store for work spawned to outlive the operation that started it, where the
+    /// operation could not join its claim: as [`Self::hold_for_command`], but the guard keeps the
+    /// flock for that work and covers no operation, see [`claim_for_task`]. The default is
+    /// [`Self::hold_for_command`]; a store with files on disk, and a wrapper around one, override
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::hold_for_command`].
+    async fn hold_for_task(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        self.hold_for_command().await
     }
 
     /// Whether this store refuses to serve a payload it only found under another partition.
@@ -409,17 +653,19 @@ pub trait ImmutableStore: Any + Send + Sync {
         address: Address,
     ) -> Result<StoreGetData, StoreError>;
 
-    /// Read the payload stored under `address`, into `dst` when the payload is the content itself
-    /// and into a buffer of its own otherwise, reporting the fragment that describes it.
+    /// Read the payload stored under `address`, or the content a store expanded from it on receipt
+    /// ([`StoreGetData::content`]), into `dst` when it is the content itself and into a buffer of
+    /// its own otherwise, reporting the fragment that describes what was read.
     ///
-    /// One lookup settles where the payload belongs and reads it there, so a reader that already
-    /// has somewhere for the content to go pays no second lookup either way. What a returned
-    /// payload has to become — expanded, or walked as a fragment list — is the reader's to do; this
-    /// only decides where the stored bytes land. A payload `dst` has no room for is [`Oversized`];
-    /// a returned one is the reader's to size.
+    /// One lookup settles where the bytes belong and reads them there, so a reader that already has
+    /// somewhere for the content to go pays no second lookup either way. What returned bytes have
+    /// to become — expanded, or walked as a fragment list — is the reader's to do; this only
+    /// decides where they land. Bytes `dst` has no room for are [`Oversized`]; returned ones are
+    /// the reader's to size.
     ///
-    /// The default implementation goes through [`get`](ImmutableStore::get) and copies. A store
-    /// overrides it to read its index once and have the read itself land in `dst`.
+    /// The default implementation goes through [`get`](ImmutableStore::get) and copies the content
+    /// where the store expanded one, and the payload otherwise. A store overrides it to read its
+    /// index once and have the read itself land in `dst`.
     async fn get_into(
         self: Arc<Self>,
         partition: Partition,
@@ -427,26 +673,22 @@ pub trait ImmutableStore: Any + Send + Sync {
         dst: &mut crate::CallerBuffer,
     ) -> Result<(Fragment, PayloadRead), StoreError> {
         let data = self.get(partition, address).await?;
-        let fragment = data.fragment;
-        let payload = data
-            .payload
-            .ok_or_else(|| StoreError::from(PayloadNotFound::from(address.hash)))?;
+        let (fragment, payload) = match data.content {
+            Some(content) => content,
+            None => (
+                data.fragment,
+                data.payload
+                    .ok_or_else(|| StoreError::from(PayloadNotFound::from(address.hash)))?,
+            ),
+        };
         validate_fragment_payload(&fragment, payload.len())?;
 
         if !payload_is_content(&fragment) {
             return Ok((fragment, PayloadRead::Returned(payload)));
         }
 
-        let capacity = dst.len();
-        let Some(target) = dst.as_mut_slice().get_mut(..payload.len()) else {
-            return Err(StoreError::from(Oversized {
-                context: format!(
-                    "payload of {} bytes exceeds the {capacity} byte destination buffer",
-                    payload.len()
-                ),
-            }));
-        };
-        target.copy_from_slice(&payload);
+        validate_buffer_capacity(payload.len(), dst.len())?;
+        dst.as_mut_slice()[..payload.len()].copy_from_slice(&payload);
         Ok((fragment, PayloadRead::IntoBuffer))
     }
 
@@ -575,12 +817,16 @@ pub trait ImmutableStore: Any + Send + Sync {
         let _ = terminate;
     }
 
+    /// The GC limits and load totals of a store with background GC, `None` for one without.
+    fn gc_counters(&self) -> Option<Arc<crate::maintenance::GcCounters>> {
+        None
+    }
+
     /// Get maximum supported query batch size, if any
     fn max_query_batch(&self) -> Option<usize>;
 
-    /// Flush any pending writes to durable storage.
-    /// When `sync_data` is true, data is synced to the storage media (fsync).
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError>;
+    /// Flush any pending writes to durable storage, as `options` asks.
+    async fn flush(self: Arc<Self>, options: crate::FlushOptions) -> Result<(), StoreError>;
 
     /// Get number of fragments in store, if available
     async fn fragment_count(self: Arc<Self>) -> Option<usize> {
@@ -589,6 +835,22 @@ pub trait ImmutableStore: Any + Send + Sync {
 
     /// Verify the integrity of the store. If `heal` is true, attempt to repair any issues found.
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError>;
+
+    /// Checks this store's copy of `address` in `partition` and repairs it where it is corrupt, as
+    /// a reader that found the payload corrupt on receipt asks. A store with no copy it can repair
+    /// answers [`HealResult::NotAttempted`]; a wrapper delegates it.
+    async fn heal(
+        self: Arc<Self>,
+        _partition: Partition,
+        _address: Address,
+    ) -> Result<HealResult, StoreError> {
+        Ok(HealResult::NotAttempted)
+    }
+
+    /// Waits until a write of `address` in `partition` to a local tier, which a read here started,
+    /// has ended, so a check of the local copy that follows sees what the write left. A store that
+    /// writes nothing from its reads has nothing to wait for; a wrapper delegates it.
+    async fn settle(self: Arc<Self>, _partition: Partition, _address: Address) {}
 
     /// Copy a fragment from one `(partition, address)` tuple to another within the same store.
     ///

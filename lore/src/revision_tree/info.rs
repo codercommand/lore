@@ -25,7 +25,17 @@ use crate::revision_tree::handle::LoreRevisionTree;
 
 /// Arguments for `lore_revision_tree_info`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    LoreArgs,
+    bitcode::Encode,
+    bitcode::Decode,
+    lore_macro::WireSchema,
+)]
 #[handler(info_impl)]
 pub struct LoreRevisionTreeInfoArgs {
     /// Per-call correlation id echoed back in events
@@ -73,12 +83,12 @@ fn emit_info_error(id: u64, error_code: LoreErrorCode) {
 /// Metadata fragment reports zeroed metadata fields (not an error); a
 /// present-but-unreadable fragment completes with `error_code = INTERNAL`. The
 /// verb materializes no bytes to disk.
-pub async fn info(
+pub fn info(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, info_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, info_impl)
 }
 
 async fn info_impl(
@@ -123,8 +133,7 @@ async fn info_impl(
             let creation_timestamp = metadata.get_timestamp().unwrap_or_default() as i64;
             let author_identity = metadata
                 .get_string(CREATED_BY)
-                .map(LoreString::from)
-                .unwrap_or_default();
+                .map_or_default(LoreString::from);
             let mut metadata_key_count = 0u32;
             metadata.walk(|_, _, _| metadata_key_count += 1);
 
