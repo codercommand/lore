@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::BucketError;
 
 fn default_snapshot_interval() -> u64 {
-    60
+    5
 }
 
 /// `[plugins.bucket]` table.
@@ -39,8 +39,9 @@ pub struct BucketConfig {
     /// without that server path, in which case no snapshot is taken.
     #[serde(default)]
     pub local_path: Option<String>,
-    /// Seconds between index snapshots. Zero snapshots only when the store is
-    /// flushed. `loreserver` does that at a clean stop, not while it is running.
+    /// Seconds between index snapshots. Each pass uploads the index and branch
+    /// files that changed. Zero snapshots only when the store is flushed.
+    /// `loreserver` does that at a clean stop, not while it is running.
     #[serde(default = "default_snapshot_interval")]
     pub snapshot_interval_seconds: u64,
 }
@@ -121,7 +122,7 @@ mod tests {
         assert_eq!(cfg.endpoint, "http://127.0.0.1:9000");
         assert!(cfg.path_style);
         assert!(cfg.local_path.is_none());
-        assert_eq!(cfg.snapshot_interval_seconds, 60);
+        assert_eq!(cfg.snapshot_interval_seconds, 5);
     }
 
     #[test]

@@ -842,6 +842,55 @@ const _: () = assert!(
     TRAILER_SIZES * size_of::<PackfileSize>() < size_of::<u32>() + size_of::<ImmutableStoreEntry>()
 );
 
+// dragon: start — content identity for the bucket snapshot.
+// Access stamps sit in each entry and change when a fragment is read. Zeroing
+// them makes a stamp-only rewrite hash the same as the file already uploaded.
+// A packfile-size trailer after the entries is left as it is.
+
+/// Blake3 of `bytes`.
+pub fn snapshot_blake3(bytes: &[u8]) -> [u8; 32] {
+    *blake3::hash(bytes).as_bytes()
+}
+
+/// Blake3 of an index bucket file with access stamps zeroed.
+///
+/// A file that is not a current index bucket hashes as its raw bytes. The
+/// header is private to this module, so the bucket plugin cannot do this itself.
+pub fn index_content_hash(bytes: &[u8]) -> [u8; 32] {
+    match without_access_stamps(bytes) {
+        Some(neutral) => snapshot_blake3(&neutral),
+        None => snapshot_blake3(bytes),
+    }
+}
+
+fn without_access_stamps(bytes: &[u8]) -> Option<Vec<u8>> {
+    let header_len = size_of::<ImmutableStoreHeader>();
+    let header = ImmutableStoreHeader::read_from_bytes(bytes.get(..header_len)?).ok()?;
+    if header.version < ImmutableStoreVersion::LastAccessInEntry as u32
+        || header.version > ImmutableStoreVersion::LazyFanOut as u32
+    {
+        return None;
+    }
+    let count = header.count as usize;
+    let index_len = count.checked_mul(size_of::<u32>())?;
+    let entry_len = size_of::<ImmutableStoreEntry>();
+    let entries_len = count.checked_mul(entry_len)?;
+    let entries_at = header_len.checked_add(index_len)?;
+    let entries_end = entries_at.checked_add(entries_len)?;
+    if bytes.len() < entries_end {
+        return None;
+    }
+    let mut out = bytes.to_vec();
+    let stamp = size_of::<u64>();
+    let stamp_at = entry_len.checked_sub(stamp)?;
+    for index in 0..count {
+        let start = entries_at + index * entry_len + stamp_at;
+        out.get_mut(start..start + stamp)?.fill(0);
+    }
+    Some(out)
+}
+// dragon: end
+
 impl ImmutableStoreHeader {
     /// Record `sizes`, at most one more than [`TRAILER_SIZES`]: the first in the header, the rest
     /// to follow the entries.

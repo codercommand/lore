@@ -3,9 +3,8 @@
 //! Durable Lore tier for an S3-compatible bucket.
 //!
 //! Payloads and association markers live in the bucket. The local Lore index
-//! answers lookups. A snapshot of `immutable/` (without pack files or the
-//! process lock) and `mutable/` is uploaded after flush so a missing local
-//! index can be restored.
+//! answers lookups. Changed index and branch files are uploaded on an interval,
+//! and again when the store is flushed, so a missing local index can be restored.
 
 mod client;
 mod config;

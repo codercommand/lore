@@ -46,9 +46,8 @@ pub struct BucketStore {
     prefix: String,
     local_path: Option<PathBuf>,
     stripes: Vec<tokio::sync::Mutex<()>>,
-    /// Held for one snapshot at a time. Holds the fingerprint of the last
-    /// upload, so an unchanged cache directory is not sent again.
-    snapshot_gate: tokio::sync::Mutex<Option<snapshot::Fingerprint>>,
+    /// Held for one snapshot at a time. Remembers the files already published.
+    snapshot_gate: tokio::sync::Mutex<snapshot::BatchState>,
 }
 
 impl BucketStore {
@@ -68,7 +67,7 @@ impl BucketStore {
             prefix: prefix.into(),
             local_path,
             stripes,
-            snapshot_gate: tokio::sync::Mutex::new(None),
+            snapshot_gate: tokio::sync::Mutex::new(snapshot::BatchState::default()),
         }
     }
 
@@ -721,12 +720,15 @@ mod tests {
             Some(root.path().to_path_buf()),
         ));
         store.flush(FlushOptions::SYNC_DATA).await.unwrap();
-        let keys = client.list("snapshot/").await.unwrap();
-        assert!(
-            keys.iter()
-                .any(|key| key.ends_with("immutable/index/aa/index_00"))
-        );
-        assert!(keys.iter().all(|key| !key.contains("/pack/")));
+        let manifest = client.get("snapshot/manifest").await.unwrap();
+        let generation = String::from_utf8(manifest.to_vec()).unwrap();
+        let tree = client
+            .get(&format!("snapshot/tree/{}", generation.trim()))
+            .await
+            .unwrap();
+        let text = String::from_utf8(tree.to_vec()).unwrap();
+        assert!(text.contains("immutable/index/aa/index_00"));
+        assert!(!text.contains("pack"));
     }
 
     #[tokio::test]
