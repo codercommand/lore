@@ -46,8 +46,9 @@ const GENERATED_FILE_HEADER: &str = r#"// ======================================
 "#;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // dragon: start — the Windows main thread reserves 1 MiB, and starting
-    // composite mode overflows it. This raises the reserve for loreserver.
+    // dragon: start — Windows reserves 1 MiB for the main thread. Composite
+    // startup overflows it. This raises loreserver's reserve to 16 MiB.
+    // Remove when Lore raises it, or we stop building loreserver on Windows.
     #[cfg(windows)]
     println!("cargo:rustc-link-arg-bins=/STACK:16777216");
     // dragon: end
@@ -231,9 +232,9 @@ fn write_if_changed(path: &Path, content: &str) -> Result<bool, Box<dyn Error>> 
     Ok(true)
 }
 
-// dragon: start — wrap Dragon's bucket plugin in the generated plugins/mod.rs.
-// plugins/mod.rs is rewritten by this script. A hand comment there is deleted
-// on the next lore-server build, so the marker has to be emitted here.
+// dragon: start — plugins/mod.rs is generated. A hand comment there is deleted
+// on the next lore-server build, so the bucket markers have to be emitted here.
+// They are not behavior. Remove them when the bucket plugin is dropped.
 fn write_bucket_marker(
     content: &mut String,
     name: &str,

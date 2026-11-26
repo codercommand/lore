@@ -4,6 +4,10 @@
 //!
 //! Selected with `mode = "bucket"` and configured from `[plugins.bucket]`.
 //! The store is the composite durable tier. The local tier keeps the cache cap.
+//!
+//! This file is the whole of the plugin Lore can see. `loreserver` only loads
+//! factories under `src/plugins/`. The store itself is the `lore-bucket` crate.
+//! Remove this file when the bucket plugin is dropped.
 
 use std::sync::Arc;
 

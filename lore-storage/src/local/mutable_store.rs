@@ -1517,9 +1517,23 @@ impl LocalMutableStore {
     /// it was about to write had already been invalidated and must not reach disk.
     #[lore_macro::test_pub]
     async fn flush_delayed(weak_ref: Weak<LocalMutableStore>, group_index: usize, delay: u64) {
+        // dragon: start — hold the snapshot until this branch flush writes.
+        // Upstream can publish an index before these tips exist.
+        // Remove when lore-bucket no longer follows flushes.
+        let pending = crate::snapshot_follow::PendingBranch::enter();
+        // dragon: end
         tokio::time::sleep(Duration::from_secs(delay)).await;
         #[cfg(feature = "test-util")]
         let _task = crate::test_util::store_task(crate::test_util::StoreTask::MutableDelayedFlush);
+        // dragon: start — write the index, then the branch files, as one signal.
+        // The follower stays busy until both are done, so it cannot publish
+        // tips whose catalog is still only in memory.
+        // Remove when lore-bucket no longer follows flushes.
+        let _flight = crate::snapshot_follow::FlushGuard::enter();
+        drop(pending);
+        let _batch = crate::snapshot_follow::RequestBatch::arm();
+        crate::snapshot_follow::flush_index_before_branch(false).await;
+        // dragon: end
         if let Some(store) = weak_ref.upgrade()
             && let Some(path) = store.path.as_ref()
         {
@@ -1626,6 +1640,12 @@ impl LocalMutableStore {
         let Some(path) = path else {
             return Ok(());
         };
+        // dragon: start — flush the index, then write these tips, as one signal.
+        // Remove when lore-bucket no longer follows flushes.
+        let _flight = crate::snapshot_follow::FlushGuard::enter();
+        let _batch = crate::snapshot_follow::RequestBatch::arm();
+        crate::snapshot_follow::flush_index_before_branch(options.sync_data).await;
+        // dragon: end
         let path = Arc::new(path.as_ref().clone());
 
         let mut tasks = lore_base::runtime::DetachingJoinSet::default();

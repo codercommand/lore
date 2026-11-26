@@ -12,6 +12,7 @@ use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
 use futures::stream::StreamExt;
+use futures::stream::TryStreamExt;
 use lore_storage::local::immutable_store::index_content_hash;
 use lore_storage::local::immutable_store::snapshot_blake3;
 
@@ -21,7 +22,7 @@ use crate::client::join_key;
 
 /// How many object uploads in one batch run at once.
 const UPLOAD_PARALLELISM: usize = 32;
-/// Walks that see the tree change underneath them are retried, then refused.
+/// Walks that overlap a flush are retried, then refused. A torn walk is not published.
 const WALK_ATTEMPTS: u32 = 8;
 
 /// Which missing trees a restore may fill.
@@ -116,6 +117,11 @@ pub fn has_kept_file(dir: &Path) -> std::io::Result<bool> {
 }
 
 /// Upload changed index and branch files as one batch, then write the manifest.
+///
+/// Objects for the batch are uploaded together. `snapshot/manifest` is written
+/// last and names the new tree. Unchanged files, and index files whose only
+/// change is an access stamp, are left as they are. A walk that overlaps a
+/// flush is not published.
 #[cfg(test)]
 pub async fn upload(
     client: &dyn ObjectClient,
@@ -141,31 +147,7 @@ pub async fn upload_if_changed(
         state.remote_loaded = true;
     }
 
-    let mut last_unstable = None;
-    for _ in 0..WALK_ATTEMPTS {
-        match publish_stable(client, prefix, local, state).await {
-            Ok(published) => return Ok(published),
-            Err(SnapshotError::Unstable) => {
-                last_unstable = Some(SnapshotError::Unstable);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    Err(last_unstable.unwrap_or(SnapshotError::Unstable))
-}
-
-async fn publish_stable(
-    client: &dyn ObjectClient,
-    prefix: &str,
-    local: &Path,
-    state: &mut BatchState,
-) -> Result<bool, SnapshotError> {
-    let before = fingerprint(local)?;
-    let diff = diff_tree(local, &state.files)?;
-    let after = fingerprint(local)?;
-    if before != after {
-        return Err(SnapshotError::Unstable);
-    }
+    let diff = walk_stable(local, &state.files).await?;
     if !diff.saw_file && !state.files.is_empty() {
         tracing::warn!(
             "bucket snapshot left the manifest in place: local index and branch files are absent"
@@ -178,7 +160,6 @@ async fn publish_stable(
         return Ok(false);
     }
 
-    let generation = new_generation();
     let uploads = diff
         .uploads
         .iter()
@@ -189,19 +170,20 @@ async fn publish_stable(
             )
         })
         .collect::<Vec<_>>();
-    futures::stream::iter(uploads)
-        .map(|(key, bytes)| async move { client.put(&key, bytes).await })
-        .buffer_unordered(UPLOAD_PARALLELISM)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+    futures::stream::iter(uploads.into_iter().map(|(key, bytes)| async move {
+        client.put(&key, bytes).await?;
+        Ok::<(), SnapshotError>(())
+    }))
+    .buffer_unordered(UPLOAD_PARALLELISM)
+    .try_collect::<Vec<()>>()
+    .await?;
 
-    let tree = render_tree(&diff.files);
+    let generation = new_generation();
+    let previous_generation = state.generation.clone();
     client
         .put(
             &join_key(prefix, &format!("snapshot/tree/{generation}")),
-            Bytes::from(tree),
+            Bytes::from(render_tree(&diff.files)),
         )
         .await?;
     client
@@ -211,22 +193,52 @@ async fn publish_stable(
         )
         .await?;
 
-    let previous = state.generation.clone();
+    let uploaded_bytes: u64 = diff
+        .uploads
+        .iter()
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum();
+    tracing::info!(
+        files = diff.uploads.len(),
+        bytes = uploaded_bytes,
+        generation,
+        "bucket snapshot batch"
+    );
+
     state.files = diff.files;
     state.generation = Some(generation);
     if let Err(err) = gc_objects(client, prefix, &state.files).await {
         tracing::warn!("bucket snapshot left an unreferenced object in place: {err}");
     }
-    if let Some(previous) = previous
+    if let Some(previous) = previous_generation
         && state.generation.as_deref() != Some(previous.as_str())
         && let Err(err) = client
             .delete(&join_key(prefix, &format!("snapshot/tree/{previous}")))
             .await
     {
-        tracing::warn!("bucket snapshot left an older tree in place: {err}");
+        tracing::warn!("bucket snapshot left the previous tree in place: {err}");
     }
     clear_legacy_if_current(client, prefix, state).await;
     Ok(true)
+}
+
+async fn walk_stable(
+    local: &Path,
+    previous: &BTreeMap<String, SnapFile>,
+) -> Result<Diff, SnapshotError> {
+    for _ in 0..WALK_ATTEMPTS {
+        while lore_storage::snapshot_follow::in_flight() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let generation = lore_storage::snapshot_follow::generation();
+        let diff = diff_tree(local, previous)?;
+        if lore_storage::snapshot_follow::generation() == generation
+            && lore_storage::snapshot_follow::in_flight() == 0
+        {
+            return Ok(diff);
+        }
+    }
+    Err(SnapshotError::Unstable)
 }
 
 struct Diff {
@@ -234,23 +246,6 @@ struct Diff {
     uploads: Vec<(String, Bytes)>,
     changed: bool,
     saw_file: bool,
-}
-
-fn fingerprint(local: &Path) -> Result<Vec<(String, u64, Option<SystemTime>)>, SnapshotError> {
-    let mut listed = collect_tree(&local.join("immutable"), "immutable")?;
-    listed.extend(collect_tree(&local.join("mutable"), "mutable")?);
-    let mut out = Vec::with_capacity(listed.len());
-    for (relative, path) in listed {
-        let meta = std::fs::metadata(&path).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                SnapshotError::Unstable
-            } else {
-                SnapshotError::Io(err)
-            }
-        })?;
-        out.push((relative, meta.len(), meta.modified().ok()));
-    }
-    Ok(out)
 }
 
 fn diff_tree(local: &Path, previous: &BTreeMap<String, SnapFile>) -> Result<Diff, SnapshotError> {
@@ -262,13 +257,7 @@ fn diff_tree(local: &Path, previous: &BTreeMap<String, SnapFile>) -> Result<Diff
     let mut changed = false;
 
     for (relative, path) in listed {
-        let meta = match std::fs::metadata(&path) {
-            Ok(meta) => Some(meta),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(SnapshotError::Unstable);
-            }
-            Err(_) => None,
-        };
+        let meta = std::fs::metadata(&path).ok();
         let len = meta.as_ref().map_or(0, std::fs::Metadata::len);
         let mtime = meta.and_then(|meta| meta.modified().ok());
         if let Some(prev) = previous.get(&relative)
@@ -282,7 +271,8 @@ fn diff_tree(local: &Path, previous: &BTreeMap<String, SnapFile>) -> Result<Diff
         let bytes = match read_file(&path) {
             Ok(bytes) => bytes,
             Err(SnapshotError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(SnapshotError::Unstable);
+                changed = true;
+                continue;
             }
             Err(err) => return Err(err),
         };
@@ -863,6 +853,10 @@ mod tests {
                 .count()
                 >= 3
         );
+        let text = tree_text(&client.inner, "").await;
+        assert!(text.contains("immutable/index/aa/index_00"));
+        assert!(text.contains("immutable/index/aa/index_01"));
+        assert!(text.contains("mutable/branches"));
     }
 
     #[tokio::test]
@@ -881,6 +875,7 @@ mod tests {
                 .unwrap()
         );
         let objects = client.list("snapshot/obj/").await.unwrap();
+        // Same length, only the access stamp moves. The file mtime changes.
         std::fs::write(&path, index_bytes(2)).unwrap();
         assert!(
             !upload_if_changed(client.as_ref(), "", root.path(), &mut state)
@@ -927,6 +922,19 @@ mod tests {
                 .await
                 .unwrap()
         );
+        restore(
+            inner.as_ref(),
+            "",
+            root.path(),
+            RestoreSet {
+                index: false,
+                mutable: false,
+            },
+        )
+        .await
+        .unwrap();
+        // Restore does not replace a tree that is already present. Read the object back
+        // through a fresh directory.
         let fresh = tempfile::tempdir().unwrap();
         restore(
             inner.as_ref(),
@@ -1039,8 +1047,8 @@ mod tests {
         entry.data.last_access = stamp;
         entry.data.size_content = size_content;
         let mut out = vec![0u8; 16];
-        out[0] = 5;
-        out[8] = 1;
+        out[0] = 5; // LazyFanOut, little endian
+        out[8] = 1; // one entry
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(entry.as_bytes());
         out

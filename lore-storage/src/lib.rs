@@ -33,6 +33,11 @@ mod read_flight;
 #[cfg(feature = "test-util")]
 pub mod read_flight;
 pub(crate) mod resume;
+// dragon: start — signals for the bucket snapshot follower. See snapshot_follow.
+// Upstream does not tell a durable plugin that a local flush finished.
+// Remove when lore-bucket snapshots on its interval and does not follow flushes.
+pub mod snapshot_follow;
+// dragon: end
 pub mod store_types;
 #[cfg(feature = "test-util")]
 pub mod test_util;

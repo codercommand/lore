@@ -4,7 +4,8 @@ members = [
     "lore",
     "lore-aws",
     "lore-base",
-    # dragon: start — workspace member for the Dragon bucket plugin.
+    # dragon: start — lore-bucket is not an upstream crate.
+    # Remove when the bucket plugin is dropped.
     "lore-bucket",
     # dragon: end
     "lore-capi",
@@ -107,7 +108,8 @@ zero_sized_map_values = "warn"
 lore = { path = "lore" }
 lore-aws = { path = "lore-aws" }
 lore-base = { path = "lore-base" }
-# dragon: start — Dragon bucket plugin. Durable mode "bucket" loads this crate.
+# dragon: start — durable mode "bucket" loads this crate. Not an upstream dependency.
+# Remove when the bucket plugin is dropped.
 lore-bucket = { path = "lore-bucket" }
 # dragon: end
 lore-credential = { path = "lore-credential" }

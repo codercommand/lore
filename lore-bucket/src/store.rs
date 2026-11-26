@@ -46,7 +46,7 @@ pub struct BucketStore {
     prefix: String,
     local_path: Option<PathBuf>,
     stripes: Vec<tokio::sync::Mutex<()>>,
-    /// Held for one snapshot at a time. Remembers the files already published.
+    /// Held for one snapshot batch at a time. Remembers the files already published.
     snapshot_gate: tokio::sync::Mutex<snapshot::BatchState>,
 }
 
@@ -71,20 +71,26 @@ impl BucketStore {
         }
     }
 
-    /// Upload the index snapshot on a timer until this store is dropped.
-    pub fn start_periodic(self: &Arc<Self>, every: Duration) {
-        if every.is_zero() || self.local_path.is_none() {
+    /// Publish a snapshot batch after each quiet flush wave, until this store is dropped.
+    ///
+    /// The first request reconciles files written before the follower was running.
+    pub fn start_follow(self: &Arc<Self>) {
+        if self.local_path.is_none() {
             return;
         }
+        tracing::info!("bucket snapshot follows store flushes");
+        lore_storage::snapshot_follow::request_batch();
         let weak = Arc::downgrade(self);
         lore_spawn!(async move {
             loop {
-                tokio::time::sleep(every).await;
+                lore_storage::snapshot_follow::wait_for_follow().await;
                 let Some(store) = weak.upgrade() else {
                     break;
                 };
                 if let Err(err) = store.snapshot().await {
-                    tracing::warn!("bucket snapshot failed: {err}");
+                    tracing::error!("bucket snapshot batch failed: {err}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    lore_storage::snapshot_follow::request_batch();
                 }
             }
         });
@@ -761,7 +767,13 @@ mod tests {
         header.flags |= 0b1_0000;
         store
             .clone()
-            .put(part(1), address, header, Some(Bytes::from(vec![1, 2, 3, 4])), false)
+            .put(
+                part(1),
+                address,
+                header,
+                Some(Bytes::from(vec![1, 2, 3, 4])),
+                false,
+            )
             .await
             .unwrap();
         let err = store.get(part(1), address).await.unwrap_err();

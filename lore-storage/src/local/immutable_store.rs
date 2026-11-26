@@ -842,10 +842,11 @@ const _: () = assert!(
     TRAILER_SIZES * size_of::<PackfileSize>() < size_of::<u32>() + size_of::<ImmutableStoreEntry>()
 );
 
-// dragon: start — content identity for the bucket snapshot.
-// Access stamps sit in each entry and change when a fragment is read. Zeroing
-// them makes a stamp-only rewrite hash the same as the file already uploaded.
-// A packfile-size trailer after the entries is left as it is.
+// dragon: start — hash an index file with last_access zeroed.
+// The header is private, so lore-bucket cannot do this. A stamp-only rewrite
+// would otherwise upload the whole catalog page. last_access only ranks local
+// cache eviction; the bucket, AWS, and a mesh peer do not evict.
+// Remove when stamp-only re-uploads are acceptable, or Lore exposes this hash.
 
 /// Blake3 of `bytes`.
 pub fn snapshot_blake3(bytes: &[u8]) -> [u8; 32] {
@@ -1712,6 +1713,11 @@ impl ImmutableStoreGroup {
         }
         #[cfg(feature = "test-util")]
         let _task = crate::test_util::store_task(crate::test_util::StoreTask::DelayedFlush);
+        // dragon: start — one flush signal for this group's renames.
+        // Remove when lore-bucket no longer follows flushes.
+        let _flight = crate::snapshot_follow::FlushGuard::enter();
+        let _batch = crate::snapshot_follow::RequestBatch::arm();
+        // dragon: end
         if let Some(store) = weak_ref.upgrade()
             && let Some(path) = store.path.as_ref()
         {
@@ -5217,6 +5223,11 @@ impl LocalImmutableStore {
         let Some(path) = path else {
             return Ok(());
         };
+        // dragon: start — one flush signal for every group rename in this pass.
+        // Remove when lore-bucket no longer follows flushes.
+        let _flight = crate::snapshot_follow::FlushGuard::enter();
+        let _batch = crate::snapshot_follow::RequestBatch::arm();
+        // dragon: end
 
         let mut tasks = lore_base::runtime::DetachingJoinSet::default();
 

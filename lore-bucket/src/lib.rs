@@ -19,7 +19,6 @@ pub use store::BucketStore;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use lore_storage::ImmutableStore;
 
@@ -70,7 +69,7 @@ pub async fn prepare(config: &toml::Value) -> Result<(), BucketError> {
     Ok(())
 }
 
-/// Open the durable store and start the snapshot timer when one is configured.
+/// Open the durable store and follow local flushes when snapshots are enabled.
 pub async fn open(config: &toml::Value) -> Result<Arc<dyn ImmutableStore>, BucketError> {
     let cfg = BucketConfig::parse(config)?;
     let client = s3::connect(&cfg).await?;
@@ -79,7 +78,11 @@ pub async fn open(config: &toml::Value) -> Result<Arc<dyn ImmutableStore>, Bucke
         cfg.normalized_prefix(),
         cfg.local_path.as_ref().map(PathBuf::from),
     ));
-    store.start_periodic(Duration::from_secs(cfg.snapshot_interval_seconds));
+    // A non-zero interval enables the flush follower. The number is not a period.
+    // Zero snapshots only when the store is flushed, which is a clean stop.
+    if cfg.snapshot_interval_seconds > 0 {
+        store.start_follow();
+    }
     Ok(store)
 }
 

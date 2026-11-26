@@ -1459,6 +1459,10 @@ async fn configure_local_immutable_store(
     }
 
     info!("Wiring up local immutable store");
+    // dragon: start — branch flushes flush the local index before writing tips.
+    // Remove when the follower is gone, or upstream already does this.
+    install_index_flush_before_branch();
+    // dragon: end
 
     let store = create_local_store(settings, true /* flush background */).await?;
 
@@ -1469,6 +1473,28 @@ async fn configure_local_immutable_store(
 
     Ok(store)
 }
+
+// dragon: start — the mutable store calls this before it renames a branch tip.
+// Flushes the local index only. The bucket upload stays off this path.
+// A snapshot between the two would publish tips whose catalog is not on disk.
+// Remove when the follower is gone, or upstream flushes the index first.
+fn install_index_flush_before_branch() {
+    lore_storage::snapshot_follow::set_index_flusher(|sync_data| {
+        Box::pin(async move {
+            if let Some(store) = local_store()
+                && let Err(err) = store
+                    .flush(lore_storage::FlushOptions {
+                        sync_data,
+                        fast_flush: false,
+                    })
+                    .await
+            {
+                warn!("flushing the index before a branch flush failed: {err}");
+            }
+        })
+    });
+}
+// dragon: end
 
 async fn configure_local_mutable_store(
     settings: &LocalMutableStoreSettings,
@@ -1618,10 +1644,12 @@ async fn configure_composite_store(
                 .map(|limit| Duration::from_millis(limit.get())),
         );
 
-    // dragon: start — restore a missing bucket index before the local store opens.
-    // Opening the local store creates empty index directories. Prepare would
-    // treat those as a live index and skip the restore. local_path is the
+    // dragon: start — restore a missing index before the local store is created.
+    // Upstream has nothing to restore. Opening the local store first can leave
+    // files prepare would treat as a live index and skip. local_path is the
     // composite local directory, the parent of immutable/ and mutable/.
+    // Remove when prepare runs from lore_bucket::open and still sees an empty
+    // index, or the bucket plugin is dropped.
     let local_path = settings
         .local
         .local
@@ -1649,7 +1677,8 @@ async fn configure_composite_store(
         &settings.local.mode,
         global_settings,
         &settings.local,
-        // dragon: start — snapshot_root argument. The local tier is not the bucket.
+        // dragon: start — snapshot_root. The local tier is not the bucket.
+        // Remove with the argument when the bucket plugin no longer needs the path.
         None,
         // dragon: end
     ))
@@ -1661,6 +1690,7 @@ async fn configure_composite_store(
         // dragon: start — give the bucket plugin the cache directory as local_path.
         // A path written in the toml is replaced, so the snapshot and the cache
         // cannot point at different directories.
+        // Remove when the plugin learns the path itself, or it stops snapshotting.
         let snapshot_root = if durable_settings.mode == "bucket" {
             local_path.as_deref()
         } else {
@@ -1672,7 +1702,7 @@ async fn configure_composite_store(
             &durable_settings.mode,
             global_settings,
             durable_settings,
-            // dragon: start — pass the cache directory into the bucket plugin.
+            // dragon: start — cache directory for the bucket plugin. None for every other tier.
             snapshot_root,
             // dragon: end
         ))
@@ -1692,7 +1722,8 @@ async fn configure_composite_store(
                 &store_settings.mode,
                 global_settings,
                 store_settings,
-                // dragon: start — snapshot_root argument. Replicas are not the bucket.
+                // dragon: start — snapshot_root. A replica is not the bucket.
+                // Remove with the argument when the bucket plugin no longer needs the path.
                 None,
                 // dragon: end
             ))
@@ -1777,6 +1808,7 @@ async fn configure_composite_store(
 // Copies the composite local directory into local_path. open() does this
 // again when the plugin starts. Prepare has to see the same path first,
 // or it restores into a directory the server will not use.
+// Remove when prepare no longer runs from the server.
 fn bucket_plugin_config(global_settings: &Settings, local_path: &std::path::Path) -> toml::Value {
     let mut config =
         resolve_plugin_config_with_fallback(&global_settings.plugins, "bucket", "immutable_store")
@@ -1798,7 +1830,8 @@ async fn configure_composite_substore(
     settings: &CompositeSubStoreSettings,
     // dragon: start — snapshot directory for durable mode "bucket".
     // Other tiers pass None. lore_bucket snapshots immutable/ and mutable/
-    // under this path. Drop the argument if the bucket plugin goes away.
+    // under this path. Drop the argument when the bucket plugin goes away
+    // or reads the path from its own config.
     snapshot_root: Option<&std::path::Path>,
     // dragon: end
 ) -> Result<Arc<dyn ImmutableStore>> {
@@ -1836,8 +1869,8 @@ async fn configure_composite_substore(
         _ => {
             // All other modes use the plugin system
             // dragon: start — same local_path copy as prepare, for plugin open().
-            // plugin_config is mut so this can overwrite local_path. Server-owned
-            // so the toml cannot point the snapshot somewhere else.
+            // Overwrites a toml path so the snapshot cannot point elsewhere.
+            // Remove when the plugin learns the path itself.
             let mut plugin_config = resolve_plugin_config_with_fallback(
                 &global_settings.plugins,
                 mode,
@@ -2106,8 +2139,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // Initialize metrics and tracing telemetry, returns a guard that will cleanup when it falls out
     // of scope
     let (mut settings, settings_hash) = settings;
-    // dragon: start — remember whether the durable tier is the bucket plugin,
-    // for the second flush at shutdown.
+    // dragon: start — remember a bucket durable tier for the second shutdown flush.
+    // Remove with that flush.
     let settings_uses_bucket = settings.immutable_store.mode == "composite"
         && settings
             .immutable_store
@@ -2789,7 +2822,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     up_gauge.record(0, &up_attributes);
 
     info!("Flushing stores");
-    // dragon: start — keep a handle for the second flush below.
+    // dragon: start — keep a handle for the second flush below. Remove with it.
     let immutable_store_for_snapshot = settings_uses_bucket.then(|| Arc::clone(&immutable_store));
     // dragon: end
     if let Err(error) = flush_stores(
@@ -2802,11 +2835,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         warn!(%error, "Failed to flush the stores at shutdown");
     }
     // dragon: start — snapshot again after the mutable flush.
-    // The immutable flush above runs the bucket snapshot, and it runs before
-    // the mutable store writes its last branch tips. Without this second
-    // flush the bucket keeps branch tips up to one flush delay old, and a
-    // guild started from that bucket on another machine loses those pushes.
-    // The local tier has nothing dirty by now, so this is only the snapshot.
+    // The flush above snapshots the bucket, then the mutable flush writes the
+    // last branch tips. Without this second call those tips miss the manifest,
+    // and a guild started from the bucket loses those pushes. The local tier
+    // has nothing dirty by now, so this is only the snapshot.
+    // Remove when shutdown writes the tips before the durable snapshot.
     if let Some(store) = immutable_store_for_snapshot
         && let Err(err) = store.flush(FlushOptions::SYNC_DATA).await
     {
